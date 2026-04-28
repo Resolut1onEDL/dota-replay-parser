@@ -1,0 +1,17 @@
+# Built binaries (cross-built by CI on tag, attached to GitHub release)
+/parser
+/parser.exe
+/parser-darwin-*
+/parser-linux-*
+/parser-windows-*
+/dist/
+
+# Local test fixtures (large .dem files; not stored in repo — see test-replays/README.md)
+/test-replays/*.dem
+/test-replays/*.dem.bz2
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
