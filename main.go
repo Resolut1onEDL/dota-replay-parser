@@ -180,6 +180,7 @@ type RuneSummary struct {
 	PowerRunes   int `json:"powerRunes"`             // DD, Haste, Invis, Regen, Arcane, Shield, Illusion
 	BountyRunes  int `json:"bountyRunes"`            // bounty rune pickups
 	WaterRunes   int `json:"waterRunes"`             // water rune pickups
+	WisdomRunes  int `json:"wisdomRunes,omitempty"`  // wisdom rune pickups (type 8)
 	// Breakdown by type
 	DoubleDamage int `json:"doubleDamage,omitempty"` // type 0
 	Haste        int `json:"haste,omitempty"`        // type 1
@@ -1240,11 +1241,21 @@ func main() {
 				}
 			}
 
-			// Track TP usage (modifier_teleporting)
+			// Track TP scroll / travel boots usage. Both apply
+			// modifier_teleporting, so we have to disambiguate via the
+			// modifier_ability field — otherwise hero ult teleports
+			// (Nature's Prophet, Boots of Travel, Spirit Breaker charge,
+			// etc.) get counted as TP scrolls and inflate the metric
+			// dramatically (NP can show 50+ "TPs" in a 30-min game).
 			if modifierName == "modifier_teleporting" && strings.Contains(targetName, "hero") {
-				targetIdx := heroNameToPlayerIndex(targetName, state)
-				if targetIdx >= 0 && targetIdx < 10 {
-					state.Players[targetIdx].TPCount++
+				modAbility := state.LookupName(m.GetModifierAbility())
+				isItemTP := modAbility == "item_tpscroll" ||
+					strings.Contains(modAbility, "travel_boots")
+				if isItemTP {
+					targetIdx := heroNameToPlayerIndex(targetName, state)
+					if targetIdx >= 0 && targetIdx < 10 {
+						state.Players[targetIdx].TPCount++
+					}
 				}
 			}
 			
@@ -1313,7 +1324,10 @@ func main() {
 			}
 
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_PICKUP_RUNE:
-			// Attacker = hero who picks up, Target = rune entity
+			// Attacker = hero who picks up, Target = rune entity.
+			// NOTE: this combat-log type doesn't fire in current Dota replays
+			// (kept for backwards compat); actual pickup attribution happens
+			// in the entity-destroyed handler (~line 1693).
 			heroName := state.LookupName(m.GetAttackerName())
 			runeType := int(m.GetRuneType())
 			playerIdx := heroNameToPlayerIndex(heroName, state)
@@ -1669,35 +1683,32 @@ func main() {
 			}
 		}
 
-		// Rune entity destroyed = picked up or expired
+		// Rune entity destroyed = picked up or expired. Power runes (DD,
+		// Haste, Invis, Regen, Arcane, Shield) trigger modifier_rune_*
+		// buffs and are already tracked above. Non-power runes (bounty,
+		// water, wisdom, illusion) don't apply persistent modifiers, so
+		// we attribute them to the nearest hero at destroy time.
 		if className == "CDOTA_Item_Rune" && op&manta.EntityOpDeleted != 0 {
 			runeTime := state.ActualGameSeconds(state.GameTime())
 			idx := e.GetIndex()
 			if runeInfo, exists := state.PendingRunes[idx]; exists {
-				// Find nearest hero by position
 				nearestPlayer := findNearestHero(state, runeInfo.PosX, runeInfo.PosY)
 				if nearestPlayer >= 0 {
-					// For bounty runes (type=5): verify with gold_reason=17 event within 5 seconds
-					if runeInfo.RuneType == 5 {
-						if hasBountyGoldNear(state, runeTime, nearestPlayer) {
-							state.Players[nearestPlayer].Runes = append(state.Players[nearestPlayer].Runes, RuneEvent{
-								Time:     runeTime,
-								RuneType: runeInfo.RuneType,
-								Action:   1, // pickup
-							})
-						}
-					} else if runeInfo.RuneType == 7 {
-						// Water runes (type=7): attribute via proximity (no gold/modifier to verify)
+					attribute := false
+					switch runeInfo.RuneType {
+					case 5: // bounty: confirm via gold_reason=17 within 5s
+						attribute = hasBountyGoldNear(state, runeTime, nearestPlayer)
+					case 2, 7, 8: // illusion, water, wisdom: proximity-based
 						dist := heroDistToPoint(state, nearestPlayer, runeInfo.PosX, runeInfo.PosY)
-						if dist < 30 { // reasonable proximity threshold
-							state.Players[nearestPlayer].Runes = append(state.Players[nearestPlayer].Runes, RuneEvent{
-								Time:     runeTime,
-								RuneType: runeInfo.RuneType,
-								Action:   1, // pickup
-							})
-						}
+						attribute = dist < 40
 					}
-					// Power runes already tracked via modifier_add — skip entity-based for those
+					if attribute {
+						state.Players[nearestPlayer].Runes = append(state.Players[nearestPlayer].Runes, RuneEvent{
+							Time:     runeTime,
+							RuneType: runeInfo.RuneType,
+							Action:   1, // pickup
+						})
+					}
 				}
 				delete(state.PendingRunes, idx)
 			}
@@ -2059,6 +2070,8 @@ func buildRuneSummary(runes []RuneEvent) RuneSummary {
 			s.PowerRunes++
 		case 7: // Water
 			s.WaterRunes++
+		case 8: // Wisdom
+			s.WisdomRunes++
 		case 9: // Shield
 			s.Shield++
 			s.PowerRunes++
@@ -2372,6 +2385,6 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		PositionSamples:        state.PositionSamples,
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "3.1.2",
+		ParserVersion:          "3.1.3",
 	}
 }
