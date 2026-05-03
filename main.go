@@ -180,7 +180,10 @@ type RuneSummary struct {
 	PowerRunes   int `json:"powerRunes"`             // DD, Haste, Invis, Regen, Arcane, Shield, Illusion
 	BountyRunes  int `json:"bountyRunes"`            // bounty rune pickups
 	WaterRunes   int `json:"waterRunes"`             // water rune pickups
-	WisdomRunes  int `json:"wisdomRunes,omitempty"`  // wisdom rune pickups (type 8)
+	// Type 8 in current patches — exact identity unverified (wisdom rune
+	// was removed in 7.34+). Could be Lotus pickup or something else.
+	// Tracked here as opaque "type 8" for parity with OpenDota's `runes` map.
+	Rune8        int `json:"rune8,omitempty"`
 	// Breakdown by type
 	DoubleDamage int `json:"doubleDamage,omitempty"` // type 0
 	Haste        int `json:"haste,omitempty"`        // type 1
@@ -1686,7 +1689,7 @@ func main() {
 		// Rune entity destroyed = picked up or expired. Power runes (DD,
 		// Haste, Invis, Regen, Arcane, Shield) trigger modifier_rune_*
 		// buffs and are already tracked above. Non-power runes (bounty,
-		// water, wisdom, illusion) don't apply persistent modifiers, so
+		// water, illusion, type-8) don't apply persistent modifiers, so
 		// we attribute them to the nearest hero at destroy time.
 		if className == "CDOTA_Item_Rune" && op&manta.EntityOpDeleted != 0 {
 			runeTime := state.ActualGameSeconds(state.GameTime())
@@ -1698,7 +1701,7 @@ func main() {
 					switch runeInfo.RuneType {
 					case 5: // bounty: confirm via gold_reason=17 within 5s
 						attribute = hasBountyGoldNear(state, runeTime, nearestPlayer)
-					case 2, 7, 8: // illusion, water, wisdom: proximity-based
+					case 2, 7, 8: // illusion, water, type-8: proximity-based
 						dist := heroDistToPoint(state, nearestPlayer, runeInfo.PosX, runeInfo.PosY)
 						attribute = dist < 40
 					}
@@ -1909,67 +1912,182 @@ func heroNameStringToID(name string) int {
 	return 0
 }
 
+// detectLane classifies a hero's lane during the 1–10 minute laning phase
+// based on average map cell position. Source 2 cell coords: X grows east,
+// Y grows north. Radiant base is at the SW corner (~64,64), Dire base at
+// the NE corner (~192,192).
+//
+// Lane geometry (during laning phase, players stand near these areas):
+//   - bottom lane (south edge):  low Y,  X ~80–140  → radiant safe / dire off
+//   - top lane (west edge):      low X,  Y ~80–140  → radiant off / dire safe
+//   - mid:                       on diagonal X≈Y around 110–150
 func detectLane(positions []struct{ X, Y float64 }, isRadiant bool) string {
-	if len(positions) < 500 {
+	if len(positions) < 100 {
 		return "unknown"
 	}
-	
-	// Skip first 1000 samples (~spawn time), sample next 2000 (core laning phase)
-	start := 1000
-	if start >= len(positions) {
-		start = len(positions) / 4
+	// Skip first 20% (early movement out of fountain) and avg over the rest.
+	start := len(positions) / 5
+	var sumX, sumY float64
+	n := 0
+	for i := start; i < len(positions); i++ {
+		sumX += positions[i].X
+		sumY += positions[i].Y
+		n++
 	}
-	end := start + 2000
-	if end > len(positions) {
-		end = len(positions)
-	}
-	
-	var avgX, avgY float64
-	count := 0
-	for i := start; i < end; i++ {
-		avgX += positions[i].X
-		avgY += positions[i].Y
-		count++
-	}
-	if count == 0 {
+	if n == 0 {
 		return "unknown"
 	}
-	avgX /= float64(count)
-	avgY /= float64(count)
-	
-	// Map is roughly 256x256 cells
-	// Radiant base ~(64,64), Dire base ~(192,192)
-	// Safe lane for Radiant = bottom (high Y), Off = top (low Y)
-	// Safe lane for Dire = top (low Y), Off = bottom (high Y)
-	
-	// Determine quadrant
-	midX, midY := 128.0, 128.0
-	
-	if avgY > midY+30 { // Bottom half (Y > 158)
-		if avgX < midX-10 { // Bottom-left = Radiant safe lane area
-			if isRadiant {
-				return "safe"
-			}
-			return "off"
-		} else { // Bottom-right = transitional/mid area
-			return "roam"
-		}
-	} else if avgY < midY-30 { // Top half (Y < 98)  
-		if avgX > midX+10 { // Top-right = Dire safe lane area
-			if isRadiant {
-				return "off"
-			}
+	avgX := sumX / float64(n)
+	avgY := sumY / float64(n)
+
+	// Bottom lane corridor (Y is small, X varies 60..180).
+	bottomLane := avgY < 110 && avgX >= 60 && avgX <= 200
+	// Top lane corridor (X is small, Y varies 60..180).
+	topLane := avgX < 110 && avgY >= 60 && avgY <= 200
+	// Mid lane: along the diagonal X≈Y, in the central band.
+	midLane := math.Abs(avgX-avgY) < 30 && avgX >= 100 && avgX <= 170
+
+	// Mid takes priority because mid corridor partly overlaps
+	// jungle/transition zones.
+	if midLane {
+		return "mid"
+	}
+	if bottomLane {
+		if isRadiant {
 			return "safe"
-		} else { // Top-left = transitional
-			return "roam"
 		}
-	} else { // Middle band
-		// Check for mid lane (diagonal)
-		if avgX > midX-20 && avgX < midX+20 && avgY > midY-20 && avgY < midY+20 {
-			return "mid"
-		}
-		return "roam"
+		return "off"
 	}
+	if topLane {
+		if isRadiant {
+			return "off"
+		}
+		return "safe"
+	}
+	// Far from any lane corridor → likely jungling or roaming between lanes.
+	if avgX > 110 && avgX < 180 && avgY > 110 && avgY < 180 {
+		return "jungle"
+	}
+	return "roam"
+}
+
+// detectLanePartner finds the hero (player index 0..9) on the same team
+// that this hero spent most of the laning phase next to. Uses the
+// minute-snapshot position samples shared between players. Returns -1 if
+// no clear partner.
+//
+// "next to" = within 30 cells. We count overlapping positions per minute
+// snapshot; the partner is the teammate with the highest match count.
+func detectLanePartner(state *ParserState, playerIdx int) int {
+	if playerIdx < 0 || playerIdx >= 10 {
+		return -1
+	}
+	me := state.Players[playerIdx]
+	if len(me.LanePositions) < 30 {
+		return -1
+	}
+	bestPartner := -1
+	bestScore := 0
+	for j := 0; j < 10; j++ {
+		if j == playerIdx {
+			continue
+		}
+		other := state.Players[j]
+		if other.IsRadiant != me.IsRadiant {
+			continue
+		}
+		if len(other.LanePositions) < 30 {
+			continue
+		}
+		// Position arrays have one entry per server tick during 1-10 min.
+		// Lengths may differ slightly; use the shorter.
+		n := len(me.LanePositions)
+		if len(other.LanePositions) < n {
+			n = len(other.LanePositions)
+		}
+		score := 0
+		for k := 0; k < n; k++ {
+			dx := me.LanePositions[k].X - other.LanePositions[k].X
+			dy := me.LanePositions[k].Y - other.LanePositions[k].Y
+			if dx*dx+dy*dy < 30*30 { // within 30 cells (squared comparison)
+				score++
+			}
+		}
+		// Require at least 30% overlap to consider as partners.
+		if score > bestScore && score > n/3 {
+			bestScore = score
+			bestPartner = j
+		}
+	}
+	return bestPartner
+}
+
+// assignPositions classifies each player to a Dota position 1-5:
+//   1 = hard carry  (highest NW core on safe lane)
+//   2 = mid         (solo player on mid)
+//   3 = offlaner    (highest NW core on off lane)
+//   4 = soft support
+//   5 = hard support
+//
+// Algorithm:
+//  1. Group players by team and detected lane.
+//  2. Mid solo = pos 2.
+//  3. On safe/off, the higher-NW@10 player is core (1 or 3),
+//     the other is hard/soft support (5 or 4).
+//  4. Roamers default to pos 4 (soft support / roaming gank role).
+//
+// Returns map[playerIdx]position.
+func assignPositions(state *ParserState, lanes map[int]string) map[int]int {
+	pos := make(map[int]int, 10)
+	// Bucket per team+lane
+	type bucket struct{ idxs []int }
+	buckets := map[string]*bucket{}
+	for i := 0; i < 10; i++ {
+		side := "rad"
+		if !state.Players[i].IsRadiant {
+			side = "dire"
+		}
+		key := side + ":" + lanes[i]
+		if buckets[key] == nil {
+			buckets[key] = &bucket{}
+		}
+		buckets[key].idxs = append(buckets[key].idxs, i)
+	}
+	for key, b := range buckets {
+		// Sort by NW@10 desc — highest farm goes to core position.
+		sort.Slice(b.idxs, func(a, c int) bool {
+			return state.Players[b.idxs[a]].NWAt10 > state.Players[b.idxs[c]].NWAt10
+		})
+		switch {
+		case strings.HasSuffix(key, ":mid"):
+			for _, idx := range b.idxs {
+				pos[idx] = 2
+			}
+		case strings.HasSuffix(key, ":safe"):
+			// Highest NW = pos 1, lowest = pos 5.
+			for k, idx := range b.idxs {
+				if k == 0 {
+					pos[idx] = 1
+				} else {
+					pos[idx] = 5
+				}
+			}
+		case strings.HasSuffix(key, ":off"):
+			for k, idx := range b.idxs {
+				if k == 0 {
+					pos[idx] = 3
+				} else {
+					pos[idx] = 4
+				}
+			}
+		default:
+			// Roamers / jungle / unknown — default to pos 4.
+			for _, idx := range b.idxs {
+				pos[idx] = 4
+			}
+		}
+	}
+	return pos
 }
 
 // xpmAtTen returns XP per minute at 10 minutes using the best available source:
@@ -2070,8 +2188,8 @@ func buildRuneSummary(runes []RuneEvent) RuneSummary {
 			s.PowerRunes++
 		case 7: // Water
 			s.WaterRunes++
-		case 8: // Wisdom
-			s.WisdomRunes++
+		case 8: // Type 8 — identity unverified in current patch; see RuneSummary doc
+			s.Rune8++
 		case 9: // Shield
 			s.Shield++
 			s.PowerRunes++
@@ -2163,6 +2281,32 @@ func detectTeamfights(state *ParserState) []Teamfight {
 func buildMatchOutput(state *ParserState, duration float64) Match {
 	players := make([]Player, 10)
 
+	// Three-pass build: pass 1 classifies lane per player (geometry),
+	// pass 2 reconciles via lane partners (if my partner is on a "stronger"
+	// lane I'm probably with them — supports who roam through mid get
+	// pulled back to their core's lane), pass 3 assigns positions 1-5.
+	lanes := make(map[int]string, 10)
+	for i := 0; i < 10; i++ {
+		lanes[i] = detectLane(state.Players[i].LanePositions, state.Players[i].IsRadiant)
+	}
+	partners := make(map[int]int, 10)
+	for i := 0; i < 10; i++ {
+		partners[i] = detectLanePartner(state, i)
+	}
+	// Lane reconcile: prefer partner's lane if it's safe/off (more reliable
+	// than mid for support detection — supports often pass through mid).
+	for i := 0; i < 10; i++ {
+		p := partners[i]
+		if p < 0 {
+			continue
+		}
+		other := lanes[p]
+		if other == "safe" || other == "off" {
+			lanes[i] = other
+		}
+	}
+	positions := assignPositions(state, lanes)
+
 	for i := 0; i < 10; i++ {
 		ps := state.Players[i]
 
@@ -2228,8 +2372,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			}
 		}
 
-		// Detect lane
-		lane := detectLane(ps.LanePositions, ps.IsRadiant)
+		// Lane (from pass-1 detection above)
+		lane := lanes[i]
 		laneInt := 0
 		switch lane {
 		case "safe":
@@ -2242,10 +2386,14 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			laneInt = 4
 		}
 
-		// Calculate role/position based on networth at 10 min
-		role := 0 // core
-		position := i%5 + 1
-		if ps.NWAt10 < 3000 { // Low farm = support
+		// Position 1-5 from pass-2 assignment.
+		position := positions[i]
+		if position == 0 {
+			position = 4 // fallback
+		}
+		// Role: 0 = core (positions 1, 2, 3), 1 = support (positions 4, 5).
+		role := 0
+		if position >= 4 {
 			role = 1
 		}
 
@@ -2271,6 +2419,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			CampStacks:           ps.CampStacks,
 			LaneStats: LaneStats{
 				Lane:          lane,
+				LanePartner:   partners[i],
 				ReaggroCount:  ps.LaneHarassCount, // Lane harass events as aggro proxy
 				DeathsPreTen:  ps.LaneDeaths,
 				KillsPreTen:   ps.LaneKills,
@@ -2385,6 +2534,6 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		PositionSamples:        state.PositionSamples,
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "3.1.3",
+		ParserVersion:          "3.1.4",
 	}
 }
