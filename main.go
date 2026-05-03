@@ -543,71 +543,34 @@ var entityClassToItemName = map[string]string{
 	"Whisper_Of_The_Dread":"item_whisper_of_the_dread",
 }
 
-// itemNameToID maps standard item_ names to Dota 2 item IDs (from OpenDota constants)
-var itemNameToID = map[string]int{
-	"item_blink": 1, "item_blades_of_attack": 2, "item_broadsword": 3,
-	"item_chainmail": 4, "item_claymore": 5, "item_helm_of_iron_will": 6,
-	"item_javelin": 7, "item_mithril_hammer": 8, "item_platemail": 9,
-	"item_quelling_blade": 11, "item_ring_of_protection": 12,
-	"item_gauntlets": 13, "item_slippers": 14, "item_mantle": 15, "item_branches": 16,
-	"item_belt_of_strength": 17, "item_boots_of_elves": 18, "item_robe": 19,
-	"item_circlet": 20, "item_ogre_axe": 21, "item_blade_of_alacrity": 22,
-	"item_staff_of_wizardry": 23, "item_ultimate_orb": 24, "item_gloves": 25,
-	"item_ring_of_regen": 27, "item_sobi_mask": 28, "item_boots": 29,
-	"item_gem": 30, "item_cloak": 31, "item_talisman_of_evasion": 32,
-	"item_cheese": 33, "item_magic_stick": 34, "item_magic_wand": 36,
-	"item_ghost": 37, "item_clarity": 38, "item_flask": 39,
-	"item_dust": 40, "item_bottle": 41, "item_ward_observer": 42,
-	"item_ward_sentry": 43, "item_tango": 44, "item_tpscroll": 46,
-	"item_phase_boots": 50, "item_demon_edge": 51, "item_eagle": 52,
-	"item_reaver": 53, "item_relic": 54, "item_hyperstone": 55,
-	"item_ring_of_health": 56, "item_void_stone": 57, "item_mystic_staff": 58,
-	"item_energy_booster": 59, "item_point_booster": 60, "item_vitality_booster": 61,
-	"item_power_treads": 63, "item_hand_of_midas": 65,
-	"item_oblivion_staff": 67, "item_pers": 69,
-	"item_bracer": 73, "item_wraith_band": 75, "item_null_talisman": 77,
-	"item_mekansm": 79, "item_vladmir": 81, "item_buckler": 86,
-	"item_ring_of_basilius": 88, "item_pipe": 90, "item_urn_of_shadows": 92,
-	"item_headdress": 94, "item_sheepstick": 96, "item_orchid": 98,
-	"item_cyclone": 100, "item_force_staff": 102, "item_dagon": 104,
-	"item_vanguard": 106, "item_blade_mail": 107, "item_soul_ring": 108,
-	"item_rod_of_atos": 109, "item_abyssal_blade": 111,
-	"item_heavens_halberd": 112, "item_tranquil_boots": 114,
-	"item_shadow_amulet": 115, "item_glimmer_cape": 116, "item_solar_crest": 117,
-	"item_ancient_janggo": 118, "item_diffusal_blade": 119, "item_manta": 120,
-	"item_sange": 121, "item_yasha": 122, "item_kaya": 123,
-	"item_sange_and_yasha": 124, "item_yasha_and_kaya": 125, "item_kaya_and_sange": 126,
-	"item_basher": 127, "item_bfury": 128, "item_monkey_king_bar": 129,
-	"item_dragon_lance": 130, "item_maelstrom": 131, "item_mjollnir": 132,
-	"item_skadi": 133, "item_satanic": 134, "item_black_king_bar": 135,
-	"item_heart": 136, "item_assault": 137, "item_refresher": 138,
-	"item_shivas_guard": 139, "item_mask_of_madness": 140, "item_desolator": 141,
-	"item_arcane_boots": 142, "item_helm_of_the_dominator": 143,
-	"item_octarine_core": 144, "item_spirit_vessel": 145,
-	"item_nullifier": 146, "item_radiance": 147, "item_butterfly": 148,
-	"item_ethereal_blade": 149, "item_rapier": 150, "item_ultimate_scepter": 151,
-	"item_pavise": 152, "item_soul_booster": 153,
-	"item_stout_shield": 182, "item_ward_dispenser": 218,
-	"item_enchanted_mango": 216, "item_moon_shard": 247,
-	"item_bloodthorn": 250, "item_echo_sabre": 252, "item_wind_lace": 244,
-	"item_faerie_fire": 237, "item_infused_raindrop": 265,
-	"item_crown": 261, "item_hurricane_pike": 263, "item_holy_locket": 269,
-	"item_ring_of_tarrasque": 279, "item_fluffy_hat": 593,
-	"item_blitz_knuckles": 485, "item_witch_blade": 534,
-	"item_overwhelming_blink": 600, "item_swift_blink": 603,
-	"item_arcane_blink": 604, "item_wind_waker": 610,
-	"item_diadem": 1122, "item_blood_grenade": 1123,
-	"item_cornucopia": 1125, "item_greater_crit": 141, // Note: same as desolator in some builds — verify
-	"item_lesser_crit": 122, // Verify
-	"item_gungir": 1466, // Approximate
-	"item_aghanims_shard": 609,
-	"item_smoke_of_deceit": 188,
-	"item_lotus_orb": 226, "item_sphere": 223, "item_guardian_greaves": 231,
-	"item_aether_lens": 232, "item_veil_of_discord": 242,
-	"item_crimson_guard": 229, "item_wraith_pact": 908,
-	"item_tiara_of_selemene": 1802,
-	"item_aegis": 117, "item_refresher_shard": 725,
-	"item_blight_stone": 572, "item_planewalkers_cloak": 1813,
+// itemNameToID is generated from OpenDota constants — see items_constants.go.
+
+// isBuildingTarget returns true if the combat-log target name refers to a
+// destructible structure (tower, barracks, fort/ancient, shrine). OpenDota
+// counts damage to all of these under tower_damage.
+func isBuildingTarget(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, sub := range []string{"tower", "rax", "barrack", "fort", "ancient", "shrine", "building"} {
+		if strings.Contains(name, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildingIsRadiant tells which side a structure belongs to based on naming
+// (Dota uses goodguys = radiant, badguys = dire). Returns false for second
+// return if undecidable.
+func buildingIsRadiant(name string) (bool, bool) {
+	if strings.Contains(name, "goodguys") {
+		return true, true
+	}
+	if strings.Contains(name, "badguys") {
+		return false, true
+	}
+	return false, false
 }
 
 // normalizeEntityItemName converts entity class name to standard item_ format
@@ -834,6 +797,7 @@ func NewParserState(p *manta.Parser) *ParserState {
 			// IsRadiant is resolved from CDOTA_PlayerResource.m_vecPlayerData.NNNN.m_iPlayerTeam
 			// at parse time. Hardcoding `i < 5` here was wrong — player_id ordering
 			// does not always align with team membership (see match 8788500456).
+			LastMinute:      -1, // first snapshot fires at gameMinute=0 (horn) so series[i] aligns with OpenDota's gold_t/xp_t/lh_t/dn_t at minute i.
 			ItemPurchases:   make([]ItemPurchase, 0),
 			DeathEvents:     make([]DeathEvent, 0),
 			KillEvents:      make([]KillEvent, 0),
@@ -1182,32 +1146,37 @@ func main() {
 				attackerIdx := heroNameToPlayerIndex(attackerName, state)
 				targetIdx := heroNameToPlayerIndex(targetName, state)
 
-				if attackerIdx >= 0 && attackerIdx < 10 {
+				// hero_damage = damage dealt to *enemy* heroes only (OpenDota
+				// definition). Skip self-damage and ally-damage.
+				isEnemyHero := attackerIdx >= 0 && attackerIdx < 10 &&
+					targetIdx >= 0 && targetIdx < 10 &&
+					attackerIdx != targetIdx &&
+					state.Players[attackerIdx].IsRadiant != state.Players[targetIdx].IsRadiant
+
+				if isEnemyHero {
 					state.Players[attackerIdx].HeroDamage += damage
 
 					// Track damage by target
-					if targetIdx >= 0 {
-						if state.Players[attackerIdx].DamageByTarget[targetIdx] == nil {
-							state.Players[attackerIdx].DamageByTarget[targetIdx] = &DamageTarget{Target: targetIdx}
-						}
-						switch damageType {
-						case 1: // Physical
-							state.Players[attackerIdx].DamageByTarget[targetIdx].PhysicalDamage += damage
-
-							// Track reaggro (physical attacks on heroes during laning)
-							if actualTime > 60 && actualTime < 600 {
-								state.Players[attackerIdx].LaneHarassCount++
-							}
-						case 2: // Magical
-							state.Players[attackerIdx].DamageByTarget[targetIdx].MagicalDamage += damage
-						case 4: // Pure
-							state.Players[attackerIdx].DamageByTarget[targetIdx].PureDamage += damage
-						}
+					if state.Players[attackerIdx].DamageByTarget[targetIdx] == nil {
+						state.Players[attackerIdx].DamageByTarget[targetIdx] = &DamageTarget{Target: targetIdx}
 					}
+					switch damageType {
+					case 1: // Physical
+						state.Players[attackerIdx].DamageByTarget[targetIdx].PhysicalDamage += damage
 
+						// Track reaggro (physical attacks on heroes during laning)
+						if actualTime > 60 && actualTime < 600 {
+							state.Players[attackerIdx].LaneHarassCount++
+						}
+					case 2: // Magical
+						state.Players[attackerIdx].DamageByTarget[targetIdx].MagicalDamage += damage
+					case 4: // Pure
+						state.Players[attackerIdx].DamageByTarget[targetIdx].PureDamage += damage
 					}
+				}
 
-				// Track damage received by target
+				// Track damage received by target (any hero→hero, even ally —
+				// this is the inverse view, useful for separate analysis).
 				if targetIdx >= 0 && targetIdx < 10 {
 					switch damageType {
 					case 1:
@@ -1219,19 +1188,33 @@ func main() {
 					}
 				}
 			}
-			
-			if strings.Contains(targetName, "tower") || strings.Contains(targetName, "building") {
+
+			// tower_damage = damage by hero to *enemy* buildings only.
+			// OpenDota lumps tower/rax/ancient/fort under tower_damage, but
+			// excludes ally-side damage (e.g. teammate's tower hit by AoE).
+			if isBuildingTarget(targetName) && strings.Contains(attackerName, "hero") {
 				attackerIdx := heroNameToPlayerIndex(attackerName, state)
 				if attackerIdx >= 0 && attackerIdx < 10 {
-					state.Players[attackerIdx].TowerDamage += damage
+					if isRad, ok := buildingIsRadiant(targetName); ok && isRad != state.Players[attackerIdx].IsRadiant {
+						state.Players[attackerIdx].TowerDamage += damage
+					}
 				}
 			}
 
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_HEAL:
 			attackerName := state.LookupName(m.GetAttackerName())
+			targetName := state.LookupName(m.GetTargetName())
 			value := int(m.GetValue())
 			attackerIdx := heroNameToPlayerIndex(attackerName, state)
-			if attackerIdx >= 0 && attackerIdx < 10 {
+			targetIdx := heroNameToPlayerIndex(targetName, state)
+			// hero_healing = healing applied to *allied* heroes excluding self,
+			// to match OpenDota's definition. Skip self-heal, non-hero targets,
+			// regen, and enemy heroes.
+			if attackerIdx >= 0 && attackerIdx < 10 &&
+				strings.Contains(targetName, "hero") &&
+				attackerName != targetName &&
+				targetIdx >= 0 && targetIdx < 10 &&
+				state.Players[attackerIdx].IsRadiant == state.Players[targetIdx].IsRadiant {
 				state.Players[attackerIdx].HeroHealing += value
 			}
 
@@ -1411,23 +1394,31 @@ func main() {
 						}
 					}
 					
-					// Track current items (will have final items at end of parse)
-					for i := 0; i < 6; i++ {
-						key := fmt.Sprintf("m_hItems.%04d", i)
-						if handle, ok := e.GetUint32(key); ok && handle > 0 && handle < 16777215 {
-							entityIdx := int32(handle & 0x3FFF)
-							if itemName, exists := state.ItemEntities[entityIdx]; exists {
-								state.Players[playerIdx].FinalItems[i] = itemName
+					// Track current items. Resolve handle → entity → className live;
+					// the ItemEntities cache can return stale names after entity index
+					// reuse (manta recycles indexes when entities are destroyed).
+					resolveItem := func(slotKey string) string {
+						handle, ok := e.GetUint32(slotKey)
+						if !ok || handle == 0 || handle >= 16777215 {
+							return ""
+						}
+						entityIdx := int32(handle & 0x3FFF)
+						if itemEnt := state.Parser.FindEntity(entityIdx); itemEnt != nil {
+							cn := itemEnt.GetClassName()
+							if strings.HasPrefix(cn, "CDOTA_Item_") {
+								return normalizeEntityItemName(strings.TrimPrefix(cn, "CDOTA_Item_"))
 							}
 						}
+						return state.ItemEntities[entityIdx]
 					}
-					// Neutral item (slot 16)
-					if handle, ok := e.GetUint32("m_hItems.0016"); ok && handle > 0 && handle < 16777215 {
-						entityIdx := int32(handle & 0x3FFF)
-						if itemName, exists := state.ItemEntities[entityIdx]; exists {
-							state.Players[playerIdx].FinalNeutral = itemName
-						}
+					for i := 0; i < 6; i++ {
+						state.Players[playerIdx].FinalItems[i] = resolveItem(fmt.Sprintf("m_hItems.%04d", i))
 					}
+					for i := 0; i < 3; i++ {
+						name := resolveItem(fmt.Sprintf("m_hItems.%04d", 6+i))
+						state.Players[playerIdx].Backpack[i] = itemNameToID[name]
+					}
+					state.Players[playerIdx].FinalNeutral = resolveItem("m_hItems.0016")
 
 					// Track TP scroll in dedicated slot 15 (Dota 2 7.23+)
 					if handle, ok := e.GetUint32("m_hItems.0015"); ok && handle > 0 && handle < 16777215 {
@@ -1576,8 +1567,12 @@ func main() {
 					ps.XP = int(xp) // Override combat log XP with entity value
 				}
 				
-				// Record per-minute snapshot (only after GameStartTime is known)
-				if gameMinute > ps.LastMinute && gameMinute > 0 && state.GameStartTime > 0 {
+				// Record per-minute snapshot (only after GameStartTime is known
+				// and before game-end). LastMinute starts at -1 so the first
+				// snapshot fires at gameMinute=0 (horn), aligning ours[i] with
+				// OpenDota's *_t[i] at minute i.
+				gameOver := state.GameEndTime > 0 && state.GameTime() > state.GameEndTime
+				if gameMinute > ps.LastMinute && state.GameStartTime > 0 && !gameOver {
 					ps.MinuteSnapshots = append(ps.MinuteSnapshots, MinuteSnapshot{
 						Gold:   ps.Gold,
 						XP:     ps.XP,
@@ -1776,6 +1771,27 @@ func main() {
 		duration = state.GameTime() // fallback to tick-based
 		log.Printf("Using tick-based duration: %.0fs", duration)
 	}
+
+	// Make series[final_minute] reflect game-end values. Our regular minute
+	// snapshot fires at the *first* tick after each minute boundary — so the
+	// snapshot at minute N captures values at ~N:00, not the activity that
+	// happened during minute N. OpenDota's *_t[N] is the cumulative value at
+	// the *end* of minute N. Either replace the existing last snapshot with
+	// current values, or append one if we never reached the final minute.
+	finalMinute := int(duration / 60)
+	finalSnap := func(ps *PlayerState) MinuteSnapshot {
+		return MinuteSnapshot{Gold: ps.Gold, XP: ps.XP, LH: ps.LastHits, Denies: ps.Denies, NW: ps.NetWorth, Level: ps.Level}
+	}
+	for i := 0; i < 10; i++ {
+		ps := state.Players[i]
+		if len(ps.MinuteSnapshots) > finalMinute {
+			ps.MinuteSnapshots[finalMinute] = finalSnap(ps)
+			ps.MinuteSnapshots = ps.MinuteSnapshots[:finalMinute+1]
+		} else {
+			ps.MinuteSnapshots = append(ps.MinuteSnapshots, finalSnap(ps))
+		}
+	}
+
 	match := buildMatchOutput(state, duration)
 
 	jsonData, err := json.MarshalIndent(match, "", "  ")
@@ -2140,6 +2156,14 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		gpm := 0
 		xpm := 0
 		if duration > 0 {
+			// gpm uses NetWorth/minutes as a proxy. The "true" total-gold-
+			// earned isn't available without reconstructing from combat log
+			// gold events with reason filtering — matching OpenDota's
+			// gold_per_min exactly would require reverse-engineering their
+			// reason allowlist. Currently within ~10% of OpenDota; consumers
+			// that need higher precision should compute from `goldPerMinute[]`
+			// (cumulative current cash) or pull gold_per_min from OpenDota
+			// directly. See deriveGpm() in src/lib/games.ts (Next.js).
 			gpm = int(float64(ps.NetWorth) / (duration / 60.0))
 			xpm = int(float64(ps.XP) / (duration / 60.0))
 		}
@@ -2348,6 +2372,6 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		PositionSamples:        state.PositionSamples,
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "3.1.1",
+		ParserVersion:          "3.1.2",
 	}
 }

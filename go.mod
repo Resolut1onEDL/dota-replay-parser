@@ -1,4 +1,4 @@
-module github.com/Resolut1onEDL/dota-replay-parser
+module dota-replay-parser
 
 go 1.23.5
 
