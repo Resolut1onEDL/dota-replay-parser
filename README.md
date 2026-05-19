@@ -27,7 +27,9 @@ Stdout is the JSON output. Stderr carries progress logs. Exit code 0 = success.
   "lobbyType":       <int>
   "didRadiantWin":   <bool>
   "durationSeconds": <int>
-  "startDateTime":   <unix sec>
+  "startDateTime":   <unix sec>  // first packet of demo (pick/strategy phase)
+  "hornDateTime":    <unix sec>  // game-clock 0 (creeps spawn)
+  "pauses":          [ { gameTime, wallStart, durationSec, pausedBy } ]
   "players":         [ {...} x10 ]
   "teamfights":      [...]
   "roshanKills":     [...]
@@ -35,6 +37,20 @@ Stdout is the JSON output. Stderr carries progress logs. Exit code 0 = success.
   "parserVersion":   "<semver>"
 }
 ```
+
+### Wall-clock alignment (e.g. voice transcripts → game events)
+
+`startDateTime` points to the demo's first packet (pick/strategy). For aligning
+external timestamps with in-game events, use `hornDateTime` (= unix sec at
+game-clock 0). To map a wall-clock unix timestamp `T` to game seconds:
+
+```
+game_sec(T) = (T - hornDateTime) - Σ pause.durationSec for each pause where pause.wallStart <= T
+```
+
+All per-event times inside the output (`teamfights[].startTime`, `deaths[].time`,
+`roshanKills[].time`, …) are game-clock seconds already (0 = horn, negative =
+pregame), so this gives you the axis to compare against them.
 
 Per-player fields include `steamAccountId`, `heroId`, `heroName`, `isRadiant`,
 `isVictory`, `kills`/`deaths`/`assists`, `networth`, `goldPerMinute`,

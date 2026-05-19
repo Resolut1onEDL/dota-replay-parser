@@ -292,6 +292,17 @@ type Player struct {
 	Stats *PlayerStats `json:"stats,omitempty"`
 }
 
+// PauseEvent records a single in-game pause. GameTime/WallStart are captured at
+// pause start; DurationSec is the real-time length of the pause. Voice/chat
+// transcripts at wall-clock T can be converted to game-clock by subtracting the
+// cumulative duration of all pauses with WallStart <= T from (T - HornDateTime).
+type PauseEvent struct {
+	GameTime    float64 `json:"gameTime"`           // game-clock sec (0 = horn) at pause start
+	WallStart   int64   `json:"wallStart"`          // unix sec when pause started
+	DurationSec float64 `json:"durationSec"`        // real-time pause length
+	PausedBy    int     `json:"pausedBy,omitempty"` // team that initiated (2=radiant, 3=dire)
+}
+
 type Match struct {
 	ID               int64    `json:"id"`
 	GameMode         int      `json:"gameMode"`
@@ -299,10 +310,15 @@ type Match struct {
 	DidRadiantWin    bool     `json:"didRadiantWin"`
 	DurationSeconds  int      `json:"durationSeconds"`
 	StartDateTime    int64    `json:"startDateTime,omitempty"`
-	
+	// HornDateTime is unix seconds at game-clock 0 (horn). Use this — not
+	// StartDateTime — to align wall-clock voice/chat timestamps with game events.
+	// StartDateTime points to the demo's first packet (pick/strategy phase).
+	HornDateTime int64        `json:"hornDateTime,omitempty"`
+	Pauses       []PauseEvent `json:"pauses,omitempty"`
+
 	RadiantNetworthLeads   []int `json:"radiantNetworthLeads,omitempty"`
 	RadiantExperienceLeads []int `json:"radiantExperienceLeads,omitempty"`
-	
+
 	// Match events
 	RoshanKills   []RoshanEvent   `json:"roshanKills,omitempty"`
 	Buybacks      []BuybackEvent  `json:"buybacks,omitempty"`
@@ -742,6 +758,24 @@ type ParserState struct {
 	GameStartTime float64 // m_flGameStartTime (server time when game clock starts)
 	GameEndTime   float64 // m_flGameEndTime (server time when game ends)
 
+	// Wall-clock alignment. TickInterval comes from CSVCMsg_ServerInfo (seconds
+	// per tick; ~1/30 for Dota 2). HornTick is the parser tick when GameStartTime
+	// first became non-zero — i.e. the horn moment. Combined with StartTime
+	// (replay-start unix sec) they yield hornDateTime in unix sec at output.
+	TickInterval float32
+	HornTick     uint32
+
+	// Pause tracking. PauseActive mirrors m_pGameRules.m_bGamePaused. On false→true
+	// we snapshot tick + game-time + team; on true→false we compute duration and
+	// append to Pauses. PauseStartTicks is a parallel slice of start ticks used
+	// by buildMatch to fill WallStart once StartTime is known.
+	PauseActive        bool
+	PauseStartTick     uint32
+	PauseStartGameSec  float64
+	PauseStartedByTeam int
+	Pauses             []PauseEvent
+	PauseStartTicks    []uint32
+
 	// Rune entity tracking for pickup attribution
 	PendingRunes map[int32]*RuneEntityInfo // entityIdx → rune info
 
@@ -795,6 +829,7 @@ func NewParserState(p *manta.Parser) *ParserState {
 		PendingRunes:       make(map[int32]*RuneEntityInfo),
 		BountyGoldEvents:   make([]BountyGoldEvent, 0),
 		PositionSamples:    make([]PositionSample, 0),
+		Pauses:             make([]PauseEvent, 0),
 	}
 	for i := 0; i < 10; i++ {
 		state.Players[i] = &PlayerState{
@@ -925,6 +960,15 @@ func main() {
 
 	state := NewParserState(p)
 
+	// Capture tick interval (seconds per tick) for wall-clock conversion of
+	// per-tick events. Dota 2 ships at 30 tps so this is normally ~0.0333.
+	p.Callbacks.OnCSVCMsg_ServerInfo(func(m *dota.CSVCMsg_ServerInfo) error {
+		if ti := m.GetTickInterval(); ti > 0 {
+			state.TickInterval = ti
+		}
+		return nil
+	})
+
 	// Demo file info callback (contains match ID)
 	p.Callbacks.OnCDemoFileInfo(func(m *dota.CDemoFileInfo) error {
 		if gi := m.GetGameInfo(); gi != nil {
@@ -943,6 +987,16 @@ func main() {
 		gameTime := float64(m.GetTimestamp())
 		actualTime := state.ActualGameSeconds(gameTime) // 0 = horn
 		logType := m.GetType()
+
+		// HornTick: first combat-log event at or after horn (game-clock >= 0)
+		// once GameStartTime is known. Combat-log entries arrive every server
+		// tick during gameplay so this lands within ~33ms of true horn. We
+		// store the server tick (p.NetTick) — not p.Tick — because tick × the
+		// interval from CSVCMsg_ServerInfo must yield server-time, which is
+		// what GameStartTime is denominated in.
+		if state.HornTick == 0 && state.GameStartTime > 0 && actualTime >= 0 {
+			state.HornTick = p.NetTick
+		}
 
 		switch logType {
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_DEATH:
@@ -1511,9 +1565,51 @@ func main() {
 			if startTime, ok := e.GetFloat32("m_pGameRules.m_flGameStartTime"); ok {
 				state.GameStartTime = float64(startTime)
 			}
+			// HornTick is set from the combat-log callback (see below) on the
+			// first event with actualTime >= 0. m_pGameRules.m_iGameState is
+			// not reliably exposed via Entity Get() on the proxy in this
+			// schema, so we use the combat-log signal instead — it fires
+			// within one server tick of horn, which is plenty for second-
+			// level wall-clock alignment.
 			if endTime, ok := e.GetFloat32("m_pGameRules.m_flGameEndTime"); ok {
 				if endTime > 0 {
 					state.GameEndTime = float64(endTime)
+				}
+			}
+
+			// Pause tracking. m_bGamePaused flips true on pause-in, false on
+			// pause-out. We snapshot at the edges and compute duration from
+			// the tick delta × tickInterval. WallStart is filled in buildMatch
+			// (depends on StartTime from CDemoFileInfo, which fires at end
+			// of demo). The parallel PauseStartTicks slice carries the start
+			// tick of each entry in Pauses.
+			if paused, ok := e.GetBool("m_pGameRules.m_bGamePaused"); ok {
+				if paused && !state.PauseActive {
+					state.PauseActive = true
+					state.PauseStartTick = p.NetTick
+					if state.GameStartTime > 0 && state.TickInterval > 0 {
+						state.PauseStartGameSec = float64(p.NetTick)*float64(state.TickInterval) - state.GameStartTime
+					} else {
+						state.PauseStartGameSec = 0
+					}
+					if team, ok2 := e.GetInt32("m_pGameRules.m_iPauseTeam"); ok2 {
+						state.PauseStartedByTeam = int(team)
+					} else {
+						state.PauseStartedByTeam = 0
+					}
+				} else if !paused && state.PauseActive {
+					state.PauseActive = false
+					ticks := p.NetTick - state.PauseStartTick
+					dur := float64(ticks) * float64(state.TickInterval)
+					if dur < 0 {
+						dur = 0
+					}
+					state.Pauses = append(state.Pauses, PauseEvent{
+						GameTime:    state.PauseStartGameSec,
+						DurationSec: dur,
+						PausedBy:    state.PauseStartedByTeam,
+					})
+					state.PauseStartTicks = append(state.PauseStartTicks, state.PauseStartTick)
 				}
 			}
 		}
@@ -2517,6 +2613,23 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		xpLeads = append(xpLeads, radXP-direXP)
 	}
 
+	// Horn wall-clock: replay-start wall-clock + (hornTick × tickInterval).
+	// Only emit if we captured both endpoints; otherwise 0 and the field is
+	// omitempty-elided so consumers can detect "unknown" cleanly.
+	var hornDateTime int64
+	if state.StartTime > 0 && state.HornTick > 0 && state.TickInterval > 0 {
+		hornDateTime = state.StartTime + int64(float64(state.HornTick)*float64(state.TickInterval))
+	}
+
+	// Fill WallStart of each pause from its start tick (parallel slice).
+	if state.StartTime > 0 && state.TickInterval > 0 {
+		for i := range state.Pauses {
+			if i < len(state.PauseStartTicks) {
+				state.Pauses[i].WallStart = state.StartTime + int64(float64(state.PauseStartTicks[i])*float64(state.TickInterval))
+			}
+		}
+	}
+
 	return Match{
 		ID:                     state.MatchID,
 		GameMode:               state.GameMode,
@@ -2524,6 +2637,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		DidRadiantWin:          state.RadiantWin,
 		DurationSeconds:        int(duration),
 		StartDateTime:          state.StartTime,
+		HornDateTime:           hornDateTime,
+		Pauses:                 state.Pauses,
 		RadiantNetworthLeads:   nwLeads,
 		RadiantExperienceLeads: xpLeads,
 		RoshanKills:            state.RoshanKills,
@@ -2534,6 +2649,6 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		PositionSamples:        state.PositionSamples,
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "3.1.4",
+		ParserVersion:          "3.2.0",
 	}
 }
