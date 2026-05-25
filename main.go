@@ -174,6 +174,24 @@ type VisionExposure struct {
 	SmokeUsageCount int `json:"smokeUsageCount"` // Times used smoke of deceit
 }
 
+// SmokeEvent — match-level: группа игроков одной команды одновременно
+// (≥4 в окне 1.5s) получила modifier_smoke_of_deceit. Outcome считается за
+// 60s после начала smoke: kills/deaths участников, towers сошедшие на этой
+// стороне, runes подобранные участниками.
+type SmokeEvent struct {
+	GameTime     float64      `json:"gameTime"`     // sec since horn
+	Participants []int        `json:"participants"` // player indices 0-9
+	IsRadiant    bool         `json:"isRadiant"`    // which side smoked
+	Outcome      SmokeOutcome `json:"outcome"`
+}
+
+type SmokeOutcome struct {
+	KillsWithin60s  int `json:"killsWithin60s"`  // kills BY smokers
+	DeathsWithin60s int `json:"deathsWithin60s"` // deaths OF smokers
+	TowersWithin60s int `json:"towersWithin60s"` // enemy towers down by smokers' side
+	RunesWithin60s  int `json:"runesWithin60s"`  // runes picked by smokers
+}
+
 // Rune pickup summary per player
 type RuneSummary struct {
 	Total        int `json:"total"`                  // all rune pickups
@@ -326,6 +344,7 @@ type Match struct {
 	BuildingKills []BuildingEvent `json:"buildingKills,omitempty"`
 	Teamfights      []Teamfight      `json:"teamfights,omitempty"`
 	PositionSamples []PositionSample `json:"positionSamples,omitempty"`
+	SmokeEvents     []SmokeEvent     `json:"smokeEvents,omitempty"` // v4: group smoke detection
 
 	Players []Player `json:"players"`
 	
@@ -788,6 +807,15 @@ type ParserState struct {
 
 	// Gold lost tracking (GOLD event fires BEFORE DEATH event, so we buffer)
 	PendingGoldLost [10]PendingGoldLoss
+
+	// Raw smoke modifier-add events (time + player index). Группируются в
+	// buildMatchOutput в SmokeEvent при ≥4 одной команды в окне 1.5s.
+	SmokeModifierAdds []SmokeModifierAdd
+}
+
+type SmokeModifierAdd struct {
+	Time      float64
+	PlayerIdx int
 }
 
 type PendingGoldLoss struct {
@@ -1316,11 +1344,16 @@ func main() {
 				}
 			}
 			
-			// Track smoke usage
+			// Track smoke usage. Counter оставляем для back-compat; параллельно
+			// копим raw events для group detection в buildMatchOutput.
 			if modifierName == "modifier_smoke_of_deceit" && strings.Contains(targetName, "hero") {
 				targetIdx := heroNameToPlayerIndex(targetName, state)
 				if targetIdx >= 0 && targetIdx < 10 {
 					state.Players[targetIdx].SmokeCount++
+					state.SmokeModifierAdds = append(state.SmokeModifierAdds, SmokeModifierAdd{
+						Time:      actualTime,
+						PlayerIdx: targetIdx,
+					})
 				}
 			}
 
@@ -2647,8 +2680,128 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		BuildingKills:          state.BuildingKills,
 		Teamfights:             detectTeamfights(state),
 		PositionSamples:        state.PositionSamples,
+		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "3.2.0",
+		ParserVersion:          "4.0.0",
 	}
+}
+
+// detectSmokeEvents группирует raw modifier_smoke_of_deceit events в командные
+// смоки: ≥4 героев одной стороны в окне 1.5s. Для каждой группы — outcome за
+// 60s: kills/deaths участников, towers упавшие на стороне противника от
+// участников, runes подобранные участниками.
+func detectSmokeEvents(state *ParserState) []SmokeEvent {
+	if len(state.SmokeModifierAdds) == 0 {
+		return nil
+	}
+	// Сортируем по времени.
+	raw := make([]SmokeModifierAdd, len(state.SmokeModifierAdds))
+	copy(raw, state.SmokeModifierAdds)
+	sort.Slice(raw, func(i, j int) bool { return raw[i].Time < raw[j].Time })
+
+	// Какая сторона у игрока (radiant)? IsRadiant в Player итоговом — но он не
+	// готов на момент detectSmokeEvents. PlayerState хранит TeamNumber (2=rad,3=dire)?
+	// Проще: state.Players[idx] *PlayerState — у него уже есть IsRadiant установлен.
+	playerIsRadiant := func(idx int) bool {
+		if idx < 0 || idx >= 10 || state.Players[idx] == nil {
+			return false
+		}
+		return state.Players[idx].IsRadiant
+	}
+
+	const groupWindowSec = 1.5
+	const outcomeWindowSec = 60.0
+	const minParticipants = 4
+
+	type cluster struct {
+		startTime    float64
+		isRadiant    bool
+		participants map[int]struct{}
+	}
+	var clusters []cluster
+	for _, ev := range raw {
+		side := playerIsRadiant(ev.PlayerIdx)
+		// Ищем существующий кластер той же стороны в окне.
+		merged := false
+		for i := range clusters {
+			c := &clusters[i]
+			if c.isRadiant == side && ev.Time-c.startTime <= groupWindowSec {
+				c.participants[ev.PlayerIdx] = struct{}{}
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			c := cluster{startTime: ev.Time, isRadiant: side, participants: map[int]struct{}{ev.PlayerIdx: {}}}
+			clusters = append(clusters, c)
+		}
+	}
+
+	// Эмитим только кластеры с ≥minParticipants. Для каждого считаем outcome.
+	var out []SmokeEvent
+	for _, c := range clusters {
+		if len(c.participants) < minParticipants {
+			continue
+		}
+		parts := make([]int, 0, len(c.participants))
+		for idx := range c.participants {
+			parts = append(parts, idx)
+		}
+		sort.Ints(parts)
+		partSet := c.participants
+
+		windowEnd := c.startTime + outcomeWindowSec
+		kills, deaths, towers, runes := 0, 0, 0, 0
+
+		// Kills BY смокеров: смотрим Stats.KillEvents игроков-участников.
+		for idx := range partSet {
+			if state.Players[idx] == nil {
+				continue
+			}
+			for _, k := range state.Players[idx].KillEvents {
+				if k.Time >= c.startTime && k.Time <= windowEnd {
+					kills++
+				}
+			}
+			for _, d := range state.Players[idx].DeathEvents {
+				if d.Time >= c.startTime && d.Time <= windowEnd {
+					deaths++
+				}
+			}
+			for _, r := range state.Players[idx].Runes {
+				if r.Action == 1 && r.Time >= c.startTime && r.Time <= windowEnd {
+					runes++
+				}
+			}
+		}
+
+		// Towers: BuildingKills где IsRadiant противника, killer в участниках, время в окне.
+		for _, b := range state.BuildingKills {
+			if b.Time < c.startTime || b.Time > windowEnd {
+				continue
+			}
+			// Только вражеские здания (противоположная сторона).
+			if b.IsRadiant == c.isRadiant {
+				continue
+			}
+			if _, ok := partSet[b.KillerPlayer]; !ok {
+				continue
+			}
+			towers++
+		}
+
+		out = append(out, SmokeEvent{
+			GameTime:     c.startTime,
+			Participants: parts,
+			IsRadiant:    c.isRadiant,
+			Outcome: SmokeOutcome{
+				KillsWithin60s:  kills,
+				DeathsWithin60s: deaths,
+				TowersWithin60s: towers,
+				RunesWithin60s:  runes,
+			},
+		})
+	}
+	return out
 }
