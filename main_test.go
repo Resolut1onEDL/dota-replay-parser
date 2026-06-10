@@ -27,6 +27,87 @@ type opendotaMatch struct {
 	Players    []opendotaPlayer `json:"players"`
 }
 
+// Unit test for buildTalents (v4.1.0 talent extraction).
+// Talent slots arrive as map[slotIdx]AbilityEntityInfo collected from the
+// hero entity's m_vecAbilities. Hero ability lists carry the 8 talents in
+// tier order (two per tier), so with exactly 8 slots the tier is derivable
+// (10/15/20/25); otherwise level must be omitted (0).
+func TestBuildTalents(t *testing.T) {
+	t.Run("full 8 slots derive tiers", func(t *testing.T) {
+		slots := map[int]AbilityEntityInfo{
+			10: {Name: "special_bonus_unique_axe_8", Level: 1}, // tier 10 left
+			11: {Name: "special_bonus_movement_speed_20"},      // tier 10 right, not chosen
+			12: {Name: "special_bonus_strength_12"},            // tier 15 left, not chosen
+			13: {Name: "special_bonus_unique_axe_4", Level: 1}, // tier 15 right
+			14: {Name: "special_bonus_unique_axe_5", Level: 1}, // tier 20 left
+			15: {Name: "special_bonus_hp_500"},                 // tier 20 right, not chosen
+			16: {Name: "special_bonus_unique_axe_2", Level: 1}, // tier 25 left
+			17: {Name: "special_bonus_unique_axe_3"},           // tier 25 right, not chosen
+		}
+		got := buildTalents(slots)
+		want := []struct {
+			level int
+			name  string
+		}{
+			{10, "special_bonus_unique_axe_8"},
+			{15, "special_bonus_unique_axe_4"},
+			{20, "special_bonus_unique_axe_5"},
+			{25, "special_bonus_unique_axe_2"},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("got %d talents, want %d: %+v", len(got), len(want), got)
+		}
+		for i, w := range want {
+			if got[i].Level != w.level || got[i].Name != w.name {
+				t.Errorf("talent[%d]: got {%d %s}, want {%d %s}",
+					i, got[i].Level, got[i].Name, w.level, w.name)
+			}
+		}
+	})
+
+	t.Run("excluded generic special_bonus abilities", func(t *testing.T) {
+		slots := map[int]AbilityEntityInfo{
+			5:  {Name: "special_bonus_attributes", Level: 7},
+			6:  {Name: "special_bonus_base", Level: 1},
+			10: {Name: "special_bonus_unique_axe_8", Level: 1},
+		}
+		got := buildTalents(slots)
+		if len(got) != 1 || got[0].Name != "special_bonus_unique_axe_8" {
+			t.Fatalf("expected only the real talent, got %+v", got)
+		}
+	})
+
+	t.Run("non-8 slot count omits tier level", func(t *testing.T) {
+		slots := map[int]AbilityEntityInfo{
+			12: {Name: "special_bonus_unique_a", Level: 1},
+			14: {Name: "special_bonus_unique_b", Level: 1},
+		}
+		got := buildTalents(slots)
+		if len(got) != 2 {
+			t.Fatalf("got %d talents, want 2: %+v", len(got), got)
+		}
+		for _, tt := range got {
+			if tt.Level != 0 {
+				t.Errorf("level must be omitted (0) when tier not derivable, got %d", tt.Level)
+			}
+		}
+		// Slot order preserved
+		if got[0].Name != "special_bonus_unique_a" || got[1].Name != "special_bonus_unique_b" {
+			t.Errorf("slot order not preserved: %+v", got)
+		}
+	})
+
+	t.Run("empty input yields empty non-nil slice", func(t *testing.T) {
+		got := buildTalents(map[int]AbilityEntityInfo{})
+		if got == nil {
+			t.Fatal("talents must be non-nil so JSON emits [] not null")
+		}
+		if len(got) != 0 {
+			t.Fatalf("expected empty, got %+v", got)
+		}
+	})
+}
+
 func TestTeamAssignmentMatchesOpenDota(t *testing.T) {
 	cases := []string{"8582691771", "8591372106", "8591453147"}
 

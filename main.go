@@ -162,6 +162,14 @@ type AbilityEntityInfo struct {
 	Level int
 }
 
+// Talent is a chosen hero talent — a special_bonus_* ability on the hero
+// entity with ability level >= 1, snapshotted at the end of the replay.
+// Level is the talent tier (10/15/20/25) when derivable, 0 (omitted) otherwise.
+type Talent struct {
+	Level int    `json:"level,omitempty"`
+	Name  string `json:"name"`
+}
+
 type DamageTarget struct {
 	Target         int `json:"target"`
 	PhysicalDamage int `json:"physicalDamage"`
@@ -306,7 +314,10 @@ type Player struct {
 	Item4Name    string `json:"item4Name,omitempty"`
 	Item5Name    string `json:"item5Name,omitempty"`
 	NeutralName  string `json:"neutralName,omitempty"`
-	
+
+	// Talent tree choices (v4.1.0), final state at end of replay.
+	Talents []Talent `json:"talents"`
+
 	Stats *PlayerStats `json:"stats,omitempty"`
 }
 
@@ -704,6 +715,11 @@ type PlayerState struct {
 	SkillBuild      []SkillLevelUp
 	PrevAbilityLvls map[string]int // ability name → last known level
 
+	// Talent tracking: ability slot index (m_vecAbilities.NNNN) → talent
+	// info for special_bonus_* abilities. Overwritten on every hero entity
+	// update so it holds the final state at end of replay.
+	TalentSlots map[int]AbilityEntityInfo
+
 	// Lane tracking
 	LaneDeaths   int
 	LaneKills    int
@@ -876,6 +892,7 @@ func NewParserState(p *manta.Parser) *ParserState {
 			LanePositions:   make([]struct{ X, Y float64 }, 0),
 			PrevAbilityLvls: make(map[string]int),
 			SkillBuild:      make([]SkillLevelUp, 0),
+			TalentSlots:     make(map[int]AbilityEntityInfo),
 		}
 	}
 	return state
@@ -1554,6 +1571,24 @@ func main() {
 							if abEnt == nil {
 								continue
 							}
+
+							// Track talent choices (v4.1.0). Talents are
+							// special_bonus_* abilities; their identity is not
+							// in the entity class name, so resolve the real
+							// ability name via the EntityNames string table.
+							// Runs before the CDOTA_Ability_ class filter
+							// below because talent entities may use a
+							// different class.
+							if nameIdx, okN := abEnt.GetInt32("m_pEntity.m_nameStringTableIndex"); okN && nameIdx >= 0 {
+								if entName, okT := state.Parser.LookupStringByIndex("EntityNames", nameIdx); okT && strings.HasPrefix(entName, "special_bonus_") {
+									talentLvl := 0
+									if l, okL := abEnt.GetInt32("m_iLevel"); okL {
+										talentLvl = int(l)
+									}
+									state.Players[playerIdx].TalentSlots[ai] = AbilityEntityInfo{Name: entName, Level: talentLvl}
+								}
+							}
+
 							abClass := abEnt.GetClassName()
 							if !strings.HasPrefix(abClass, "CDOTA_Ability_") {
 								continue
@@ -2275,6 +2310,47 @@ func filterSkillBuild(raw []SkillLevelUp) []SkillLevelUp {
 	return result
 }
 
+// talentExcludedNames are special_bonus_* abilities that are not real
+// talent-tree choices (shared stat/placeholder abilities present on heroes).
+var talentExcludedNames = map[string]bool{
+	"special_bonus_attributes": true,
+	"special_bonus_base":       true,
+}
+
+// buildTalents converts observed talent slots (ability slot index → info)
+// into the list of chosen talents (ability level >= 1). Hero ability lists
+// carry the 8 talents in tier order (two per tier: 10/10/15/15/20/20/25/25),
+// so when exactly 8 talent slots are present the tier is derived from the
+// pair position. Otherwise Level is left 0 (omitted in JSON) and chosen
+// talents are listed in slot order.
+func buildTalents(slots map[int]AbilityEntityInfo) []Talent {
+	keys := make([]int, 0, len(slots))
+	for k := range slots {
+		if talentExcludedNames[slots[k].Name] {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+
+	tiers := []int{10, 10, 15, 15, 20, 20, 25, 25}
+	deriveTier := len(keys) == len(tiers)
+
+	talents := make([]Talent, 0, 4)
+	for pos, k := range keys {
+		info := slots[k]
+		if info.Level < 1 {
+			continue
+		}
+		t := Talent{Name: info.Name}
+		if deriveTier {
+			t.Level = tiers[pos]
+		}
+		talents = append(talents, t)
+	}
+	return talents
+}
+
 // runeModifierToType maps modifier names to rune type IDs
 var runeModifierToType = map[string]int{
 	"modifier_rune_doubledamage": 0,
@@ -2613,6 +2689,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			Item4Name:           ps.FinalItems[4],
 			Item5Name:           ps.FinalItems[5],
 			NeutralName:         ps.FinalNeutral,
+			Talents:             buildTalents(ps.TalentSlots),
 			Stats:               stats,
 		}
 	}
@@ -2683,7 +2760,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.0.0",
+		ParserVersion:          "4.1.0",
 	}
 }
 
