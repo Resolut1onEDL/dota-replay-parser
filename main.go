@@ -392,6 +392,7 @@ var heroNames = map[int32]string{
 	113: "Arc Warden", 114: "Monkey King", 119: "Dark Willow", 120: "Pangolier",
 	121: "Grimstroke", 123: "Hoodwink", 126: "Void Spirit", 128: "Snapfire", 129: "Mars",
 	135: "Dawnbreaker", 136: "Marci", 137: "Primal Beast", 138: "Muerta", 145: "Ringmaster",
+	152: "Kez", 155: "Largo",
 }
 
 func getHeroName(heroID int) string {
@@ -399,6 +400,23 @@ func getHeroName(heroID int) string {
 		return name
 	}
 	return fmt.Sprintf("Hero_%d", heroID)
+}
+
+// decodeSelectedHeroID decodes m_vecPlayerTeamData.*.m_nSelectedHeroID.
+// Older replays expose it as int32 carrying the hero ID directly. Newer
+// replays expose it as uint32 with the ID doubled (shifted left by one bit) —
+// the same encoding artifact m_iPlayerID has (see replayPlayerToIndex).
+// Verified against match 8824123966: all ten uint32 slot values were exactly
+// 2x the Stratz ground-truth hero IDs (82→41 Faceless Void, 310→155 Largo).
+// Returns ok=false when the property is absent (manta Get returns nil).
+func decodeSelectedHeroID(raw interface{}) (int, bool) {
+	switch v := raw.(type) {
+	case int32:
+		return int(v), true
+	case uint32:
+		return int(v >> 1), true
+	}
+	return 0, false
 }
 
 // Dota 2 cumulative XP thresholds per hero level (index = level, value = total XP needed)
@@ -1706,8 +1724,10 @@ func main() {
 				if team, ok := e.GetInt32(fmt.Sprintf("m_vecPlayerData.%04d.m_iPlayerTeam", i)); ok && team != 0 {
 					state.Players[i].IsRadiant = team == 2
 				}
-				if heroID, ok := e.GetInt32(fmt.Sprintf("m_vecPlayerTeamData.%04d.m_nSelectedHeroID", i)); ok && heroID > 0 {
-					state.Players[i].HeroID = int(heroID)
+				// m_nSelectedHeroID is int32 in older replays but uint32 (with
+				// the value doubled) in newer ones — see decodeSelectedHeroID.
+				if heroID, ok := decodeSelectedHeroID(e.Get(fmt.Sprintf("m_vecPlayerTeamData.%04d.m_nSelectedHeroID", i))); ok && heroID > 0 {
+					state.Players[i].HeroID = heroID
 				}
 			}
 		}
@@ -2009,8 +2029,9 @@ func heroNameToPlayerIndex(combatLogName string, state *ParserState) int {
 	return -1
 }
 
-func heroNameStringToID(name string) int {
-	nameMap := map[string]int{
+// heroNpcNameToID maps npc_dota_hero_* suffixes (combat log) and normalized
+// CDOTA_Unit_Hero_* class suffixes to hero IDs.
+var heroNpcNameToID = map[string]int{
 		// Combat log format
 		"antimage": 1, "axe": 2, "bane": 3, "bloodseeker": 4, "crystal_maiden": 5,
 		"drow_ranger": 6, "earthshaker": 7, "juggernaut": 8, "mirana": 9, "morphling": 10,
@@ -2038,7 +2059,8 @@ func heroNameStringToID(name string) int {
 		"arc_warden": 113, "monkey_king": 114, "dark_willow": 119, "pangolier": 120,
 		"grimstroke": 121, "hoodwink": 123, "void_spirit": 126, "snapfire": 128, "mars": 129,
 		"dawnbreaker": 135, "marci": 136, "primal_beast": 137, "muerta": 138, "ringmaster": 145,
-		
+		"kez": 152, "largo": 155,
+
 		// Class name format (normalized)
 		"shadowshaman": 27, "spiritbreaker": 71, "obsidiandestroyer": 76,
 		"phantomlancer": 12, "phantomassassin": 44, "dragonknight": 49,
@@ -2053,26 +2075,38 @@ func heroNameStringToID(name string) int {
 		"treantprotector": 83, "templarassassin": 46, "naturesprophet": 53,
 		"outworlddestroyer": 76, "outworlddevourer": 76, "wraithking": 42, "io": 91,
 		"ogremagi": 84,
-	}
+}
 
+// heroNpcNameToIDNoSep indexes the same IDs by name with separators removed,
+// derived from the canonical map so entity class suffixes like "FacelessVoid"
+// resolve without hand-maintained aliases (the alias list above had holes —
+// e.g. Faceless Void resolved to 0 in match 8824123966).
+var heroNpcNameToIDNoSep = func() map[string]int {
+	m := make(map[string]int, len(heroNpcNameToID))
+	for k, v := range heroNpcNameToID {
+		m[strings.ReplaceAll(k, "_", "")] = v
+	}
+	return m
+}()
+
+func heroNameStringToID(name string) int {
 	name = strings.ToLower(name)
 	// Try with underscores first (matches combat log names like "shadow_demon")
-	if id, ok := nameMap[name]; ok {
+	if id, ok := heroNpcNameToID[name]; ok {
 		return id
 	}
 	// Try without underscores/spaces (matches entity class names like "ShadowDemon")
 	name = strings.ReplaceAll(name, "_", "")
 	name = strings.ReplaceAll(name, " ", "")
-	
-	if id, ok := nameMap[name]; ok {
+
+	if id, ok := heroNpcNameToID[name]; ok {
 		return id
 	}
-	
-	name2 := strings.ToLower(strings.ReplaceAll(name, " ", "_"))
-	if id, ok := nameMap[name2]; ok {
+	// Derived no-separator index covers multi-word names without explicit aliases
+	if id, ok := heroNpcNameToIDNoSep[name]; ok {
 		return id
 	}
-	
+
 	return 0
 }
 
@@ -2760,7 +2794,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.1.0",
+		ParserVersion:          "4.1.1",
 	}
 }
 

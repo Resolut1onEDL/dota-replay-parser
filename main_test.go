@@ -108,6 +108,86 @@ func TestBuildTalents(t *testing.T) {
 	})
 }
 
+// Regression tests for hero resolution (v4.1.1).
+// Match 8824123966 ground truth (Stratz): Faceless Void (41) and Largo (155)
+// came out as heroId=0 / "Hero_0" because:
+//   - entity class suffixes like "FacelessVoid" had no no-separator alias in
+//     the npc-name map (only "faceless_void"), so the class-name fallback failed;
+//   - Largo (155) and Kez (152) were missing from the compiled tables entirely;
+//   - m_nSelectedHeroID is exposed as uint32 in newer replays (GetInt32 read
+//     failed) and carries the hero ID doubled — same encoding artifact as
+//     m_iPlayerID (see replayPlayerToIndex).
+func TestHeroNameStringToID(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		// combat-log npc suffixes (worked before the fix — regression guard)
+		{"faceless_void", 41},
+		{"axe", 2},
+		{"void_spirit", 126},
+		// entity class suffixes (CDOTA_Unit_Hero_*) — failed before the fix
+		{"FacelessVoid", 41},
+		{"Void_Spirit", 126},
+		{"Sand_King", 16},
+		// new heroes — missing from tables before the fix
+		{"largo", 155},
+		{"Largo", 155},
+		{"kez", 152},
+		// unknown stays 0, never invented
+		{"totally_unknown_hero", 0},
+	}
+	for _, c := range cases {
+		if got := heroNameStringToID(c.in); got != c.want {
+			t.Errorf("heroNameStringToID(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDecodeSelectedHeroID(t *testing.T) {
+	cases := []struct {
+		raw    interface{}
+		want   int
+		wantOK bool
+	}{
+		// legacy replays: plain int32
+		{int32(41), 41, true},
+		{int32(0), 0, true},
+		// newer replays: uint32 with the ID doubled (match 8824123966:
+		// slot0=82→41 Faceless Void, slot7=310→155 Largo, slot6=26→13 Puck)
+		{uint32(82), 41, true},
+		{uint32(310), 155, true},
+		{uint32(26), 13, true},
+		{uint32(0), 0, true},
+		// property absent (manta Get returns nil)
+		{nil, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := decodeSelectedHeroID(c.raw)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("decodeSelectedHeroID(%v %T) = (%d,%v), want (%d,%v)",
+				c.raw, c.raw, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestGetHeroNameNewHeroes(t *testing.T) {
+	cases := []struct {
+		id   int
+		want string
+	}{
+		{41, "Faceless Void"},
+		{152, "Kez"},
+		{155, "Largo"},
+		{9999, "Hero_9999"}, // unknown id keeps explicit fallback
+	}
+	for _, c := range cases {
+		if got := getHeroName(c.id); got != c.want {
+			t.Errorf("getHeroName(%d) = %q, want %q", c.id, got, c.want)
+		}
+	}
+}
+
 func TestTeamAssignmentMatchesOpenDota(t *testing.T) {
 	cases := []string{"8582691771", "8591372106", "8591453147"}
 
