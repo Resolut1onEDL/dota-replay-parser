@@ -228,6 +228,7 @@ type LaneStats struct {
 	LaneCreepDenies   int     `json:"laneCreepDenies"`
 	ReaggroCount      int     `json:"reaggroCount"` // EXTRA: creep aggro manipulation
 	DeathsPreTen      int     `json:"deathsPreTen"`
+	LaneDamageTakenPre5 int   `json:"laneDamageTakenPre5"` // EXTRA: enemy-hero dmg taken before 5:00
 	KillsPreTen       int     `json:"killsPreTen"`
 	AssistsPreTen     int     `json:"assistsPreTen"`
 	GPMAtTen          int     `json:"gpmAtTen"`
@@ -755,6 +756,9 @@ type PlayerState struct {
 	// Reaggro tracking (physical attacks on enemy heroes in lane)
 	LaneHarassCount int
 
+	// Enemy-hero damage received before 5:00 (lane punishment taken)
+	LaneDamageTakenPre5 int
+
 	// Position tracking
 	LastPosX float64
 	LastPosY float64
@@ -1276,6 +1280,13 @@ func main() {
 
 				if isEnemyHero {
 					state.Players[attackerIdx].HeroDamage += damage
+
+					// Lane damage taken (victim side): enemy-hero damage the target
+					// eats before 5:00 — inverse of LaneHarassCount; surfaces poor
+					// lane standing ("how much you get punished on the lane").
+					if actualTime < 300 {
+						state.Players[targetIdx].LaneDamageTakenPre5 += damage
+					}
 
 					// Track damage by target
 					if state.Players[attackerIdx].DamageByTarget[targetIdx] == nil {
@@ -2661,6 +2672,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 				LanePartner:   partners[i],
 				ReaggroCount:  ps.LaneHarassCount, // Lane harass events as aggro proxy
 				DeathsPreTen:  ps.LaneDeaths,
+				LaneDamageTakenPre5: ps.LaneDamageTakenPre5,
 				KillsPreTen:   ps.LaneKills,
 				AssistsPreTen: ps.LaneAssists,
 				NetWorthAtTen: ps.NWAt10,
@@ -2794,7 +2806,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.1.1",
+		ParserVersion:          "4.2.0",
 	}
 }
 
