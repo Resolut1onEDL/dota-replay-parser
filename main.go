@@ -27,6 +27,17 @@ type WardEvent struct {
 	PositionX float64 `json:"positionX,omitempty"`
 	PositionY float64 `json:"positionY,omitempty"`
 	PlayerID  int     `json:"playerId,omitempty"`
+	// v4.3.0: ward lifecycle from entity create→delete. EndTime/Duration absent
+	// (omitempty) when the ward was still alive at game end.
+	EndTime  float64 `json:"endTime,omitempty"`
+	Duration float64 `json:"durationSeconds,omitempty"`
+}
+
+// v4.3.0: in-flight ward, для расчёта длительности на удалении сущности.
+type activeWard struct {
+	playerIdx int
+	sliceIdx  int // индекс в Players[playerIdx].Wards
+	start     float64
 }
 
 type RuneEvent struct {
@@ -180,6 +191,9 @@ type DamageTarget struct {
 // EXTRA: Vision/stealth metrics
 type VisionExposure struct {
 	SmokeUsageCount int `json:"smokeUsageCount"` // Times used smoke of deceit
+	// v4.3.0: сколько вражеских вардов (obs+sentry) снёс этот игрок (deward).
+	// Истечение варда (attacker == target) не считается.
+	WardsDewarded int `json:"wardsDewarded"`
 }
 
 // SmokeEvent — match-level: группа игроков одной команды одновременно
@@ -753,6 +767,9 @@ type PlayerState struct {
 	// Smoke tracking
 	SmokeCount int
 
+	// Vision: enemy wards destroyed by this player (deward), v4.3.0
+	WardsDewarded int
+
 	// Reaggro tracking (physical attacks on enemy heroes in lane)
 	LaneHarassCount int
 
@@ -810,6 +827,9 @@ type ParserState struct {
 
 	// Ability entity tracking for skill build
 	AbilityEntities map[int32]*AbilityEntityInfo
+
+	// Ward entity → in-flight ward, для длительности (v4.3.0)
+	ActiveWards map[int32]*activeWard
 
 	// Game timing from CDOTAGamerulesProxy
 	GameStartTime float64 // m_flGameStartTime (server time when game clock starts)
@@ -892,6 +912,7 @@ func NewParserState(p *manta.Parser) *ParserState {
 		BuildingKills: make([]BuildingEvent, 0),
 		ItemEntities:       make(map[int32]string),
 		AbilityEntities:    make(map[int32]*AbilityEntityInfo),
+		ActiveWards:        make(map[int32]*activeWard),
 		PendingRunes:       make(map[int32]*RuneEntityInfo),
 		BountyGoldEvents:   make([]BountyGoldEvent, 0),
 		PositionSamples:    make([]PositionSample, 0),
@@ -941,6 +962,41 @@ func (s *ParserState) ActualGameSeconds(rawTime float64) float64 {
 		return rawTime - s.GameStartTime
 	}
 	return rawTime
+}
+
+// isWardDeward сообщает, что смерть варда — это снос врагом (а не естественное
+// истечение). Combat-log называет истёкший вард так, что attacker == target
+// ("npc_dota_*_wards" сам себя); снос даёт attacker = герой/юнит. (v4.3.0)
+func isWardDeward(targetName, attackerName string) bool {
+	if targetName != "npc_dota_observer_wards" && targetName != "npc_dota_sentry_wards" {
+		return false
+	}
+	return attackerName != targetName
+}
+
+// finalizeWard закрывает жизнь варда на удалении сущности: проставляет EndTime
+// и Duration в соответствующий WardEvent игрока. Варды, дожившие до конца игры,
+// не получают удаления → остаются без Duration (omitempty) и исключаются из
+// средней длительности агрегатором. (v4.3.0)
+func finalizeWard(s *ParserState, idx int32, now float64) {
+	w, ok := s.ActiveWards[idx]
+	if !ok {
+		return
+	}
+	delete(s.ActiveWards, idx)
+	if w.playerIdx < 0 || w.playerIdx >= 10 {
+		return
+	}
+	pw := s.Players[w.playerIdx].Wards
+	if w.sliceIdx < 0 || w.sliceIdx >= len(pw) {
+		return
+	}
+	dur := now - w.start
+	if dur < 0 {
+		dur = 0
+	}
+	pw[w.sliceIdx].EndTime = now
+	pw[w.sliceIdx].Duration = dur
 }
 
 // Convert replay player ID to 0-9 index
@@ -1069,6 +1125,15 @@ func main() {
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_DEATH:
 			targetName := state.LookupName(m.GetTargetName())
 			attackerName := state.LookupName(m.GetAttackerName())
+
+			// Deward attribution (v4.3.0): ward убит, если это не естественное
+			// истечение (attacker == target = ward "сам себя").
+			if isWardDeward(targetName, attackerName) {
+				killerIdx := heroNameToPlayerIndex(attackerName, state)
+				if killerIdx >= 0 && killerIdx < 10 {
+					state.Players[killerIdx].WardsDewarded++
+				}
+			}
 
 			if strings.Contains(targetName, "hero") {
 				targetIdx := heroNameToPlayerIndex(targetName, state)
@@ -1506,7 +1571,16 @@ func main() {
 	// Entity callback
 	p.OnEntity(func(e *manta.Entity, op manta.EntityOp) error {
 		state.CurrentTick = p.NetTick
-		
+
+		// Ward lifecycle: фиксируем удаление (истечение/снос) ДО early-return,
+		// т.к. чистый EntityOpDeleted ниже выходит сразу. (v4.3.0)
+		if op&manta.EntityOpDeleted != 0 {
+			cn := e.GetClassName()
+			if cn == "CDOTA_NPC_Observer_Ward" || cn == "CDOTA_NPC_Observer_Ward_TrueSight" {
+				finalizeWard(state, e.GetIndex(), state.ActualGameSeconds(state.GameTime()))
+			}
+		}
+
 		if op == manta.EntityOpDeleted {
 			return nil
 		}
@@ -1849,6 +1923,12 @@ func main() {
 
 				if playerIdx >= 0 && playerIdx < 10 {
 					state.Players[playerIdx].Wards = append(state.Players[playerIdx].Wards, wardEvent)
+					// Регистрируем для расчёта длительности на удалении (v4.3.0).
+					state.ActiveWards[e.GetIndex()] = &activeWard{
+						playerIdx: playerIdx,
+						sliceIdx:  len(state.Players[playerIdx].Wards) - 1,
+						start:     wardTime,
+					}
 				}
 			}
 		}
@@ -2682,6 +2762,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			},
 			VisionStats: VisionExposure{
 				SmokeUsageCount: ps.SmokeCount,
+				WardsDewarded:   ps.WardsDewarded,
 			},
 			RuneStats: buildRuneSummary(ps.Runes),
 			TPCount:   ps.TPCount,
@@ -2806,7 +2887,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.2.0",
+		ParserVersion:          "4.3.0",
 	}
 }
 

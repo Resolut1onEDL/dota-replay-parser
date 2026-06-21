@@ -253,3 +253,66 @@ func TestTeamAssignmentMatchesOpenDota(t *testing.T) {
 		})
 	}
 }
+
+// v4.3.0: deward attribution. Combat-log помечает истёкший вард как
+// attacker == target; снос врагом — attacker = герой. isWardDeward отделяет одно
+// от другого, чтобы естественное истечение не засчитывалось как deward.
+func TestIsWardDeward(t *testing.T) {
+	cases := []struct {
+		name, target, attacker string
+		want                   bool
+	}{
+		{"sentry killed by hero", "npc_dota_sentry_wards", "npc_dota_hero_hoodwink", true},
+		{"observer killed by hero", "npc_dota_observer_wards", "npc_dota_hero_bane", true},
+		{"sentry expired", "npc_dota_sentry_wards", "npc_dota_sentry_wards", false},
+		{"observer expired", "npc_dota_observer_wards", "npc_dota_observer_wards", false},
+		{"not a ward", "npc_dota_hero_axe", "npc_dota_hero_lina", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isWardDeward(c.target, c.attacker); got != c.want {
+				t.Errorf("isWardDeward(%q,%q) = %v, want %v", c.target, c.attacker, got, c.want)
+			}
+		})
+	}
+}
+
+// v4.3.0: ward lifetime. finalizeWard на удалении сущности проставляет
+// EndTime/Duration в WardEvent игрока; варды без удаления (живы до конца) Duration
+// не получают и не портят среднюю.
+func TestFinalizeWard(t *testing.T) {
+	mkState := func() *ParserState {
+		s := &ParserState{ActiveWards: make(map[int32]*activeWard)}
+		s.Players[3] = &PlayerState{Wards: []WardEvent{{Time: 100, Type: 0}}}
+		s.ActiveWards[42] = &activeWard{playerIdx: 3, sliceIdx: 0, start: 100}
+		return s
+	}
+
+	t.Run("sets duration on deletion", func(t *testing.T) {
+		s := mkState()
+		finalizeWard(s, 42, 360) // прожил 260с
+		w := s.Players[3].Wards[0]
+		if w.EndTime != 360 || w.Duration != 260 {
+			t.Errorf("EndTime=%v Duration=%v, want 360/260", w.EndTime, w.Duration)
+		}
+		if _, ok := s.ActiveWards[42]; ok {
+			t.Error("entry not removed from ActiveWards")
+		}
+	})
+
+	t.Run("unknown entity is a no-op", func(t *testing.T) {
+		s := mkState()
+		finalizeWard(s, 999, 360)
+		if s.Players[3].Wards[0].Duration != 0 {
+			t.Error("untracked deletion mutated a ward")
+		}
+	})
+
+	t.Run("negative duration clamped to 0", func(t *testing.T) {
+		s := mkState()
+		finalizeWard(s, 42, 50) // now < start
+		if s.Players[3].Wards[0].Duration != 0 {
+			t.Errorf("Duration=%v, want 0", s.Players[3].Wards[0].Duration)
+		}
+	})
+}
