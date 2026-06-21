@@ -2887,7 +2887,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.3.0",
+		ParserVersion:          "4.3.1",
 	}
 }
 
@@ -2914,9 +2914,16 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 		return state.Players[idx].IsRadiant
 	}
 
-	const groupWindowSec = 1.5
+	// v4.3.1: rolling-gap кластеризация по стороне. Смок-применения у команды
+	// приходят ступенчато (игроки жмут смок не идеально синхронно), поэтому
+	// мерджим add в открытый кластер той же стороны, если он в пределах gap от
+	// ПОСЛЕДНЕГО add (а не от старта). Раздельные смоки (>gap друг от друга)
+	// дают разные кластеры. Порог участников снижен до 2 — дуо/трио-смоки это
+	// тоже координированный смок-мув. Старый порог (≥4 в окне 1.5с от старта)
+	// ловил только полнокомандные синхронные смоки и кратно занижал счёт.
+	const gapWindowSec = 4.0
 	const outcomeWindowSec = 60.0
-	const minParticipants = 4
+	const minParticipants = 2
 
 	type cluster struct {
 		startTime    float64
@@ -2924,22 +2931,24 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 		participants map[int]struct{}
 	}
 	var clusters []cluster
+	open := [2]int{-1, -1}        // индекс открытого кластера: [0]=radiant, [1]=dire
+	lastTime := [2]float64{0, 0}  // время последнего add в открытом кластере
 	for _, ev := range raw {
-		side := playerIsRadiant(ev.PlayerIdx)
-		// Ищем существующий кластер той же стороны в окне.
-		merged := false
-		for i := range clusters {
-			c := &clusters[i]
-			if c.isRadiant == side && ev.Time-c.startTime <= groupWindowSec {
-				c.participants[ev.PlayerIdx] = struct{}{}
-				merged = true
-				break
-			}
+		s := 1
+		if playerIsRadiant(ev.PlayerIdx) {
+			s = 0
 		}
-		if !merged {
-			c := cluster{startTime: ev.Time, isRadiant: side, participants: map[int]struct{}{ev.PlayerIdx: {}}}
-			clusters = append(clusters, c)
+		if open[s] >= 0 && ev.Time-lastTime[s] <= gapWindowSec {
+			clusters[open[s]].participants[ev.PlayerIdx] = struct{}{}
+		} else {
+			clusters = append(clusters, cluster{
+				startTime:    ev.Time,
+				isRadiant:    s == 0,
+				participants: map[int]struct{}{ev.PlayerIdx: {}},
+			})
+			open[s] = len(clusters) - 1
 		}
+		lastTime[s] = ev.Time
 	}
 
 	// Эмитим только кластеры с ≥minParticipants. Для каждого считаем outcome.
