@@ -1,0 +1,5 @@
+dist-release/
+*.md
+*.json
+!go.mod
+.git/
