@@ -2,6 +2,7 @@
 //
 //	POST /parse        raw .dem or .dem.bz2 body            -> parsed JSON
 //	POST /parse-valve  {"match_id":..,"cluster":..,"salt":..} -> download from Valve, parse
+//	POST /parse-url    {"url":"https://.."}                   -> download .dem(.bz2) from URL, parse
 //	GET  /healthz      -> {"ok":true,"parser":"<version>"}
 //
 // Env:
@@ -23,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,7 +33,23 @@ var (
 	parserBin = envOr("PARSER_BIN", "./parser")
 	token     = os.Getenv("PARSE_TOKEN")
 	sem       chan struct{}
+	// Replay download client with a total timeout. Valve's replay CDN is
+	// wildly variable — some servers deliver a 150 MB .dem.bz2 at ~7 MB/s
+	// (~20s), others at ~0.2 MB/s (12+ min). The default no-timeout client
+	// waited out the slow ones, hanging the machine (and failing health
+	// checks) for minutes. Cap it so a slow CDN fails fast and the caller
+	// falls back, while a normal large download still completes.
+	downloadClient = &http.Client{Timeout: downloadTimeout()}
 )
+
+func downloadTimeout() time.Duration {
+	if v := os.Getenv("DOWNLOAD_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -127,8 +145,9 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 	log.Printf("parse-valve: downloading %s", url)
 
 	dlStart := time.Now()
-	resp, err := http.Get(url)
+	resp, err := downloadClient.Get(url)
 	if err != nil {
+		log.Printf("parse-valve: download error after %s: %v", time.Since(dlStart).Round(time.Millisecond), err)
 		http.Error(w, `{"error":"valve_unreachable"}`, http.StatusBadGateway)
 		return
 	}
@@ -149,6 +168,56 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 	defer os.Remove(demPath)
 	dl := time.Since(dlStart)
 	log.Printf("parse-valve: downloaded+unpacked %d MB in %s", size>>20, dl.Round(time.Millisecond))
+	serveParsed(w, demPath, dl)
+}
+
+type urlReq struct {
+	URL string `json:"url"`
+}
+
+func handleParseURL(w http.ResponseWriter, r *http.Request) {
+	if !authed(r) {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	var req urlReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+		!strings.HasPrefix(req.URL, "https://") {
+		http.Error(w, `{"error":"bad_params"}`, http.StatusBadRequest)
+		return
+	}
+
+	// signed URLs carry auth in the query string — keep it out of logs
+	logURL := req.URL
+	if i := strings.IndexByte(logURL, '?'); i >= 0 {
+		logURL = logURL[:i]
+	}
+	log.Printf("parse-url: downloading %s", logURL)
+
+	dlStart := time.Now()
+	resp, err := downloadClient.Get(req.URL)
+	if err != nil {
+		log.Printf("parse-url: download error after %s: %v", time.Since(dlStart).Round(time.Millisecond), err)
+		http.Error(w, `{"error":"source_unreachable"}`, http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("parse-url: source returned %d", resp.StatusCode)
+		http.Error(w,
+			fmt.Sprintf(`{"error":"source_unavailable","source_status":%d}`, resp.StatusCode),
+			http.StatusNotFound)
+		return
+	}
+
+	demPath, size, err := writeDem(io.LimitReader(resp.Body, 500<<20))
+	if err != nil {
+		http.Error(w, `{"error":"download_failed"}`, http.StatusBadGateway)
+		return
+	}
+	defer os.Remove(demPath)
+	dl := time.Since(dlStart)
+	log.Printf("parse-url: downloaded+unpacked %d MB in %s", size>>20, dl.Round(time.Millisecond))
 	serveParsed(w, demPath, dl)
 }
 
@@ -184,6 +253,7 @@ func main() {
 	mux.HandleFunc("GET /healthz", handleHealth)
 	mux.HandleFunc("POST /parse", handleParse)
 	mux.HandleFunc("POST /parse-valve", handleParseValve)
+	mux.HandleFunc("POST /parse-url", handleParseURL)
 
 	port := envOr("PORT", "8080")
 	log.Printf("parse-service listening on :%s (parser=%s, max_concurrent=%d, auth=%v)",
