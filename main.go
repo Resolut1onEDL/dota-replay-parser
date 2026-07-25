@@ -321,6 +321,8 @@ type PlayerStats struct {
 	SkillBuild           []SkillLevelUp       `json:"skillBuild,omitempty"`
 	ItemUsed             []ItemUsed           `json:"itemUsed,omitempty"`
 	CampStacks           []CampStack          `json:"campStack,omitempty"`
+	CampsStacked         int                  `json:"campsStacked"`
+	CreepsStacked        int                  `json:"creepsStacked"`
 
 	// EXTRA metrics
 	VisionStats VisionExposure `json:"visionStats"`
@@ -796,6 +798,11 @@ type PlayerState struct {
 	// Item usage tracking (item_name → count)
 	ItemUsage  map[string]int
 	CampStacks []CampStack
+	// v4.4.2: final totals from CDOTA_DataRadiant/Dire m_vecDataTeam —
+	// the NEUTRAL_CAMP_STACK combat-log type (20) never fires in real
+	// demos (verified empirically), so per-event CampStacks stays empty.
+	CampsStacked int
+	CreepsStacked int
 	
 	// Skill build tracking
 	SkillBuild      []SkillLevelUp
@@ -1730,6 +1737,24 @@ func main() {
 		gameMinute := int(actualGameTime / 60.0)
 
 		// Extract hero ID from hero entities
+		// v4.4.2: per-player stacked totals live on the team-data entities
+		// (m_vecDataTeam.N.m_iCampsStacked); index N maps to team slot →
+		// global player index 0-4 (Radiant) / 5-9 (Dire).
+		if className == "CDOTA_DataRadiant" || className == "CDOTA_DataDire" {
+			offset := 0
+			if className == "CDOTA_DataDire" {
+				offset = 5
+			}
+			for i := 0; i < 5; i++ {
+				if v, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iCampsStacked", i)); ok {
+					state.Players[offset+i].CampsStacked = int(v)
+				}
+				if v, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iCreepsStacked", i)); ok {
+					state.Players[offset+i].CreepsStacked = int(v)
+				}
+			}
+		}
+
 		if strings.HasPrefix(className, "CDOTA_Unit_Hero_") {
 			if replayPlayerID, ok := e.GetUint32("m_iPlayerID"); ok {
 				playerIdx := replayPlayerToIndex(replayPlayerID)
@@ -2901,6 +2926,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			SkillBuild:           filterSkillBuild(ps.SkillBuild),
 			ItemUsed:             itemUsed,
 			CampStacks:           ps.CampStacks,
+			CampsStacked:         ps.CampsStacked,
+			CreepsStacked:        ps.CreepsStacked,
 			LaneStats: LaneStats{
 				Lane:          lane,
 				LanePartner:   partners[i],
@@ -3042,7 +3069,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.4.1",
+		ParserVersion:          "4.4.2",
 	}
 }
 
