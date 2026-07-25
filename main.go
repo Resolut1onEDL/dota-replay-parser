@@ -52,6 +52,12 @@ type RoshanEvent struct {
 	Team   string  `json:"team"` // "radiant" or "dire"
 }
 
+// v4.4.1: who picked up the Aegis (no omitempty on PlayerIdx — slot 0 is real).
+type AegisEvent struct {
+	Time      float64 `json:"time"`
+	PlayerIdx int     `json:"playerIdx"`
+}
+
 type BuildingEvent struct {
 	Time         float64 `json:"time"`
 	Building     string  `json:"building"`
@@ -396,6 +402,7 @@ type Match struct {
 
 	// Match events
 	RoshanKills   []RoshanEvent   `json:"roshanKills,omitempty"`
+	AegisEvents   []AegisEvent    `json:"aegisEvents,omitempty"`
 	Buybacks      []BuybackEvent  `json:"buybacks,omitempty"`
 	RuneSpawns    []RuneEvent     `json:"runeSpawns,omitempty"`
 	BuildingKills []BuildingEvent `json:"buildingKills,omitempty"`
@@ -856,6 +863,7 @@ type ParserState struct {
 	
 	// Match events
 	RoshanKills   []RoshanEvent
+	AegisEvents   []AegisEvent
 	Buybacks      []BuybackEvent
 	RuneSpawns    []RuneEvent
 	BuildingKills []BuildingEvent
@@ -1640,6 +1648,20 @@ func main() {
 					state.Players[playerIdx].ItemCastEvents = append(
 						state.Players[playerIdx].ItemCastEvents,
 						ItemCastEvent{Time: actualTime, Item: itemName})
+				}
+			}
+
+		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_AEGIS_TAKEN:
+			// v4.4.1: who picked the Aegis — an enemy-side pickup vs the
+			// Roshan-killing team is an aegis steal (detected web-side).
+			{
+				targetName := state.LookupName(m.GetTargetName())
+				playerIdx := heroNameToPlayerIndex(targetName, state)
+				if playerIdx >= 0 && playerIdx < 10 {
+					state.AegisEvents = append(state.AegisEvents, AegisEvent{
+						Time:      actualTime,
+						PlayerIdx: playerIdx,
+					})
 				}
 			}
 
@@ -2984,6 +3006,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		RadiantNetworthLeads:   nwLeads,
 		RadiantExperienceLeads: xpLeads,
 		RoshanKills:            state.RoshanKills,
+		AegisEvents:            state.AegisEvents,
 		Buybacks:               state.Buybacks,
 		RuneSpawns:             state.RuneSpawns,
 		BuildingKills:          state.BuildingKills,
@@ -2992,7 +3015,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.4.0",
+		ParserVersion:          "4.4.1",
 	}
 }
 
