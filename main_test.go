@@ -133,7 +133,8 @@ func TestHeroNameStringToID(t *testing.T) {
 		// new heroes — missing from tables before the fix
 		{"largo", 155},
 		{"Largo", 155},
-		{"kez", 152},
+		{"kez", 145}, // real PlayerResource id (152 does not exist; was a map typo)
+		{"ringmaster", 131},
 		// unknown stays 0, never invented
 		{"totally_unknown_hero", 0},
 	}

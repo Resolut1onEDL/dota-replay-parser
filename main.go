@@ -53,9 +53,14 @@ type RoshanEvent struct {
 }
 
 // v4.4.1: who picked up the Aegis (no omitempty on PlayerIdx — slot 0 is real).
+// Source: chat events, NOT the combat log — AEGIS_TAKEN (type 30) never occurs
+// in real demos (verified on multiple replays); Valve announces pickups via
+// CHAT_MESSAGE_AEGIS / _AEGIS_STOLEN / _DENIED_AEGIS, which also hands us the
+// steal classification for free.
 type AegisEvent struct {
 	Time      float64 `json:"time"`
 	PlayerIdx int     `json:"playerIdx"`
+	Event     string  `json:"event"` // "taken" | "stolen" | "denied"
 }
 
 type BuildingEvent struct {
@@ -182,6 +187,9 @@ type AbilityCastEvent struct {
 type ItemCastEvent struct {
 	Time float64 `json:"time"`
 	Item string  `json:"item"`
+	// Unit-target info when the item was cast on a hero (Force/Glimmer/Eul…)
+	TargetSelf bool   `json:"targetSelf,omitempty"`
+	TargetHero string `json:"targetHero,omitempty"`
 }
 
 // Emitted when a hero-vs-hero hit leaves the target at ≤20% max HP (illusions
@@ -1152,6 +1160,31 @@ func main() {
 	})
 
 	// Combat log callback
+	// v4.4.1: Aegis pickups arrive as chat events (playerid_1 = player slot,
+	// verified 0-9 direct — no entity-id remap needed).
+	p.Callbacks.OnCDOTAUserMsg_ChatEvent(func(m *dota.CDOTAUserMsg_ChatEvent) error {
+		var kind string
+		switch m.GetType() {
+		case dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_AEGIS:
+			kind = "taken"
+		case dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_AEGIS_STOLEN:
+			kind = "stolen"
+		case dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_DENIED_AEGIS:
+			kind = "denied"
+		default:
+			return nil
+		}
+		pid := int(m.GetPlayerid_1())
+		if pid >= 0 && pid < 10 {
+			state.AegisEvents = append(state.AegisEvents, AegisEvent{
+				Time:      state.ActualGameSeconds(state.GameTime()),
+				PlayerIdx: pid,
+				Event:     kind,
+			})
+		}
+		return nil
+	})
+
 	p.Callbacks.OnCMsgDOTACombatLogEntry(func(m *dota.CMsgDOTACombatLogEntry) error {
 		gameTime := float64(m.GetTimestamp())
 		actualTime := state.ActualGameSeconds(gameTime) // 0 = horn
@@ -1645,23 +1678,17 @@ func main() {
 				if !m.GetIsAbilityToggleOn() && !m.GetIsAbilityToggleOff() &&
 					itemName != "item_power_treads" &&
 					len(state.Players[playerIdx].ItemCastEvents) < 3000 {
+					ev := ItemCastEvent{Time: actualTime, Item: itemName}
+					targetName := state.LookupName(m.GetTargetName())
+					if strings.Contains(targetName, "hero") && !m.GetIsTargetIllusion() {
+						if targetName == heroName {
+							ev.TargetSelf = true
+						} else {
+							ev.TargetHero = strings.TrimPrefix(targetName, "npc_dota_hero_")
+						}
+					}
 					state.Players[playerIdx].ItemCastEvents = append(
-						state.Players[playerIdx].ItemCastEvents,
-						ItemCastEvent{Time: actualTime, Item: itemName})
-				}
-			}
-
-		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_AEGIS_TAKEN:
-			// v4.4.1: who picked the Aegis — an enemy-side pickup vs the
-			// Roshan-killing team is an aegis steal (detected web-side).
-			{
-				targetName := state.LookupName(m.GetTargetName())
-				playerIdx := heroNameToPlayerIndex(targetName, state)
-				if playerIdx >= 0 && playerIdx < 10 {
-					state.AegisEvents = append(state.AegisEvents, AegisEvent{
-						Time:      actualTime,
-						PlayerIdx: playerIdx,
-					})
+						state.Players[playerIdx].ItemCastEvents, ev)
 				}
 			}
 
@@ -2268,8 +2295,8 @@ var heroNpcNameToID = map[string]int{
 		"abyssal_underlord": 108, "terrorblade": 109, "phoenix": 110, "oracle": 111, "winter_wyvern": 112,
 		"arc_warden": 113, "monkey_king": 114, "dark_willow": 119, "pangolier": 120,
 		"grimstroke": 121, "hoodwink": 123, "void_spirit": 126, "snapfire": 128, "mars": 129,
-		"dawnbreaker": 135, "marci": 136, "primal_beast": 137, "muerta": 138, "ringmaster": 145,
-		"kez": 152, "largo": 155,
+		"dawnbreaker": 135, "marci": 136, "primal_beast": 137, "muerta": 138, "ringmaster": 131,
+		"kez": 145, "largo": 155,
 
 		// Class name format (normalized)
 		"shadowshaman": 27, "spiritbreaker": 71, "obsidiandestroyer": 76,
