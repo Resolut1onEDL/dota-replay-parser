@@ -160,6 +160,32 @@ type AbilityCast struct {
 	Count       int    `json:"count"`
 }
 
+// v4.4.0: timestamped cast/usage timelines — the raw data for "moments"
+// detection (clutch escapes, teamfight ults, stolen-spell plays). The old
+// count-only reports stay for back-compat.
+type AbilityCastEvent struct {
+	Time       float64 `json:"time"`
+	Ability    string  `json:"ability"`
+	IsUltimate bool    `json:"isUltimate,omitempty"`
+	IsStolen   bool    `json:"isStolen,omitempty"`
+	TargetSelf bool    `json:"targetSelf,omitempty"`
+	// Short hero name (no npc_dota_hero_ prefix) when unit-targeted on a hero.
+	TargetHero string `json:"targetHero,omitempty"`
+}
+
+type ItemCastEvent struct {
+	Time float64 `json:"time"`
+	Item string  `json:"item"`
+}
+
+// Emitted when a hero-vs-hero hit leaves the target at ≤20% max HP (illusions
+// excluded), at most one event per 5s window. HpPct is AFTER the hit.
+type NearDeathEvent struct {
+	Time     float64 `json:"time"`
+	HpPct    int     `json:"hpPct"`
+	Attacker string  `json:"attacker,omitempty"`
+}
+
 type SkillLevelUp struct {
 	Time        float64 `json:"time"`
 	AbilityName string  `json:"abilityName"`
@@ -267,6 +293,11 @@ type PlayerStats struct {
 	Runes         []RuneEvent    `json:"runes,omitempty"`
 	Wards         []WardEvent    `json:"wards,omitempty"`
 	ItemPurchases []ItemPurchase `json:"itemPurchases,omitempty"`
+
+	// Timestamped timelines (v4.4.0)
+	AbilityCastEvents []AbilityCastEvent `json:"abilityCastEvents,omitempty"`
+	ItemCastEvents    []ItemCastEvent    `json:"itemCastEvents,omitempty"`
+	NearDeathEvents   []NearDeathEvent   `json:"nearDeathEvents,omitempty"`
 
 	// Reports
 	AbilityCastReport    []AbilityCast        `json:"abilityCastReport,omitempty"`
@@ -732,6 +763,13 @@ type PlayerState struct {
 
 	// Ability tracking
 	AbilityCasts map[string]int
+
+	// Timestamped timelines (v4.4.0)
+	AbilityCastEvents []AbilityCastEvent
+	ItemCastEvents    []ItemCastEvent
+	NearDeathEvents   []NearDeathEvent
+	MaxHealth         int     // last known m_iMaxHealth from the hero entity
+	LastNearDeathTime float64 // dedup window for NearDeathEvents
 
 	// Damage tracking
 	DamageByTarget         map[int]*DamageTarget
@@ -1372,6 +1410,27 @@ func main() {
 					}
 				}
 
+				// v4.4.0: near-death timeline — the raw signal for clutch-escape
+				// detection. GetHealth() is the target's HP AFTER this hit;
+				// MaxHealth comes from the hero entity scan. Illusions excluded
+				// (they die at low HP constantly), one event per 5s window.
+				// Hero-attacker hits only (this branch) — enough for clutch
+				// moments, tower/creep chip is not tracked here.
+				if targetIdx >= 0 && targetIdx < 10 && !m.GetIsTargetIllusion() {
+					tp := state.Players[targetIdx]
+					if hp := int(m.GetHealth()); hp > 0 && tp.MaxHealth > 0 {
+						if pct := hp * 100 / tp.MaxHealth; pct <= 20 &&
+							actualTime-tp.LastNearDeathTime >= 5 {
+							tp.LastNearDeathTime = actualTime
+							ev := NearDeathEvent{Time: actualTime, HpPct: pct}
+							if attackerIdx >= 0 && attackerIdx < 10 {
+								ev.Attacker = strings.TrimPrefix(attackerName, "npc_dota_hero_")
+							}
+							tp.NearDeathEvents = append(tp.NearDeathEvents, ev)
+						}
+					}
+				}
+
 				// Track damage received by target (any hero→hero, even ally —
 				// this is the inverse view, useful for separate analysis).
 				if targetIdx >= 0 && targetIdx < 10 {
@@ -1421,6 +1480,27 @@ func main() {
 			attackerIdx := heroNameToPlayerIndex(attackerName, state)
 			if attackerIdx >= 0 && attackerIdx < 10 && abilityName != "" {
 				state.Players[attackerIdx].AbilityCasts[abilityName]++
+				// v4.4.0: timestamped cast timeline. Toggles are excluded —
+				// armlet/treads-style spam would drown the real casts.
+				if !m.GetIsAbilityToggleOn() && !m.GetIsAbilityToggleOff() &&
+					len(state.Players[attackerIdx].AbilityCastEvents) < 3000 {
+					ev := AbilityCastEvent{
+						Time:       actualTime,
+						Ability:    abilityName,
+						IsUltimate: m.GetIsUltimateAbility(),
+						IsStolen:   m.GetInflictorIsStolenAbility(),
+					}
+					targetName := state.LookupName(m.GetTargetName())
+					if strings.Contains(targetName, "hero") && !m.GetIsTargetIllusion() {
+						if targetName == attackerName {
+							ev.TargetSelf = true
+						} else {
+							ev.TargetHero = strings.TrimPrefix(targetName, "npc_dota_hero_")
+						}
+					}
+					state.Players[attackerIdx].AbilityCastEvents = append(
+						state.Players[attackerIdx].AbilityCastEvents, ev)
+				}
 			}
 
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_MODIFIER_ADD:
@@ -1550,6 +1630,17 @@ func main() {
 					state.Players[playerIdx].ItemUsage = make(map[string]int)
 				}
 				state.Players[playerIdx].ItemUsage[itemName]++
+				// v4.4.0: timestamped item-use timeline. Power Treads stat
+				// switching fires ITEM events WITHOUT toggle flags (observed:
+				// 87 "uses" per game) — excluded by name; armlet toggling is
+				// kept deliberately (clutch micro signal).
+				if !m.GetIsAbilityToggleOn() && !m.GetIsAbilityToggleOff() &&
+					itemName != "item_power_treads" &&
+					len(state.Players[playerIdx].ItemCastEvents) < 3000 {
+					state.Players[playerIdx].ItemCastEvents = append(
+						state.Players[playerIdx].ItemCastEvents,
+						ItemCastEvent{Time: actualTime, Item: itemName})
+				}
 			}
 
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_NEUTRAL_CAMP_STACK:
@@ -1601,6 +1692,12 @@ func main() {
 						state.Players[playerIdx].HeroID = heroID
 					}
 					
+					// v4.4.0: last known max HP — denominator for near-death
+					// events in the combat-log damage handler.
+					if maxHP, ok := e.GetInt32("m_iMaxHealth"); ok && maxHP > 0 {
+						state.Players[playerIdx].MaxHealth = int(maxHP)
+					}
+
 					// Track position for lane detection
 					if cellX, ok := e.GetUint64("CBodyComponent.m_cellX"); ok {
 						if cellY, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
@@ -2666,6 +2763,11 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			levelPM = append(levelPM, snap.Level)
 		}
 
+		// v4.4.0 timelines pass through as-is (already time-ordered)
+		abilityCastEvents := ps.AbilityCastEvents
+		itemCastEvents := ps.ItemCastEvents
+		nearDeathEvents := ps.NearDeathEvents
+
 		// Build ability cast report
 		var abilityCasts []AbilityCast
 		for name, count := range ps.AbilityCasts {
@@ -2740,6 +2842,9 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			ItemPurchases:        ps.ItemPurchases,
 			Wards:                ps.Wards,
 			Runes:                ps.Runes,
+			AbilityCastEvents:    abilityCastEvents,
+			ItemCastEvents:       itemCastEvents,
+			NearDeathEvents:      nearDeathEvents,
 			AbilityCastReport:    abilityCasts,
 			HeroDamageReport:     damageReport,
 			DamageReceivedReport: damageReceivedReport,
@@ -2887,7 +2992,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.3.1",
+		ParserVersion:          "4.4.0",
 	}
 }
 
