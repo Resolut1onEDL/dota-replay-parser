@@ -913,6 +913,10 @@ type ParserState struct {
 	PauseStartedByTeam int
 	Pauses             []PauseEvent
 	PauseStartTicks    []uint32
+	// v4.4.3: суммарные тики завершённых пауз — вычитаются в GameTime(),
+	// чтобы тиковые часы совпадали с серверной игровой осью (m_fGameTime),
+	// на которой живут m_flGameStartTime/EndTime и таймстампы комбатлога.
+	PausedTicksTotal uint32
 
 	// Rune entity tracking for pickup attribution
 	PendingRunes map[int32]*RuneEntityInfo // entityIdx → rune info
@@ -1009,8 +1013,29 @@ func (s *ParserState) LookupName(index uint32) string {
 	return fmt.Sprintf("unknown_%d", index)
 }
 
+// GameTime возвращает СЕРВЕРНЫЕ игровые часы (ось m_fGameTime, на которой
+// живут m_flGameStartTime/EndTime и таймстампы комбатлога): тики демо минус
+// все тики пауз. Сырой tick/30 убегает вперёд на сумму пауз: 21.6-минутная
+// пауза в драфте (матч 8883829567) сдвигала окно лейн-детекта «1..10 минута»
+// целиком в паузу — laneStats/lane умирали у всех десяти игроков, а в любых
+// запаузенных матчах entity-таймстампы (касты, варды, руны, поминутные серии)
+// расходились с комбатлогом на сумму пауз. Проверка оси: wall-прегейм 2085с −
+// паузы 1306с = 779 ≈ m_flGameStartTime 778.4. (v4.4.3)
 func (s *ParserState) GameTime() float64 {
-	return float64(s.CurrentTick) / 30.0
+	tick := s.CurrentTick
+	if s.PauseActive && s.PauseStartTick > 0 && s.PauseStartTick < tick {
+		tick = s.PauseStartTick // во время паузы часы стоят
+	}
+	if tick > s.PausedTicksTotal {
+		tick -= s.PausedTicksTotal
+	} else {
+		tick = 0
+	}
+	ti := float64(s.TickInterval)
+	if ti <= 0 {
+		ti = 1.0 / 30.0
+	}
+	return float64(tick) * ti
 }
 
 func (s *ParserState) GameMinute() int {
@@ -1952,6 +1977,7 @@ func main() {
 						PausedBy:    state.PauseStartedByTeam,
 					})
 					state.PauseStartTicks = append(state.PauseStartTicks, state.PauseStartTick)
+					state.PausedTicksTotal += ticks
 				}
 			}
 		}
@@ -3069,7 +3095,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.4.2",
+		ParserVersion:          "4.4.3",
 	}
 }
 
