@@ -454,8 +454,8 @@ var heroNames = map[int32]string{
 	108: "Underlord", 109: "Terrorblade", 110: "Phoenix", 111: "Oracle", 112: "Winter Wyvern",
 	113: "Arc Warden", 114: "Monkey King", 119: "Dark Willow", 120: "Pangolier",
 	121: "Grimstroke", 123: "Hoodwink", 126: "Void Spirit", 128: "Snapfire", 129: "Mars",
-	135: "Dawnbreaker", 136: "Marci", 137: "Primal Beast", 138: "Muerta", 145: "Ringmaster",
-	152: "Kez", 155: "Largo",
+	135: "Dawnbreaker", 136: "Marci", 137: "Primal Beast", 138: "Muerta", 131: "Ringmaster",
+	145: "Kez", 155: "Largo",
 }
 
 func getHeroName(heroID int) string {
