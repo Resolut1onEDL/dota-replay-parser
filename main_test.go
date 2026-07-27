@@ -178,7 +178,8 @@ func TestGetHeroNameNewHeroes(t *testing.T) {
 		want string
 	}{
 		{41, "Faceless Void"},
-		{152, "Kez"},
+		{145, "Kez"}, // real id (152 never existed — old map typo)
+		{131, "Ringmaster"},
 		{155, "Largo"},
 		{9999, "Hero_9999"}, // unknown id keeps explicit fallback
 	}
