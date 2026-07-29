@@ -280,7 +280,8 @@ type LaneStats struct {
 	LanePartner       int     `json:"lanePartner,omitempty"`
 	LaneCreepKills    int     `json:"laneCreepKills"`
 	LaneCreepDenies   int     `json:"laneCreepDenies"`
-	ReaggroCount      int     `json:"reaggroCount"` // EXTRA: creep aggro manipulation
+	ReaggroCount      int     `json:"reaggroCount"` // v4.4.4: ЧЕСТНОЕ реагро (attack-ордер без урона)
+	LaneHarassCount   int     `json:"laneHarassCount"` // долетевший физурон по героям (бывший «reaggroCount»)
 	DeathsPreTen      int     `json:"deathsPreTen"`
 	LaneDamageTakenPre5 int   `json:"laneDamageTakenPre5"` // EXTRA: enemy-hero dmg taken before 5:00
 	KillsPreTen       int     `json:"killsPreTen"`
@@ -830,8 +831,15 @@ type PlayerState struct {
 	// Vision: enemy wards destroyed by this player (deward), v4.3.0
 	WardsDewarded int
 
-	// Reaggro tracking (physical attacks on enemy heroes in lane)
+	// Харасс на линии: долетевший физурон по вражеским героям в 1-10 мин.
+	// До v4.4.4 это значение выдавалось как reaggroCount («aggro proxy»).
 	LaneHarassCount int
+
+	// Честное реагро (v4.4.4): ATTACK_TARGET-ордера по вражескому герою БЕЗ
+	// физурона по нему в ближайшие 1.5с — чистый дёрг агро крипов (атака
+	// отменена). Идеальное реагро наносит ноль урона и для харасс-метрики
+	// невидимо (эталон: ТА 8897841991 — 23 дёрга / 0 ударов за 10 минут).
+	TrueReaggroCount int
 
 	// Enemy-hero damage received before 5:00 (lane punishment taken)
 	LaneDamageTakenPre5 int
@@ -921,6 +929,13 @@ type ParserState struct {
 	// Rune entity tracking for pickup attribution
 	PendingRunes map[int32]*RuneEntityInfo // entityIdx → rune info
 
+	// Реагро-детект (v4.4.4): entity-индекс героя → игрок (иллюзии включены —
+	// агро крипов триггерится и об иллюзию), незакрытые attack-ордера и
+	// анти-спам-дедуп дёргов по паре (игрок, цель).
+	HeroEntityToPlayer map[int32]int
+	PendingAggro       []pendingAggroOrder
+	LastAggroPull      [10][10]float64
+
 	// Bounty rune gold tracking (gold_reason=17) for confirmation
 	BountyGoldEvents []BountyGoldEvent
 
@@ -979,6 +994,7 @@ func NewParserState(p *manta.Parser) *ParserState {
 		AbilityEntities:    make(map[int32]*AbilityEntityInfo),
 		ActiveWards:        make(map[int32]*activeWard),
 		PendingRunes:       make(map[int32]*RuneEntityInfo),
+		HeroEntityToPlayer: make(map[int32]int),
 		BountyGoldEvents:   make([]BountyGoldEvent, 0),
 		PositionSamples:    make([]PositionSample, 0),
 		Pauses:             make([]PauseEvent, 0),
@@ -1083,6 +1099,11 @@ func finalizeWard(s *ParserState, idx int32, now float64) {
 	}
 	pw[w.sliceIdx].EndTime = now
 	pw[w.sliceIdx].Duration = dur
+}
+
+type pendingAggroOrder struct {
+	player, target int
+	t              float64
 }
 
 // Convert replay player ID to 0-9 index
@@ -1194,6 +1215,33 @@ func main() {
 	// Combat log callback
 	// v4.4.1: Aegis pickups arrive as chat events (playerid_1 = player slot,
 	// verified 0-9 direct — no entity-id remap needed).
+	// v4.4.4: реагро-детект. ATTACK_TARGET-ордер по вражескому герою; если в
+	// ближайшие 1.5с физурон по этой цели НЕ долетел (см. damage-хендлер) —
+	// это дёрг агро крипов, а не харасс. Дедуп спам-кликов пары 2.5с.
+	p.Callbacks.OnCDOTAUserMsg_SpectatorPlayerUnitOrders(func(m *dota.CDOTAUserMsg_SpectatorPlayerUnitOrders) error {
+		if m.GetOrderType() != 4 || len(m.GetUnits()) == 0 { // DOTA_UNIT_ORDER_ATTACK_TARGET
+			return nil
+		}
+		pl, ok := state.HeroEntityToPlayer[int32(m.GetUnits()[0])]
+		if !ok {
+			return nil
+		}
+		tg, ok2 := state.HeroEntityToPlayer[m.GetTargetIndex()]
+		if !ok2 || pl == tg || state.Players[pl].IsRadiant == state.Players[tg].IsRadiant {
+			return nil
+		}
+		gt := state.ActualGameSeconds(state.GameTime())
+		if state.GameStartTime == 0 || gt <= 0 || gt >= 600 {
+			return nil
+		}
+		if gt-state.LastAggroPull[pl][tg] <= 2.5 {
+			return nil
+		}
+		state.LastAggroPull[pl][tg] = gt
+		state.PendingAggro = append(state.PendingAggro, pendingAggroOrder{player: pl, target: tg, t: gt})
+		return nil
+	})
+
 	p.Callbacks.OnCDOTAUserMsg_ChatEvent(func(m *dota.CDOTAUserMsg_ChatEvent) error {
 		var kind string
 		switch m.GetType() {
@@ -1472,10 +1520,21 @@ func main() {
 					case 1: // Physical
 						state.Players[attackerIdx].DamageByTarget[targetIdx].PhysicalDamage += damage
 
-						// Track reaggro (physical attacks on heroes during laning)
+						// Харасс: долетевший физурон по герою на линии
 						if actualTime > 60 && actualTime < 600 {
 							state.Players[attackerIdx].LaneHarassCount++
 						}
+						// v4.4.4: урон долетел → недавние attack-ордера этой
+						// пары были харассом, из реагро-кандидатов убираем
+						kept := state.PendingAggro[:0]
+						for _, pd := range state.PendingAggro {
+							if pd.player == attackerIdx && pd.target == targetIdx &&
+								actualTime >= pd.t && actualTime-pd.t <= 1.5 {
+								continue
+							}
+							kept = append(kept, pd)
+						}
+						state.PendingAggro = kept
 					case 2: // Magical
 						state.Players[attackerIdx].DamageByTarget[targetIdx].MagicalDamage += damage
 					case 4: // Pure
@@ -1785,6 +1844,8 @@ func main() {
 				playerIdx := replayPlayerToIndex(replayPlayerID)
 
 				if playerIdx >= 0 && playerIdx < 10 {
+					// v4.4.4: entity→игрок для реагро-детекта по ордерам
+					state.HeroEntityToPlayer[e.GetIndex()] = playerIdx
 					heroName := strings.TrimPrefix(className, "CDOTA_Unit_Hero_")
 					heroID := heroNameStringToID(heroName)
 					if heroID > 0 && state.Players[playerIdx].HeroID == 0 {
@@ -2813,6 +2874,13 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 	// lane I'm probably with them — supports who roam through mid get
 	// pulled back to their core's lane), pass 3 assigns positions 1-5.
 	lanes := make(map[int]string, 10)
+
+	// v4.4.4: незакрытые attack-ордера (урон так и не долетел) = реагро
+	for _, pd := range state.PendingAggro {
+		if pd.t > 0 && pd.t < 600 {
+			state.Players[pd.player].TrueReaggroCount++
+		}
+	}
 	for i := 0; i < 10; i++ {
 		lanes[i] = detectLane(state.Players[i].LanePositions, state.Players[i].IsRadiant)
 	}
@@ -2957,7 +3025,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			LaneStats: LaneStats{
 				Lane:          lane,
 				LanePartner:   partners[i],
-				ReaggroCount:  ps.LaneHarassCount, // Lane harass events as aggro proxy
+				ReaggroCount:    ps.TrueReaggroCount,
+				LaneHarassCount: ps.LaneHarassCount,
 				DeathsPreTen:  ps.LaneDeaths,
 				LaneDamageTakenPre5: ps.LaneDamageTakenPre5,
 				KillsPreTen:   ps.LaneKills,
@@ -3095,7 +3164,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.4.3",
+		ParserVersion:          "4.4.4",
 	}
 }
 
