@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"crypto/subtle"
@@ -84,7 +85,12 @@ func writeDem(src io.Reader) (string, int64, error) {
 	if err != nil && n == 0 {
 		return "", 0, fmt.Errorf("empty body")
 	}
-	full := io.MultiReader(bytes.NewReader(head[:n]), src)
+	// Буфер 4 МБ ОБЯЗАТЕЛЕН перед распаковкой: и zstd, и bzip2 читают источник
+	// мелкими блоками, а источник здесь — сетевое тело ответа Valve. Замер на
+	// матче 8918319751: zstd прямо с resp.Body — 2 мин 2 с (упирались в
+	// 120-секундный таймаут клиента и отдавали 502 download_failed), тот же
+	// поток через bufio 4 МБ — 2.3 с.
+	var full io.Reader = bufio.NewReaderSize(io.MultiReader(bytes.NewReader(head[:n]), src), 4<<20)
 	switch {
 	case n >= 3 && string(head[:3]) == "BZh":
 		full = bzip2.NewReader(full)
