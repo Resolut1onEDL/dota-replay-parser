@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/bzip2"
 	"crypto/subtle"
 	"encoding/json"
@@ -27,6 +28,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 var (
@@ -67,16 +70,31 @@ func authed(r *http.Request) bool {
 }
 
 // writeDem writes the request body to a temp .dem file, transparently
-// decompressing bzip2 (Valve replays are .dem.bz2).
+// decompressing whatever container Valve sends.
+//
+// 2026-07-29: Valve switched new replays from bzip2 to ZSTD while keeping the
+// .dem.bz2 URL — magic 28 B5 2F FD instead of BZh. Sniffing "BZh" only meant
+// zstd bytes were written straight to the .dem file and every new match died
+// with «unexpected magic: expected PBDEMS2» (service answered parse_failed,
+// analyses silently fell back to OpenDota stats). Old bzip2 replays are still
+// served for older matches, so BOTH must work — sniff, never trust the URL.
 func writeDem(src io.Reader) (string, int64, error) {
-	head := make([]byte, 3)
+	head := make([]byte, 4)
 	n, err := io.ReadFull(src, head)
 	if err != nil && n == 0 {
 		return "", 0, fmt.Errorf("empty body")
 	}
-	full := io.MultiReader(strings.NewReader(string(head[:n])), src)
-	if string(head[:n]) == "BZh" {
+	full := io.MultiReader(bytes.NewReader(head[:n]), src)
+	switch {
+	case n >= 3 && string(head[:3]) == "BZh":
 		full = bzip2.NewReader(full)
+	case n >= 4 && head[0] == 0x28 && head[1] == 0xB5 && head[2] == 0x2F && head[3] == 0xFD:
+		zr, zerr := zstd.NewReader(full)
+		if zerr != nil {
+			return "", 0, fmt.Errorf("zstd: %w", zerr)
+		}
+		defer zr.Close()
+		full = zr.IOReadCloser()
 	}
 
 	f, err := os.CreateTemp("", "replay-*.dem")
