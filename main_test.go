@@ -380,6 +380,286 @@ func TestAssignPositionsTrilanePermutation(t *testing.T) {
 	}
 }
 
+// v4.6.0: stun combos. A clean chain (second disable lands as the first
+// ends) and a simultaneous overlap must BOTH count as combos but differ in
+// stunOverlapWastedSec — that difference is the whole point of the metric.
+func TestDetectStunCombos(t *testing.T) {
+	mkState := func() *ParserState {
+		s := &ParserState{}
+		for i := 0; i < 10; i++ {
+			s.Players[i] = &PlayerState{IsRadiant: i < 5}
+		}
+		return s
+	}
+
+	t.Run("clean chain vs overlap are distinguished", func(t *testing.T) {
+		s := mkState()
+		// Clean chain on target 5: A(0) 100.0+1.2s, B(1) at 101.2 (gap 0).
+		// Overlapping duo on target 6: A(0) 200.0+1.6s, B(1) at 200.2+1.7s.
+		s.StunApps = []stunApp{
+			{T: 100.0, Attacker: 0, Target: 5, Dur: 1.2, Ability: "sven_storm_bolt", AttackerShort: "sven", TargetShort: "medusa"},
+			{T: 101.2, Attacker: 1, Target: 5, Dur: 1.0, Ability: "lion_impale", AttackerShort: "lion", TargetShort: "medusa"},
+			{T: 200.0, Attacker: 0, Target: 6, Dur: 1.6, Ability: "sven_storm_bolt", AttackerShort: "sven", TargetShort: "lina"},
+			{T: 200.2, Attacker: 1, Target: 6, Dur: 1.7, Ability: "lion_impale", AttackerShort: "lion", TargetShort: "lina"},
+		}
+		counts, wasted, events := detectStunCombos(s)
+		if counts[0] != 2 || counts[1] != 2 {
+			t.Fatalf("combo counts: got %d/%d, want 2/2", counts[0], counts[1])
+		}
+		// Clean chain wastes 0; the overlap burns 201.6-200.2 = 1.4s.
+		if wasted[0] != 1.4 || wasted[1] != 1.4 {
+			t.Errorf("wasted: got %.2f/%.2f, want 1.40/1.40", wasted[0], wasted[1])
+		}
+		if len(events[0]) != 2 {
+			t.Fatalf("events[0]: got %d, want 2", len(events[0]))
+		}
+		ev := events[0][0]
+		if ev.Time != 100.0 || ev.TargetHero != "medusa" {
+			t.Errorf("first combo event: got %+v", ev)
+		}
+		if len(ev.Abilities) != 2 || ev.Abilities[0] != "sven_storm_bolt" || ev.Abilities[1] != "lion_impale" {
+			t.Errorf("abilities: got %v", ev.Abilities)
+		}
+		if len(ev.Partners) != 1 || ev.Partners[0] != "lion" {
+			t.Errorf("partners for sven: got %v", ev.Partners)
+		}
+	})
+
+	t.Run("same ally re-stun is not a combo", func(t *testing.T) {
+		s := mkState()
+		// Slardar crush → bash: one attacker, chained control, no combo.
+		s.StunApps = []stunApp{
+			{T: 100.0, Attacker: 0, Target: 5, Dur: 0.8, Ability: "slardar_slithereen_crush", AttackerShort: "slardar", TargetShort: "medusa"},
+			{T: 100.7, Attacker: 0, Target: 5, Dur: 1.0, Ability: "slardar_bash", AttackerShort: "slardar", TargetShort: "medusa"},
+		}
+		counts, wasted, events := detectStunCombos(s)
+		if counts[0] != 0 || wasted[0] != 0 || len(events[0]) != 0 {
+			t.Errorf("same-ally chain must not count: counts=%d wasted=%.2f events=%d",
+				counts[0], wasted[0], len(events[0]))
+		}
+	})
+
+	t.Run("gap over grace breaks the chain", func(t *testing.T) {
+		s := mkState()
+		// A ends at 101.2; B lands at 101.8 — 0.6s of free target, no chain.
+		s.StunApps = []stunApp{
+			{T: 100.0, Attacker: 0, Target: 5, Dur: 1.2, Ability: "sven_storm_bolt", AttackerShort: "sven", TargetShort: "medusa"},
+			{T: 101.8, Attacker: 1, Target: 5, Dur: 1.0, Ability: "lion_impale", AttackerShort: "lion", TargetShort: "medusa"},
+		}
+		counts, _, _ := detectStunCombos(s)
+		if counts[0] != 0 || counts[1] != 0 {
+			t.Errorf("broken chain must not count: got %d/%d", counts[0], counts[1])
+		}
+	})
+}
+
+// v4.6.0: pulls. The dire support walks the wave into a camp (creep<->neutral
+// deaths + neutral deletions at the camp) — attributed to the nearest hero
+// over the pre-cluster window. A stack has no creep<->neutral deaths at all
+// and must yield zero pulls even with the hero standing at the camp.
+func TestDetectPulls(t *testing.T) {
+	mkState := func() *ParserState {
+		s := &ParserState{}
+		for i := 0; i < 10; i++ {
+			s.Players[i] = &PlayerState{IsRadiant: i < 5}
+		}
+		s.CampSpawners = [][2]float64{{164, 98}, {136, 148}}
+		return s
+	}
+	campSamples := func(from, to float64, x, y float64) []posSample {
+		var out []posSample
+		for tt := from; tt <= to; tt++ {
+			out = append(out, posSample{T: tt, X: x, Y: y})
+		}
+		return out
+	}
+
+	t.Run("support pull attributed, carry in lane is not", func(t *testing.T) {
+		s := mkState()
+		s.PullDeaths = []pullDeathRec{
+			{T: 265, Radiant: false},                  // neutral died to dire creeps
+			{T: 270, Radiant: false, CreepDied: true}, // dire creep died to neutrals
+			{T: 273, Radiant: false},
+		}
+		s.NeutDeletions = []neutDeletion{{T: 269, X: 164, Y: 97}, {T: 274, X: 165, Y: 98}}
+		s.PosHistory[5] = campSamples(250, 270, 163, 97)  // support at the camp
+		s.PosHistory[6] = campSamples(250, 270, 176, 88)  // carry in lane, ~16 cells off
+		pulls := detectPulls(s)
+		if len(pulls[5]) != 1 {
+			t.Fatalf("support pulls: got %d, want 1 (%+v)", len(pulls[5]), pulls[5])
+		}
+		ev := pulls[5][0]
+		if ev.Time != 265 || ev.CampX != 164 || ev.CampY != 98 || ev.CreepsDied != 1 {
+			t.Errorf("pull event: got %+v, want t=265 camp=(164,98) creepsDied=1", ev)
+		}
+		if len(pulls[6]) != 0 {
+			t.Errorf("carry must not get the pull: %+v", pulls[6])
+		}
+	})
+
+	t.Run("stack is not a pull", func(t *testing.T) {
+		s := mkState()
+		// Hero farms/stacks the camp: neutral deletions happen, hero is right
+		// there — but no lane creep ever fought a neutral.
+		s.NeutDeletions = []neutDeletion{{T: 269, X: 164, Y: 97}}
+		s.PosHistory[5] = campSamples(250, 270, 163, 97)
+		pulls := detectPulls(s)
+		for i := 0; i < 10; i++ {
+			if len(pulls[i]) != 0 {
+				t.Fatalf("stack produced a pull for player %d: %+v", i, pulls[i])
+			}
+		}
+	})
+
+	t.Run("wave meeting neutrals without a puller is skipped", func(t *testing.T) {
+		s := mkState()
+		s.PullDeaths = []pullDeathRec{{T: 265, Radiant: false, CreepDied: true}}
+		s.NeutDeletions = []neutDeletion{{T: 267, X: 164, Y: 97}}
+		// Everyone far away (>20 cells from the camp).
+		s.PosHistory[5] = campSamples(250, 270, 120, 140)
+		pulls := detectPulls(s)
+		for i := 0; i < 10; i++ {
+			if len(pulls[i]) != 0 {
+				t.Fatalf("unattended wave counted as pull for player %d", i)
+			}
+		}
+	})
+}
+
+// v4.6.0: highground episodes. Two zone touches within 10s merge into one
+// episode; a death inside truncates it (corpse freezes in zone until the
+// respawn jump); outcome covers [entry, exit+10].
+func TestDetectHgEntries(t *testing.T) {
+	mkState := func() *ParserState {
+		s := &ParserState{}
+		for i := 0; i < 10; i++ {
+			s.Players[i] = &PlayerState{IsRadiant: i < 5}
+		}
+		return s
+	}
+	// Default zones: radiant base edge x+y<=178. In-zone (100,76)=176;
+	// out-of-zone lane point (110,80)=190. Player 5 is Dire → enemy base is
+	// the Radiant plateau.
+	inX, inY := 100.0, 76.0
+	outX, outY := 110.0, 80.0
+
+	t.Run("two touches within 8s merge into one episode", func(t *testing.T) {
+		s := mkState()
+		s.PosHistory[5] = []posSample{
+			{T: 1000, X: outX, Y: outY},
+			{T: 1001, X: inX, Y: inY},
+			{T: 1004, X: inX, Y: inY},
+			{T: 1005, X: outX, Y: outY}, // brief backstep
+			{T: 1012, X: inX, Y: inY},   // re-entry 8s after last in-zone sample
+			{T: 1015, X: inX, Y: inY},
+			{T: 1016, X: outX, Y: outY},
+		}
+		entries := detectHgEntries(s)
+		if len(entries[5]) != 1 {
+			t.Fatalf("episodes: got %d, want 1 merged (%+v)", len(entries[5]), entries[5])
+		}
+		e := entries[5][0]
+		if e.Time != 1001 || e.DurationSec != 14 {
+			t.Errorf("merged episode: got t=%v dur=%v, want t=1001 dur=14", e.Time, e.DurationSec)
+		}
+		if e.Died {
+			t.Error("no death happened")
+		}
+	})
+
+	t.Run("death truncates the episode and flags died", func(t *testing.T) {
+		s := mkState()
+		s.PosHistory[5] = []posSample{
+			{T: 2000, X: outX, Y: outY},
+			{T: 2001, X: inX, Y: inY},
+			// corpse frozen in zone until the respawn jump at 2040
+			{T: 2010, X: inX, Y: inY},
+			{T: 2040, X: outX, Y: outY},
+		}
+		s.Players[5].DeathEvents = []DeathEvent{{Time: 2005}}
+		entries := detectHgEntries(s)
+		if len(entries[5]) != 1 {
+			t.Fatalf("episodes: got %d, want 1", len(entries[5]))
+		}
+		e := entries[5][0]
+		if !e.Died || e.DurationSec != 4 {
+			t.Errorf("truncated episode: got died=%v dur=%v, want died=true dur=4", e.Died, e.DurationSec)
+		}
+	})
+
+	t.Run("kills, building damage and allies land in the outcome window", func(t *testing.T) {
+		s := mkState()
+		s.PosHistory[5] = []posSample{
+			{T: 3000, X: outX, Y: outY},
+			{T: 3001, X: inX, Y: inY},
+			{T: 3010, X: inX, Y: inY},
+			{T: 3011, X: outX, Y: outY},
+		}
+		s.Players[5].KillEvents = []KillEvent{{Time: 3003}, {Time: 3019}, {Time: 3025}} // 3025 is past exit+10
+		s.Players[5].BuildingDamageTimes = []bdEvent{{T: 3004, Dmg: 350}, {T: 3030, Dmg: 999}}
+		s.PosHistory[6] = []posSample{{T: 3000, X: inX + 5, Y: inY}}   // ally on the plateau
+		s.PosHistory[7] = []posSample{{T: 3000, X: 150, Y: 150}}      // ally far away
+		s.PosHistory[0] = []posSample{{T: 3000, X: inX, Y: inY}}      // enemy — never listed
+		entries := detectHgEntries(s)
+		if len(entries[5]) != 1 {
+			t.Fatalf("episodes: got %d, want 1", len(entries[5]))
+		}
+		e := entries[5][0]
+		if e.Kills != 2 {
+			t.Errorf("kills: got %d, want 2", e.Kills)
+		}
+		if e.BuildingDamage != 350 {
+			t.Errorf("buildingDamage: got %d, want 350", e.BuildingDamage)
+		}
+		if len(e.AlliesNearby) != 1 || e.AlliesNearby[0] != 6 {
+			t.Errorf("alliesNearby: got %v, want [6]", e.AlliesNearby)
+		}
+	})
+}
+
+// v4.6.0: plateau zone geometry — the measured tier-3 cells must be inside
+// their base zone, ramp-bottom lane points outside, and tower-derived
+// thresholds must match the fallback constants on the reference map.
+func TestHgZones(t *testing.T) {
+	zones := deriveHgZones(map[string][2]float64{
+		"dota_goodguys_tower3_bot": {96, 80},
+		"dota_goodguys_tower3_mid": {90, 94},
+		"dota_goodguys_tower3_top": {76, 100},
+		"dota_badguys_tower3_bot":  {176, 150},
+		"dota_badguys_tower3_mid":  {160, 156},
+		"dota_badguys_tower3_top":  {154, 172},
+	})
+	if zones != (hgZones{radEdge: 178, radMid: 186, direEdge: 324, direMid: 314}) {
+		t.Fatalf("derived zones differ from reference: %+v", zones)
+	}
+	cases := []struct {
+		x, y    float64
+		radBase bool
+		want    bool
+		name    string
+	}{
+		{96, 80, true, true, "radiant t3 bot on plateau"},
+		{90, 94, true, true, "radiant t3 mid on the nose"},
+		{80, 86, true, true, "radiant fort"},
+		{102, 80, true, false, "bot lane below the ramp"},
+		{96, 96, true, false, "mid ramp bottom"},
+		{176, 150, false, true, "dire t3 bot on plateau"},
+		{160, 156, false, true, "dire t3 mid on the nose"},
+		{170, 166, false, true, "dire fort"},
+		{140, 174, false, false, "top lane before dire ramp"},
+		{140, 140, false, false, "river"},
+	}
+	for _, c := range cases {
+		if got := zones.inBase(c.x, c.y, c.radBase); got != c.want {
+			t.Errorf("%s (%v,%v): inBase=%v, want %v", c.name, c.x, c.y, got, c.want)
+		}
+	}
+	// No towers at all → fallback constants keep the detector alive.
+	if deriveHgZones(map[string][2]float64{}) != (hgZones{radEdge: 178, radMid: 186, direEdge: 324, direMid: 314}) {
+		t.Error("fallback thresholds broken")
+	}
+}
+
 // Dead lanes (parser gaps, heavy smokes) must still yield a permutation —
 // farm rank, crude but never a duplicate.
 func TestAssignPositionsDeadLanesPermutation(t *testing.T) {
