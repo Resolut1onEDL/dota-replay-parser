@@ -2569,69 +2569,144 @@ func detectLanePartner(state *ParserState, playerIdx int) int {
 	return bestPartner
 }
 
-// assignPositions classifies each player to a Dota position 1-5:
-//   1 = hard carry  (highest NW core on safe lane)
-//   2 = mid         (solo player on mid)
-//   3 = offlaner    (highest NW core on off lane)
-//   4 = soft support
-//   5 = hard support
+// assignPositions classifies each player to a Dota position 1-5 — and ALWAYS
+// emits a clean permutation of 1..5 per team.
 //
-// Algorithm:
-//  1. Group players by team and detected lane.
-//  2. Mid solo = pos 2.
-//  3. On safe/off, the higher-NW@10 player is core (1 or 3),
-//     the other is hard/soft support (5 or 4).
-//  4. Roamers default to pos 4 (soft support / roaming gank role).
+// This is a port of the web/camp engine's deriveMatchPositions (ResoAI-web
+// src/lib/odb/positions.ts), validated on the ODB S3 camp corpus. The previous
+// bucket-per-lane version assigned lanes independently and could not keep the
+// permutation invariant: a safe-lane trilane emitted 1+5+5 and no pos-4 at all
+// (live case: match 8919464063, Dire [5,1,3,5,2] — a roaming pos-4 Pudge and a
+// hard-5 Lion both labelled 5). Downstream consumers treat position as a role
+// and a duplicate silently breaks their rubrics.
+//
+// Algorithm (lane-first, farm fills the gaps):
+//  1. If >=4 of a team's lanes are known: the farm-richest player of each core
+//     lane takes that core slot (mid → 2, safe → 1, off → 3). EVERYONE else —
+//     second safe-laners, junglers, roamers, unknowns — is ranked by farm
+//     priority and fills the remaining free slots, richer to the lower number.
+//     That split is exactly "stood the lane and farmed → core, stood the lane
+//     and didn't → support", and the leftover ranking is what separates the
+//     roaming 4 from the hard 5.
+//  2. Lanes dead (smoked lanes, parser gaps): farm-priority rank 1..5 — crude,
+//     but still a permutation.
+//
+// Farm priority is networth at the MIDDLE of the match (duration/2 clamped to
+// [15,30] minutes): the final total lies about greedy roamers, the 10-minute
+// snapshot lies about slow-starting carries. Same anchor as the web engine so
+// parser and web derivation agree on the same replay.
 //
 // Returns map[playerIdx]position.
 func assignPositions(state *ParserState, lanes map[int]string) map[int]int {
-	pos := make(map[int]int, 10)
-	// Bucket per team+lane
-	type bucket struct{ idxs []int }
-	buckets := map[string]*bucket{}
+	// Anchor from the snapshot series length (≈ match minutes) — the caller's
+	// duration isn't in scope and the series is what farmPriority reads anyway.
+	matchMinutes := 0
 	for i := 0; i < 10; i++ {
-		side := "rad"
-		if !state.Players[i].IsRadiant {
-			side = "dire"
+		if n := len(state.Players[i].MinuteSnapshots); n > matchMinutes {
+			matchMinutes = n
 		}
-		key := side + ":" + lanes[i]
-		if buckets[key] == nil {
-			buckets[key] = &bucket{}
-		}
-		buckets[key].idxs = append(buckets[key].idxs, i)
 	}
-	for key, b := range buckets {
-		// Sort by NW@10 desc — highest farm goes to core position.
-		sort.Slice(b.idxs, func(a, c int) bool {
-			return state.Players[b.idxs[a]].NWAt10 > state.Players[b.idxs[c]].NWAt10
-		})
-		switch {
-		case strings.HasSuffix(key, ":mid"):
-			for _, idx := range b.idxs {
-				pos[idx] = 2
+	anchor := (matchMinutes + 1) / 2
+	if anchor < 15 {
+		anchor = 15
+	}
+	if anchor > 30 {
+		anchor = 30
+	}
+
+	// Source order mirrors the web engine: nw@anchor → nw@10 → cs@10 → total
+	// (scales kept apart so a better source always outranks a worse one).
+	farmPriority := func(ps *PlayerState) float64 {
+		total := float64(ps.NetWorth) / 100_000
+		if len(ps.MinuteSnapshots) >= anchor {
+			return float64(ps.MinuteSnapshots[anchor-1].NW)*1_000 + total
+		}
+		if ps.NWAt10 > 0 {
+			return float64(ps.NWAt10)*1_000 + total
+		}
+		if len(ps.MinuteSnapshots) >= 10 {
+			return float64(ps.MinuteSnapshots[9].LH)*100 + total
+		}
+		return total
+	}
+
+	pos := make(map[int]int, 10)
+	for _, side := range []bool{true, false} {
+		var team []int
+		for i := 0; i < 10; i++ {
+			if state.Players[i].IsRadiant == side {
+				team = append(team, i)
 			}
-		case strings.HasSuffix(key, ":safe"):
-			// Highest NW = pos 1, lowest = pos 5.
-			for k, idx := range b.idxs {
-				if k == 0 {
-					pos[idx] = 1
-				} else {
-					pos[idx] = 5
+		}
+		assigned := make(map[int]int, 5) // playerIdx → position
+
+		known := 0
+		for _, i := range team {
+			if l := lanes[i]; l != "" && l != "unknown" {
+				known++
+			}
+		}
+
+		if known >= 4 {
+			// Farm-richest unassigned player of a lane takes its core slot.
+			claim := func(lane string, slot int) {
+				best, bestFP := -1, 0.0
+				for _, i := range team {
+					if _, taken := assigned[i]; taken {
+						continue
+					}
+					if lanes[i] != lane {
+						continue
+					}
+					if fp := farmPriority(state.Players[i]); best < 0 || fp > bestFP {
+						best, bestFP = i, fp
+					}
+				}
+				if best >= 0 {
+					assigned[best] = slot
 				}
 			}
-		case strings.HasSuffix(key, ":off"):
-			for k, idx := range b.idxs {
-				if k == 0 {
-					pos[idx] = 3
-				} else {
-					pos[idx] = 4
+			claim("mid", 2)
+			claim("safe", 1)
+			claim("off", 3)
+
+			var left []int
+			for _, i := range team {
+				if _, taken := assigned[i]; !taken {
+					left = append(left, i)
 				}
 			}
-		default:
-			// Roamers / jungle / unknown — default to pos 4.
-			for _, idx := range b.idxs {
-				pos[idx] = 4
+			sort.Slice(left, func(a, b int) bool {
+				return farmPriority(state.Players[left[a]]) > farmPriority(state.Players[left[b]])
+			})
+			used := make(map[int]bool, 5)
+			for _, p := range assigned {
+				used[p] = true
 			}
+			var free []int
+			for s := 1; s <= 5; s++ {
+				if !used[s] {
+					free = append(free, s)
+				}
+			}
+			for k, i := range left {
+				if k < len(free) {
+					assigned[i] = free[k]
+				} else {
+					assigned[i] = 4 // unreachable with 5 players; belt and braces
+				}
+			}
+		} else {
+			ranked := append([]int(nil), team...)
+			sort.Slice(ranked, func(a, b int) bool {
+				return farmPriority(state.Players[ranked[a]]) > farmPriority(state.Players[ranked[b]])
+			})
+			for r, i := range ranked {
+				assigned[i] = r + 1
+			}
+		}
+		for i, p := range assigned {
+			pos[i] = p
 		}
 	}
 	return pos
@@ -3164,7 +3239,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		SmokeEvents:            detectSmokeEvents(state),
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.4.4",
+		ParserVersion:          "4.5.0",
 	}
 }
 

@@ -318,3 +318,87 @@ func TestFinalizeWard(t *testing.T) {
 		}
 	})
 }
+
+// assignPositions must ALWAYS emit a clean 1..5 permutation per team — the
+// bucket-per-lane version it replaced could not: a safe-lane trilane produced
+// 1+5+5 and no pos-4 (live case: match 8919464063, Dire [5,1,3,5,2] — the
+// roaming four and the hard five both labelled 5).
+func TestAssignPositionsTrilanePermutation(t *testing.T) {
+	mkPlayer := func(radiant bool, nwAtAnchor int) *PlayerState {
+		ps := &PlayerState{IsRadiant: radiant, NetWorth: nwAtAnchor * 2}
+		// 30 minutes of snapshots, linear growth to nwAtAnchor*2 at the end.
+		for m := 1; m <= 30; m++ {
+			ps.MinuteSnapshots = append(ps.MinuteSnapshots, MinuteSnapshot{NW: nwAtAnchor * 2 * m / 30})
+		}
+		return ps
+	}
+	state := &ParserState{}
+	// Dire mirrors Даня's game: trilane on safe (rich Lifestealer, roaming
+	// Pudge, poor Lion), SF mid, Rubick alone on off.
+	state.Players[0] = mkPlayer(false, 12000) // Lifestealer, safe
+	state.Players[1] = mkPlayer(false, 5000)  // Pudge, safe (roams)
+	state.Players[2] = mkPlayer(false, 3500)  // Lion, safe
+	state.Players[3] = mkPlayer(false, 11000) // SF, mid
+	state.Players[4] = mkPlayer(false, 4800)  // Rubick, off solo
+	// Radiant: an ordinary 2-1-2.
+	state.Players[5] = mkPlayer(true, 13000) // carry, safe
+	state.Players[6] = mkPlayer(true, 4000)  // hard support, safe
+	state.Players[7] = mkPlayer(true, 11500) // mid
+	state.Players[8] = mkPlayer(true, 9000)  // offlaner
+	state.Players[9] = mkPlayer(true, 5500)  // soft support, off
+
+	lanes := map[int]string{
+		0: "safe", 1: "safe", 2: "safe", 3: "mid", 4: "off",
+		5: "safe", 6: "safe", 7: "mid", 8: "off", 9: "off",
+	}
+	pos := assignPositions(state, lanes)
+
+	want := map[int]int{
+		0: 1, // richest of the trilane → carry
+		3: 2,
+		4: 3, // alone on off → offlaner (Даня: «меня провозгласили тройкой»)
+		1: 4, // richer leftover → the roaming four
+		2: 5,
+		5: 1, 6: 5, 7: 2, 8: 3, 9: 4,
+	}
+	for idx, p := range want {
+		if pos[idx] != p {
+			t.Errorf("player %d: got pos %d, want %d", idx, pos[idx], p)
+		}
+	}
+	// The invariant itself, both teams.
+	for _, team := range [][]int{{0, 1, 2, 3, 4}, {5, 6, 7, 8, 9}} {
+		seen := map[int]bool{}
+		for _, idx := range team {
+			seen[pos[idx]] = true
+		}
+		for s := 1; s <= 5; s++ {
+			if !seen[s] {
+				t.Errorf("team %v: slot %d missing — not a permutation: %v", team, s, pos)
+			}
+		}
+	}
+}
+
+// Dead lanes (parser gaps, heavy smokes) must still yield a permutation —
+// farm rank, crude but never a duplicate.
+func TestAssignPositionsDeadLanesPermutation(t *testing.T) {
+	state := &ParserState{}
+	for i := 0; i < 10; i++ {
+		state.Players[i] = &PlayerState{IsRadiant: i < 5, NetWorth: 1000 * (i + 1)}
+	}
+	lanes := map[int]string{}
+	for i := 0; i < 10; i++ {
+		lanes[i] = "unknown"
+	}
+	pos := assignPositions(state, lanes)
+	for _, team := range [][]int{{0, 1, 2, 3, 4}, {5, 6, 7, 8, 9}} {
+		seen := map[int]bool{}
+		for _, idx := range team {
+			seen[pos[idx]] = true
+		}
+		if len(seen) != 5 {
+			t.Errorf("team %v: positions are not a permutation: %v", team, pos)
+		}
+	}
+}
