@@ -13,6 +13,13 @@ import (
 	"github.com/dotabuff/manta/dota"
 )
 
+// parserVersion is the single source of truth for the output-contract
+// version: it goes into every JSON (parserVersion field), is printed by
+// `parser --version` for distribution tooling (parse-service /healthz,
+// companion/uploader bin verification, scripts/release-sync.sh), and must
+// match the release tag (vX.Y.Z) that ships the binaries.
+const parserVersion = "4.6.0"
+
 // ============= TYPES (Stratz-compatible + extras) =============
 
 type ItemPurchase struct {
@@ -1438,8 +1445,12 @@ func hasBountyGoldNear(state *ParserState, time float64, playerIdx int) bool {
 // ============= MAIN PARSER =============
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "--version" {
+		fmt.Println(parserVersion)
+		return
+	}
 	if len(os.Args) < 2 {
-		log.Fatal("Usage: dota-replay-parser <replay.dem>")
+		log.Fatal("Usage: dota-replay-parser <replay.dem> | --version")
 	}
 
 	replayPath := os.Args[1]
@@ -3782,7 +3793,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		CampBlocks:             campBlocks,
 		Players:                players,
 		ParsedFromReplay:       true,
-		ParserVersion:          "4.6.0",
+		ParserVersion:          parserVersion,
 	}
 }
 

@@ -35,6 +35,10 @@ import (
 
 var (
 	parserBin = envOr("PARSER_BIN", "./parser")
+	// parserVersion is asked from the binary itself (--version, v4.6.0+);
+	// older binaries have no flag and fall back to the basename so /healthz
+	// still answers. Resolved once at startup.
+	parserVersion = detectParserVersion()
 	token     = os.Getenv("PARSE_TOKEN")
 	sem       chan struct{}
 	// Replay download client with a total timeout. Valve's replay CDN is
@@ -53,6 +57,16 @@ func downloadTimeout() time.Duration {
 		}
 	}
 	return 120 * time.Second
+}
+
+func detectParserVersion() string {
+	out, err := exec.Command(envOr("PARSER_BIN", "./parser"), "--version").Output()
+	if err == nil {
+		if v := strings.TrimSpace(string(out)); v != "" && len(v) < 32 {
+			return v
+		}
+	}
+	return filepath.Base(envOr("PARSER_BIN", "./parser"))
 }
 
 func envOr(key, def string) string {
@@ -263,7 +277,7 @@ func serveParsed(w http.ResponseWriter, demPath string, download time.Duration) 
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"ok":true,"parser":%q}`, filepath.Base(parserBin))
+	fmt.Fprintf(w, `{"ok":true,"parser":%q}`, parserVersion)
 }
 
 func main() {
