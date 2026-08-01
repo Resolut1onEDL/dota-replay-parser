@@ -880,3 +880,43 @@ func TestAssignPositionsDeadLanesPermutation(t *testing.T) {
 		}
 	}
 }
+
+// detectLane: plurality vote of per-sample zones, not the coordinate mean.
+// The mean erased a zoned offlaner's lane (match 8921261987): minutes 1-5 in
+// the lane corridor, 6-10 pushed into jungle/roam — the average landed in the
+// central jungle box while the vote says "lane".
+func TestDetectLaneVoteBeatsMean(t *testing.T) {
+	var pos []struct{ X, Y float64 }
+	// 20% skip window eats the head — pad it with lane samples too.
+	for i := 0; i < 150; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 176, Y: 96}) // dire off corridor (bottom)
+	}
+	for i := 0; i < 80; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 135, Y: 170}) // jungle box (off the mid diagonal)
+	}
+	for i := 0; i < 60; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 190, Y: 125}) // roam (outside boxes)
+	}
+	// Dire bottom = off lane. The mean of this mix drifts into "jungle" —
+	// detectLane (roles) keeps saying so, and the REPORTING second opinion
+	// restores the lane that was stood.
+	if got := detectLane(pos, false); got != "jungle" {
+		t.Errorf("roles map must keep the mean verdict: got %q, want \"jungle\"", got)
+	}
+	if got := detectErasedLane(pos, false); got != "off" {
+		t.Errorf("zoned offlaner report lane: got %q, want \"off\"", got)
+	}
+}
+
+func TestDetectLanePureJunglerStaysJungle(t *testing.T) {
+	var pos []struct{ X, Y float64 }
+	for i := 0; i < 200; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 135, Y: 170}) // off the mid diagonal
+	}
+	if got := detectLane(pos, true); got != "jungle" {
+		t.Errorf("pure jungler: got %q, want \"jungle\"", got)
+	}
+	if got := detectErasedLane(pos, true); got != "" {
+		t.Errorf("pure jungler must get NO restored lane, got %q", got)
+	}
+}

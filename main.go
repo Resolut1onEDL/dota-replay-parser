@@ -18,7 +18,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.6.0"
+const parserVersion = "4.6.1"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -2952,20 +2952,42 @@ func heroNameStringToID(name string) int {
 	return 0
 }
 
-// detectLane classifies a hero's lane during the 1–10 minute laning phase
-// based on average map cell position. Source 2 cell coords: X grows east,
-// Y grows north. Radiant base is at the SW corner (~64,64), Dire base at
-// the NE corner (~192,192).
+// laneZoneOf classifies ONE position sample into a zone. Source 2 cell
+// coords: X grows east, Y grows north. Radiant base is at the SW corner
+// (~64,64), Dire base at the NE corner (~192,192).
 //
 // Lane geometry (during laning phase, players stand near these areas):
 //   - bottom lane (south edge):  low Y,  X ~80–140  → radiant safe / dire off
 //   - top lane (west edge):      low X,  Y ~80–140  → radiant off / dire safe
 //   - mid:                       on diagonal X≈Y around 110–150
+func laneZoneOf(x, y float64) string {
+	// Mid takes priority because its corridor partly overlaps
+	// jungle/transition zones.
+	if math.Abs(x-y) < 30 && x >= 100 && x <= 170 {
+		return "mid"
+	}
+	if y < 110 && x >= 60 && x <= 200 {
+		return "bottom"
+	}
+	if x < 110 && y >= 60 && y <= 200 {
+		return "top"
+	}
+	if x > 110 && x < 180 && y > 110 && y < 180 {
+		return "jungle"
+	}
+	return "roam"
+}
+
+// detectLane classifies a hero's lane during the 1–10 minute laning phase by
+// the MEAN position over the window (skip the first 20% — fountain walk),
+// classified by zone. The mean is a good smoother for everyone who actually
+// has a lane; per-sample plurality votes (full and early window) were tried
+// and made mids/rotators WORSE (camp-standard agreement 253→244 and 253→239),
+// so role derivation keeps consuming exactly this.
 func detectLane(positions []struct{ X, Y float64 }, isRadiant bool) string {
 	if len(positions) < 100 {
 		return "unknown"
 	}
-	// Skip first 20% (early movement out of fountain) and avg over the rest.
 	start := len(positions) / 5
 	var sumX, sumY float64
 	n := 0
@@ -2977,38 +2999,66 @@ func detectLane(positions []struct{ X, Y float64 }, isRadiant bool) string {
 	if n == 0 {
 		return "unknown"
 	}
-	avgX := sumX / float64(n)
-	avgY := sumY / float64(n)
+	return laneZoneToLane(laneZoneOf(sumX/float64(n), sumY/float64(n)), isRadiant)
+}
 
-	// Bottom lane corridor (Y is small, X varies 60..180).
-	bottomLane := avgY < 110 && avgX >= 60 && avgX <= 200
-	// Top lane corridor (X is small, Y varies 60..180).
-	topLane := avgX < 110 && avgY >= 60 && avgY <= 200
-	// Mid lane: along the diagonal X≈Y, in the central band.
-	midLane := math.Abs(avgX-avgY) < 30 && avgX >= 100 && avgX <= 170
-
-	// Mid takes priority because mid corridor partly overlaps
-	// jungle/transition zones.
-	if midLane {
-		return "mid"
-	}
-	if bottomLane {
+func laneZoneToLane(zone string, isRadiant bool) string {
+	switch zone {
+	case "bottom":
 		if isRadiant {
 			return "safe"
 		}
 		return "off"
-	}
-	if topLane {
+	case "top":
 		if isRadiant {
 			return "off"
 		}
 		return "safe"
+	default:
+		return zone
 	}
-	// Far from any lane corridor → likely jungling or roaming between lanes.
-	if avgX > 110 && avgX < 180 && avgY > 110 && avgY < 180 {
-		return "jungle"
+}
+
+// detectErasedLane is the REPORTING second opinion for a player whose mean
+// said jungle/roam ("no lane"). A zoned LANER's average drifts out of the
+// corridor even though he stood the lane. Live case, match 8921261987
+// (reported by the player who stood it): a Pangolier held the off lane 1v2
+// for minutes 1–5, got dove out, minutes 6–10 went to camps and rotations —
+// the mean landed at (179,112), inside the central jungle box, the report
+// called him «лес/роум» and his lane grade zeroed out.
+//
+// Vote per-sample zones over the EARLY window (20%–60% ≈ minutes 2–6, before
+// rotations pollute everyone): a lane zone holding ≥2/3 of those samples is a
+// lane that was STOOD, not grazed (a roaming support grazing the off lane
+// clears 50% but not 2/3 — validated on the camp corpus). Returns "" when no
+// lane qualifies.
+//
+// This feeds laneStats.lane — the coach's prose, the laning report and the
+// lane grade — and deliberately NOT role assignment: roles derive from the
+// mean-based map, which matches the human-approved camp standard except on
+// the rows the human overrode by hand. A roaming four who genuinely stood a
+// lane keeps her ROLE; she just stops being told she «играл(а) лес».
+func detectErasedLane(positions []struct{ X, Y float64 }, isRadiant bool) string {
+	if len(positions) < 100 {
+		return ""
 	}
-	return "roam"
+	start := len(positions) / 5
+	end := len(positions) * 3 / 5
+	votes := map[string]int{}
+	early := 0
+	for i := start; i < end; i++ {
+		votes[laneZoneOf(positions[i].X, positions[i].Y)]++
+		early++
+	}
+	if early == 0 {
+		return ""
+	}
+	for _, z := range []string{"mid", "bottom", "top"} {
+		if votes[z]*3 >= early*2 {
+			return laneZoneToLane(z, isRadiant)
+		}
+	}
+	return ""
 }
 
 // detectLanePartner finds the hero (player index 0..9) on the same team
@@ -3470,6 +3520,20 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 	}
 	positions := assignPositions(state, lanes)
 
+	// Reporting lanes: restore lanes the mean erased for zoned laners
+	// (detectErasedLane). Applied AFTER role assignment on purpose — roles
+	// keep deriving from the mean-based map that matches the approved camp
+	// standard; only what the coach SAYS about the lane changes.
+	reportLanes := make(map[int]string, 10)
+	for i := 0; i < 10; i++ {
+		reportLanes[i] = lanes[i]
+		if lanes[i] == "jungle" || lanes[i] == "roam" {
+			if up := detectErasedLane(state.Players[i].LanePositions, state.Players[i].IsRadiant); up != "" {
+				reportLanes[i] = up
+			}
+		}
+	}
+
 	// v4.6.0: pulls, laning stun combos, enemy-highground episodes, stacks,
 	// camp-block war, measured dead time.
 	pulls := detectPulls(state)
@@ -3584,7 +3648,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		}
 
 		// Lane (from pass-1 detection above)
-		lane := lanes[i]
+		lane := reportLanes[i]
 		laneInt := 0
 		switch lane {
 		case "safe":
