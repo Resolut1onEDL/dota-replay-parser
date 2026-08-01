@@ -18,7 +18,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.6.1"
+const parserVersion = "4.7.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -38,6 +38,10 @@ type WardEvent struct {
 	// (omitempty) when the ward was still alive at game end.
 	EndTime  float64 `json:"endTime,omitempty"`
 	Duration float64 `json:"durationSeconds,omitempty"`
+	// v4.7.0: destroyed by the enemy (deward) vs natural expiry — a combat-log
+	// ward DEATH of the same ward type within 2s of the entity deletion claims
+	// it. Expired and still-alive wards keep the zero value.
+	Killed bool `json:"killed,omitempty"`
 }
 
 // v4.3.0: in-flight ward, для расчёта длительности на удалении сущности.
@@ -256,6 +260,32 @@ type SmokeEvent struct {
 	Participants []int        `json:"participants"` // player indices 0-9
 	IsRadiant    bool         `json:"isRadiant"`    // which side smoked
 	Outcome      SmokeOutcome `json:"outcome"`
+	// v4.7.0: spatial story — activation point (participants' centroid), when
+	// the LAST participant lost the buff, and each participant's walk. Built
+	// from the illusion-filtered PosHistory + modifier_smoke_of_deceit
+	// MODIFIER_REMOVE events; absent on demos without position data.
+	X       float64      `json:"x,omitempty"` // cells (~64..192)
+	Y       float64      `json:"y,omitempty"`
+	EndTime float64      `json:"endTime,omitempty"`
+	Routes  []SmokeRoute `json:"routes,omitempty"`
+}
+
+// SmokeRoute — one participant's path while smoked. Expiry, proximity reveal
+// and death all arrive as the same MODIFIER_REMOVE, so EndTime is "the buff
+// ended", not "the smoke was broken" — the web layer tells those apart by
+// context (a death at the same second, elapsed ≈ full duration, etc).
+type SmokeRoute struct {
+	Idx     int         `json:"idx"`               // player index 0-9
+	Path    []PathPoint `json:"path,omitempty"`    // ≥1.8s apart, from 15s before activation to buff end
+	EndTime float64     `json:"endTime,omitempty"` // absent when no REMOVE landed in the window
+	EndX    float64     `json:"endX,omitempty"`    // hero cell at buff end
+	EndY    float64     `json:"endY,omitempty"`
+}
+
+type PathPoint struct {
+	T float64 `json:"t"` // game-clock sec
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
 }
 
 type SmokeOutcome struct {
@@ -1055,6 +1085,13 @@ type ParserState struct {
 	// buildMatchOutput в SmokeEvent при ≥4 одной команды в окне 1.5s.
 	SmokeModifierAdds []SmokeModifierAdd
 
+	// v4.7.0: raw smoke modifier-remove events — pair with SmokeModifierAdds
+	// so each participant's smoke gets an end (expiry/reveal/death).
+	SmokeModifierRemoves []SmokeModifierAdd
+	// v4.7.0: combat-log ward kills waiting to be matched to the ward entity
+	// deletion in finalizeWard (deward vs natural expiry).
+	PendingDewards []pendingDeward
+
 	// v4.6.0: raw signals for pulls / stun combos / highground entries.
 	CampSpawners      [][2]float64         // CDOTA_NeutralSpawner cells = camp anchors
 	NeutralSpawnCells map[int32][2]float64 // live neutral creep → first-seen cell (≈ its camp)
@@ -1102,6 +1139,14 @@ func (s *ParserState) entityActual() float64 {
 
 // v4.6.0 internal records.
 type posSample struct{ T, X, Y float64 }
+
+// v4.7.0: a combat-log ward DEATH by an enemy, waiting for the matching ward
+// entity deletion (≤2s apart on the reconciled axes) to stamp Killed=true.
+type pendingDeward struct {
+	t        float64
+	wardType int // 0 = observer, 1 = sentry
+	used     bool
+}
 
 type pullDeathRec struct {
 	T         float64
@@ -1374,6 +1419,32 @@ func finalizeWard(s *ParserState, idx int32, now float64) {
 	}
 	pw[w.sliceIdx].EndTime = now
 	pw[w.sliceIdx].Duration = dur
+	// v4.7.0: deward vs expiry. The ward ENTITY outlives its combat-log death
+	// by the corpse decay — measured 6.3–8.0s on 8878884400 (same ~7.5s lag
+	// as neutral corpses), while expired wards sit ≥12.7s from any kill. So
+	// the nearest unconsumed kill of the same ward type with
+	// (deletion − death) inside [5.0, 9.5]s claims this deletion; nearest to
+	// the 7.2s center wins.
+	best := -1
+	bestOff := math.Inf(1)
+	for i := range s.PendingDewards {
+		pd := &s.PendingDewards[i]
+		if pd.used || pd.wardType != pw[w.sliceIdx].Type {
+			continue
+		}
+		lag := now - pd.t
+		if lag < 5.0 || lag > 9.5 {
+			continue
+		}
+		if off := math.Abs(lag - 7.2); off < bestOff {
+			bestOff = off
+			best = i
+		}
+	}
+	if best >= 0 {
+		s.PendingDewards[best].used = true
+		pw[w.sliceIdx].Killed = true
+	}
 }
 
 type pendingAggroOrder struct {
@@ -1578,6 +1649,13 @@ func main() {
 				if killerIdx >= 0 && killerIdx < 10 {
 					state.Players[killerIdx].WardsDewarded++
 				}
+				// v4.7.0: remember the kill so finalizeWard can stamp
+				// Killed=true on the ward whose entity deletion follows.
+				wt := 0
+				if targetName == "npc_dota_sentry_wards" {
+					wt = 1
+				}
+				state.PendingDewards = append(state.PendingDewards, pendingDeward{t: actualTime, wardType: wt})
 			}
 
 			if strings.Contains(targetName, "hero") {
@@ -2029,6 +2107,22 @@ func main() {
 						Time:     actualTime,
 						RuneType: runeType,
 						Action:   1, // pickup
+					})
+				}
+			}
+
+		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_MODIFIER_REMOVE:
+			// v4.7.0: the end of each hero's smoke. Expiry, proximity reveal
+			// and death all fire the same REMOVE — kept raw, disambiguated by
+			// the web layer.
+			targetName := state.LookupName(m.GetTargetName())
+			modifierName := state.LookupName(m.GetInflictorName())
+			if modifierName == "modifier_smoke_of_deceit" && strings.Contains(targetName, "hero") {
+				targetIdx := heroNameToPlayerIndex(targetName, state)
+				if targetIdx >= 0 && targetIdx < 10 {
+					state.SmokeModifierRemoves = append(state.SmokeModifierRemoves, SmokeModifierAdd{
+						Time:      actualTime,
+						PlayerIdx: targetIdx,
 					})
 				}
 			}
@@ -3921,6 +4015,14 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 		lastTime[s] = ev.Time
 	}
 
+	// v4.7.0: sorted removes — per participant the first REMOVE after the
+	// cluster start ends their smoke. Capped at +90s so a lost event can't
+	// leak across the game; a re-smoke inside the window refreshes the
+	// modifier and merges the removes — accepted, noted in SmokeRoute docs.
+	removes := make([]SmokeModifierAdd, len(state.SmokeModifierRemoves))
+	copy(removes, state.SmokeModifierRemoves)
+	sort.Slice(removes, func(i, j int) bool { return removes[i].Time < removes[j].Time })
+
 	// Эмитим только кластеры с ≥minParticipants. Для каждого считаем outcome.
 	var out []SmokeEvent
 	for _, c := range clusters {
@@ -3974,7 +4076,7 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 			towers++
 		}
 
-		out = append(out, SmokeEvent{
+		ev := SmokeEvent{
 			GameTime:     c.startTime,
 			Participants: parts,
 			IsRadiant:    c.isRadiant,
@@ -3984,7 +4086,60 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 				TowersWithin60s: towers,
 				RunesWithin60s:  runes,
 			},
-		})
+		}
+
+		// v4.7.0: activation point + per-participant routes.
+		const routePreRollSec = 15.0 // approach direction before the click
+		const routeCapSec = 50.0     // path cap when no REMOVE was found (smoke ≈45s)
+		const removeCapSec = 90.0    // REMOVE search window
+		const routeStepSec = 1.8     // thin PosHistory (~1/s) to keep JSON sane
+		var sumX, sumY float64
+		var nPos int
+		for _, idx := range parts {
+			r := SmokeRoute{Idx: idx}
+			for _, rm := range removes {
+				if rm.PlayerIdx == idx && rm.Time > c.startTime && rm.Time <= c.startTime+removeCapSec {
+					r.EndTime = rm.Time
+					break
+				}
+			}
+			pathEnd := c.startTime + routeCapSec
+			if r.EndTime > 0 {
+				pathEnd = r.EndTime
+			}
+			lastT := math.Inf(-1)
+			for _, ps := range state.PosHistory[idx] {
+				if ps.T < c.startTime-routePreRollSec || ps.T > pathEnd {
+					continue
+				}
+				if ps.T-lastT < routeStepSec {
+					continue
+				}
+				lastT = ps.T
+				r.Path = append(r.Path, PathPoint{T: ps.T, X: ps.X, Y: ps.Y})
+			}
+			if r.EndTime > 0 {
+				if ex, ey, ok := posAtFresh(state.PosHistory[idx], r.EndTime, 5.0); ok {
+					r.EndX = ex
+					r.EndY = ey
+				}
+			}
+			if ax, ay, ok := posAtFresh(state.PosHistory[idx], c.startTime, 5.0); ok {
+				sumX += ax
+				sumY += ay
+				nPos++
+			}
+			if r.EndTime > ev.EndTime {
+				ev.EndTime = r.EndTime
+			}
+			ev.Routes = append(ev.Routes, r)
+		}
+		if nPos > 0 {
+			ev.X = math.Round(sumX/float64(nPos)*10) / 10
+			ev.Y = math.Round(sumY/float64(nPos)*10) / 10
+		}
+
+		out = append(out, ev)
 	}
 	return out
 }

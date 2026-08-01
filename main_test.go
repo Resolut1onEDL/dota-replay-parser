@@ -920,3 +920,129 @@ func TestDetectLanePureJunglerStaysJungle(t *testing.T) {
 		t.Errorf("pure jungler must get NO restored lane, got %q", got)
 	}
 }
+
+// v4.7.0: smoke routes. The spatial story of a smoke is assembled in
+// detectSmokeEvents from PosHistory + MODIFIER_REMOVE events: activation
+// centroid, per-participant path (thinned), per-participant buff end.
+func TestDetectSmokeRoutes(t *testing.T) {
+	mkState := func() *ParserState {
+		s := &ParserState{}
+		s.Players[0] = &PlayerState{IsRadiant: true}
+		s.Players[1] = &PlayerState{IsRadiant: true}
+		// Both walk from (100,150) towards (140,110), 1 sample/s, 580..650.
+		for i := 0; i <= 70; i++ {
+			tm := 580.0 + float64(i)
+			s.PosHistory[0] = append(s.PosHistory[0], posSample{T: tm, X: 100 + float64(i), Y: 150 - float64(i)})
+			s.PosHistory[1] = append(s.PosHistory[1], posSample{T: tm, X: 102 + float64(i), Y: 148 - float64(i)})
+		}
+		s.SmokeModifierAdds = []SmokeModifierAdd{
+			{Time: 600, PlayerIdx: 0},
+			{Time: 601.5, PlayerIdx: 1},
+		}
+		return s
+	}
+
+	t.Run("routes, ends and activation centroid", func(t *testing.T) {
+		s := mkState()
+		s.SmokeModifierRemoves = []SmokeModifierAdd{
+			{Time: 630, PlayerIdx: 0},
+			{Time: 640, PlayerIdx: 1},
+		}
+		evs := detectSmokeEvents(s)
+		if len(evs) != 1 {
+			t.Fatalf("events = %d, want 1", len(evs))
+		}
+		ev := evs[0]
+		// Centroid at t=600: p0 at (120,130), p1 at (122,128) → (121,129).
+		if ev.X != 121 || ev.Y != 129 {
+			t.Errorf("activation = (%v,%v), want (121,129)", ev.X, ev.Y)
+		}
+		if ev.EndTime != 640 {
+			t.Errorf("event endTime = %v, want 640 (last participant)", ev.EndTime)
+		}
+		if len(ev.Routes) != 2 {
+			t.Fatalf("routes = %d, want 2", len(ev.Routes))
+		}
+		r0 := ev.Routes[0]
+		if r0.Idx != 0 || r0.EndTime != 630 {
+			t.Errorf("route0 idx=%d end=%v, want 0/630", r0.Idx, r0.EndTime)
+		}
+		// Position at buff end t=630 (i=50): (150,100).
+		if r0.EndX != 150 || r0.EndY != 100 {
+			t.Errorf("route0 end pos = (%v,%v), want (150,100)", r0.EndX, r0.EndY)
+		}
+		if len(r0.Path) == 0 {
+			t.Fatal("route0 path empty")
+		}
+		first, last := r0.Path[0], r0.Path[len(r0.Path)-1]
+		if first.T < 585 || last.T > 630 {
+			t.Errorf("path spans [%v..%v], want within [585..630]", first.T, last.T)
+		}
+		for i := 1; i < len(r0.Path); i++ {
+			if r0.Path[i].T-r0.Path[i-1].T < 1.8 {
+				t.Fatalf("path not thinned: dt=%v at %d", r0.Path[i].T-r0.Path[i-1].T, i)
+			}
+		}
+	})
+
+	t.Run("no REMOVE found: path capped, no endTime", func(t *testing.T) {
+		s := mkState()
+		evs := detectSmokeEvents(s)
+		if len(evs) != 1 {
+			t.Fatalf("events = %d, want 1", len(evs))
+		}
+		r0 := evs[0].Routes[0]
+		if r0.EndTime != 0 || r0.EndX != 0 {
+			t.Errorf("endTime/endX = %v/%v, want absent (0)", r0.EndTime, r0.EndX)
+		}
+		last := r0.Path[len(r0.Path)-1]
+		if last.T > 650 {
+			t.Errorf("uncapped path: last T = %v", last.T)
+		}
+	})
+}
+
+// v4.7.0: deward vs expiry. The ward entity outlives its combat-log death by
+// the corpse decay (~6.3-8.0s measured), so a kill whose (deletion - death)
+// lag falls in [5.0, 9.5]s stamps Killed=true and is consumed exactly once;
+// anything outside the window is a natural expiry.
+func TestFinalizeWardKilled(t *testing.T) {
+	mk := func(pending []pendingDeward) *ParserState {
+		s := &ParserState{ActiveWards: make(map[int32]*activeWard)}
+		s.Players[3] = &PlayerState{Wards: []WardEvent{{Time: 100, Type: 0}, {Time: 200, Type: 0}}}
+		s.ActiveWards[42] = &activeWard{playerIdx: 3, sliceIdx: 0, start: 100}
+		s.ActiveWards[43] = &activeWard{playerIdx: 3, sliceIdx: 1, start: 200}
+		s.PendingDewards = pending
+		return s
+	}
+
+	t.Run("matched kill marks the ward and is consumed", func(t *testing.T) {
+		s := mk([]pendingDeward{{t: 353, wardType: 0}}) // deletion lags by 7s
+		finalizeWard(s, 42, 360)
+		if !s.Players[3].Wards[0].Killed {
+			t.Error("ward not marked killed")
+		}
+		finalizeWard(s, 43, 361) // second deletion: the pending record is spent
+		if s.Players[3].Wards[1].Killed {
+			t.Error("one combat-log kill claimed two wards")
+		}
+	})
+
+	t.Run("type mismatch does not match", func(t *testing.T) {
+		s := mk([]pendingDeward{{t: 353, wardType: 1}}) // sentry kill, observer ward
+		finalizeWard(s, 42, 360)
+		if s.Players[3].Wards[0].Killed {
+			t.Error("sentry kill claimed an observer ward")
+		}
+	})
+
+	t.Run("outside the corpse-lag window = natural expiry", func(t *testing.T) {
+		for _, killT := range []float64{300, 347, 356} { // lags 60 / 13 / 4
+			s := mk([]pendingDeward{{t: killT, wardType: 0}})
+			finalizeWard(s, 42, 360)
+			if s.Players[3].Wards[0].Killed {
+				t.Errorf("a kill with lag %v claimed the ward", 360-killT)
+			}
+		}
+	})
+}
