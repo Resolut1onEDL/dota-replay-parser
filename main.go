@@ -113,6 +113,10 @@ type DeathEvent struct {
 	TimeDead        int     `json:"timeDead,omitempty"`
 	IsSmoke         bool    `json:"isSmoke,omitempty"`
 	IsGank          bool    `json:"isGank,omitempty"`
+	// v4.6.0: measured dead span for this death from m_lifeState (covers
+	// aegis/buyback/game-end truncation, unlike the static TimeDead table).
+	// Absent = span not observed (e.g. illusion-death noise).
+	DeadDurationSec float64 `json:"deadDurationSec,omitempty"`
 	NetworthAtDeath int     `json:"networthAtDeath,omitempty"`
 	HadTP           bool    `json:"hadTP,omitempty"`
 	NearbyAllies    []int   `json:"nearbyAllies,omitempty"`
@@ -282,7 +286,40 @@ type PullEvent struct {
 	Time       float64 `json:"time"`
 	CampX      float64 `json:"campX"`
 	CampY      float64 `json:"campY"`
-	CreepsDied int     `json:"creepsDied"` // allied lane creeps that died to neutrals in this pull
+	CreepsDied int     `json:"creepsDied"` // engaged-wave lane creeps that died to neutrals in this pull
+	// v4.6.0: pull direction. False (default) — the player walked his OWN
+	// wave into the camp. True — neutrals were dragged onto the ENEMY wave
+	// (aggressive stack-pull, e.g. Io 4:23 in 8922693443).
+	OntoEnemyWave bool `json:"ontoEnemyWave,omitempty"`
+}
+
+// v4.6.0: camp stack event — one per m_iCampsStacked increment (the same
+// authoritative team-data counter behind campsStacked), located at the camp
+// nearest to the stacker at the increment moment. CampTier is the empirical
+// per-demo classification of that camp (small/medium/large/ancient) voted by
+// pack-leader species seen in hero->neutral combat there; "" = not enough
+// evidence.
+type StackEvent struct {
+	Time     float64 `json:"time"`
+	CampX    float64 `json:"campX"`
+	CampY    float64 `json:"campY"`
+	CampTier string  `json:"campTier,omitempty"`
+}
+
+// v4.6.0: laning camp-block war entry (0:00-12:00). Method "ward" — an
+// observer/sentry placed inside the spawn box (radius ~9 cells around the
+// spawner): blocked from From until To (ward death; omitted when the ward
+// outlived the laning window). Method "body" — a hero stood in the spawn box
+// at a minute tick while the camp was empty and not ward-blocked: an
+// instant block of that one spawn (From == To).
+type CampBlock struct {
+	CampX    float64 `json:"campX"`
+	CampY    float64 `json:"campY"`
+	Method   string  `json:"method"`             // "ward" | "body"
+	WardType string  `json:"wardType,omitempty"` // "observer" | "sentry" for method=ward
+	Player   int     `json:"player"`
+	From     float64 `json:"from"`
+	To       float64 `json:"to,omitempty"`
 }
 
 // v4.6.0: laning stun chain — 2+ disables on one enemy hero from DIFFERENT
@@ -331,6 +368,10 @@ type LaneStats struct {
 	StunComboCount       int              `json:"stunComboCount"`
 	StunOverlapWastedSec float64          `json:"stunOverlapWastedSec"`
 	StunComboEvents      []StunComboEvent `json:"stunComboEvents,omitempty"`
+	// v4.6.0: allied lane creeps on THIS player's lane killed by neutrals
+	// during 0:00-12:00 — the XP the lane lost to enemy pulls (and gave up
+	// to its own). Zero is a fact — no omitempty.
+	LaneCreepsLostToNeutrals int `json:"laneCreepsLostToNeutrals"`
 }
 
 type PlayerStats struct {
@@ -379,6 +420,13 @@ type PlayerStats struct {
 	HgEntries      []HgEntry `json:"hgEntries,omitempty"`
 	HgEntriesCount int       `json:"hgEntriesCount"`
 	HgDeaths       int       `json:"hgDeaths"`
+
+	// v4.6.0: per-increment stack events (see StackEvent) and measured total
+	// dead time (sum of m_lifeState==dead spans; the per-death table value in
+	// deathEvents[].timeDead ignores aegis, buyback and game end — this one
+	// does not).
+	StackEvents      []StackEvent `json:"stackEvents,omitempty"`
+	TotalDeadTimeSec float64      `json:"totalDeadTimeSec"`
 }
 
 type Player struct {
@@ -466,6 +514,7 @@ type Match struct {
 	Teamfights      []Teamfight      `json:"teamfights,omitempty"`
 	PositionSamples []PositionSample `json:"positionSamples,omitempty"`
 	SmokeEvents     []SmokeEvent     `json:"smokeEvents,omitempty"` // v4: group smoke detection
+	CampBlocks      []CampBlock      `json:"campBlocks,omitempty"`  // v4.6.0: laning camp-block war
 
 	Players []Player `json:"players"`
 	
@@ -1008,6 +1057,22 @@ type ParserState struct {
 	PosHistory        [10][]posSample      // real-hero (illusion-filtered) positions ~1/s
 	HgTowerCells      map[string][2]float64 // tier-3 tower cells → plateau thresholds
 
+	// v4.6.0 pull-v2 signals: hero aggro pokes, wave-at-camp presence runs,
+	// live real-hero positions, per-camp neutral occupancy, camp tier votes.
+	HeroNeutHits   []neutHit           // hero->neutral damage ≤13 min, illusion-filtered
+	CampWaveRuns   map[int]*campRuns   // campIdx -> per-side wave presence at the camp
+	RealPos        [10][2]float64      // live real-hero cells (illusion-filtered)
+	NeutCampIdx    map[int32]int       // neutral entityIdx -> campIdx (≤8 cells at first sight)
+	CampSeenTimes  [][]float64         // campIdx -> neutral first-seen times ≤13 min
+	CampDelTimes   [][]float64         // campIdx -> neutral deletion times ≤13 min
+	StackIncrs     []stackIncr         // m_iCampsStacked increments (time+player)
+	PrevCampsStacked [10]int
+	// v4.6.0 dead-time: m_lifeState==2 spans per player (whole game).
+	DeadSpans  [10][]deadSpan
+	DeadOpenT  [10]float64
+	DeadIsOpen [10]bool
+	LifePrev   [10]uint64
+
 	// v4.6.0: measured (combat-log axis − entity-tick axis) offset. The new
 	// pull/HG features match entity events against combat-log events across
 	// the two clocks, so instead of assuming the v4.4.3 pause model holds in
@@ -1054,6 +1119,79 @@ type bdEvent struct {
 	Dmg int
 }
 
+type neutHit struct {
+	T       float64
+	Player  int
+	X, Y    float64
+	Species string // combat-log name without npc_dota_neutral_ prefix
+}
+
+type waveRun struct{ T0, T1 float64 }
+
+// campRuns keeps rolling wave-presence runs at a camp per side (gap ≤4s
+// merges into the open run).
+type campRuns struct {
+	Rad  []waveRun
+	Dire []waveRun
+}
+
+func (c *campRuns) mark(t float64, radiant bool) {
+	runs := &c.Dire
+	if radiant {
+		runs = &c.Rad
+	}
+	if n := len(*runs); n > 0 && t-(*runs)[n-1].T1 <= 4 {
+		(*runs)[n-1].T1 = t
+		return
+	}
+	*runs = append(*runs, waveRun{T0: t, T1: t})
+}
+
+type stackIncr struct {
+	T      float64
+	Player int
+}
+
+type deadSpan struct{ T0, T1 float64 }
+
+// campLeaderTier maps unambiguous pack-LEADER species (combat-log names,
+// npc_dota_neutral_ prefix stripped) to camp tiers. Pack members shared
+// between tiers (satyr_soulstealer, wildkin, centaur_outrunner…) are
+// deliberately absent — only leaders vote for a camp's tier.
+var campLeaderTier = map[string]string{
+	// small
+	"kobold_taskmaster":        "small",
+	"forest_troll_high_priest": "small",
+	"gnoll_assassin":           "small",
+	"ghost":                    "small",
+	"harpy_storm":              "small",
+	"vhoul_assassin":           "small",
+	// medium
+	"mud_golem":       "medium",
+	"ogre_magi":       "medium",
+	"ogre_bruiser":    "medium",
+	"alpha_wolf":      "medium",
+	"satyr_banisher":  "medium",
+	"kobold_flagbearer": "medium",
+	// large
+	"centaur_khan":               "large",
+	"satyr_hellcaller":           "large",
+	"dark_troll_warlord":         "large",
+	"polar_furbolg_ursa_warrior": "large",
+	"enraged_wildkin":            "large",
+	"wildwing_ripper":            "large",
+	"hellbear_smasher":           "large",
+	"warpine_raider":             "large",
+	// ancient
+	"black_dragon":          "ancient",
+	"granite_golem":         "ancient",
+	"big_thunder_lizard":    "ancient",
+	"prowler_shaman":        "ancient",
+	"frostbitten_golem":     "ancient",
+	"ancient_golem":         "ancient",
+	"rock_golem":            "ancient",
+}
+
 // isLaneCreepName reports whether a combat-log unit name is a lane creep
 // (incl. siege). Same name set as the creep-kill tracking in the DEATH case.
 func isLaneCreepName(n string) bool {
@@ -1062,6 +1200,20 @@ func isLaneCreepName(n string) bool {
 }
 
 func isNeutralCreepName(n string) bool { return strings.Contains(n, "npc_dota_neutral_") }
+
+// nearestCampIdx returns the index in CampSpawners of the camp within maxD
+// cells of (x, y), or -1. Squared-distance loop — this sits on the creep
+// entity hot path.
+func nearestCampIdx(s *ParserState, x, y, maxD float64) int {
+	best, bestD := -1, maxD*maxD
+	for i, sp := range s.CampSpawners {
+		dx, dy := sp[0]-x, sp[1]-y
+		if d := dx*dx + dy*dy; d <= bestD {
+			bestD, best = d, i
+		}
+	}
+	return best
+}
 
 type SmokeModifierAdd struct {
 	Time      float64
@@ -1112,6 +1264,8 @@ func NewParserState(p *manta.Parser) *ParserState {
 		Pauses:             make([]PauseEvent, 0),
 		NeutralSpawnCells:  make(map[int32][2]float64),
 		HgTowerCells:       make(map[string][2]float64),
+		CampWaveRuns:       make(map[int]*campRuns),
+		NeutCampIdx:        make(map[int32]int),
 	}
 	for i := 0; i < 10; i++ {
 		state.Players[i] = &PlayerState{
@@ -1727,6 +1881,22 @@ func main() {
 				}
 			}
 
+			// v4.6.0: hero->neutral pokes — the pull aggro signal ("первая
+			// тычка") and the camp-tier vote source. Real heroes only.
+			if actualTime >= -30 && actualTime <= 780 &&
+				strings.HasPrefix(attackerName, "npc_dota_hero_") &&
+				isNeutralCreepName(targetName) && !m.GetIsAttackerIllusion() {
+				if idx := heroNameToPlayerIndex(attackerName, state); idx >= 0 && idx < 10 {
+					state.HeroNeutHits = append(state.HeroNeutHits, neutHit{
+						T:       actualTime,
+						Player:  idx,
+						X:       state.RealPos[idx][0],
+						Y:       state.RealPos[idx][1],
+						Species: strings.TrimPrefix(targetName, "npc_dota_neutral_"),
+					})
+				}
+			}
+
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_HEAL:
 			attackerName := state.LookupName(m.GetAttackerName())
 			targetName := state.LookupName(m.GetTargetName())
@@ -1979,8 +2149,12 @@ func main() {
 					if state.GameStartTime > 0 {
 						if t := state.entityActual(); t >= 0 && t <= 780 {
 							state.NeutDeletions = append(state.NeutDeletions, neutDeletion{T: t, X: cell[0], Y: cell[1]})
+							if ci, okC := state.NeutCampIdx[e.GetIndex()]; okC && ci < len(state.CampDelTimes) {
+								state.CampDelTimes[ci] = append(state.CampDelTimes[ci], t)
+							}
 						}
 					}
+					delete(state.NeutCampIdx, e.GetIndex())
 				}
 			}
 		}
@@ -2004,6 +2178,18 @@ func main() {
 			}
 			for i := 0; i < 5; i++ {
 				if v, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iCampsStacked", i)); ok {
+					// v4.6.0: event-ize the authoritative counter — each
+					// increment is one completed stack at ~x:00; the camp is
+					// resolved later from the stacker's position history.
+					if int(v) > state.PrevCampsStacked[offset+i] && state.GameStartTime > 0 {
+						for k := state.PrevCampsStacked[offset+i]; k < int(v); k++ {
+							state.StackIncrs = append(state.StackIncrs, stackIncr{
+								T: state.entityActual(), Player: offset + i})
+						}
+					}
+					if int(v) > state.PrevCampsStacked[offset+i] {
+						state.PrevCampsStacked[offset+i] = int(v)
+					}
 					state.Players[offset+i].CampsStacked = int(v)
 				}
 				if v, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iCreepsStacked", i)); ok {
@@ -2055,6 +2241,9 @@ func main() {
 							// Timestamps are projected onto the combat-log
 							// axis so they match death/kill event times.
 							if repl, okR := e.GetUint32("m_hReplicatingOtherHeroModel"); !okR || repl == 16777215 {
+								if cellX > 0 && cellY > 0 {
+									state.RealPos[playerIdx] = [2]float64{float64(cellX), float64(cellY)}
+								}
 								cgt := gt + state.EntityAxisOffset
 								if state.GameStartTime > 0 && cgt >= 0 && cellX > 0 && cellY > 0 {
 									hs := state.PosHistory[playerIdx]
@@ -2062,6 +2251,23 @@ func main() {
 										state.PosHistory[playerIdx] = append(hs,
 											posSample{T: cgt, X: float64(cellX), Y: float64(cellY)})
 									}
+								}
+								// v4.6.0: measured dead spans (m_lifeState:
+								// 0 alive, 1 dying, 2 dead). Spans open on
+								// ==2 for OpenDota life_state parity.
+								if lsv, okL := e.GetUint64("m_lifeState"); okL && lsv != state.LifePrev[playerIdx] {
+									t := state.entityActual()
+									if lsv == 2 && !state.DeadIsOpen[playerIdx] && state.GameStartTime > 0 {
+										state.DeadIsOpen[playerIdx] = true
+										state.DeadOpenT[playerIdx] = t
+									} else if lsv == 0 && state.DeadIsOpen[playerIdx] {
+										state.DeadIsOpen[playerIdx] = false
+										if t > state.DeadOpenT[playerIdx] {
+											state.DeadSpans[playerIdx] = append(state.DeadSpans[playerIdx],
+												deadSpan{T0: state.DeadOpenT[playerIdx], T1: t})
+										}
+									}
+									state.LifePrev[playerIdx] = lsv
 								}
 							}
 						}
@@ -2193,6 +2399,41 @@ func main() {
 				if cx, ok := e.GetUint64("CBodyComponent.m_cellX"); ok {
 					if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
 						state.NeutralSpawnCells[e.GetIndex()] = [2]float64{float64(cx), float64(cy)}
+						// v4.6.0: per-camp occupancy timeline for the
+						// block-war "camp empty at minute tick" check.
+						if ci := nearestCampIdx(state, float64(cx), float64(cy), 8); ci >= 0 {
+							state.NeutCampIdx[e.GetIndex()] = ci
+							for len(state.CampSeenTimes) < len(state.CampSpawners) {
+								state.CampSeenTimes = append(state.CampSeenTimes, nil)
+								state.CampDelTimes = append(state.CampDelTimes, nil)
+							}
+							if state.GameStartTime > 0 {
+								state.CampSeenTimes[ci] = append(state.CampSeenTimes[ci], state.entityActual())
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// v4.6.0: lane wave presence at camps — the pull-v2 engagement seed.
+		// A pulled wave parks inside the camp; a passing wave never gets
+		// within 9 cells of a spawner for long.
+		if (className == "CDOTA_BaseNPC_Creep_Lane" || className == "CDOTA_BaseNPC_Creep_Siege") &&
+			state.GameStartTime > 0 {
+			if t := state.entityActual(); t >= 0 && t <= 780 {
+				if cx, ok := e.GetUint64("CBodyComponent.m_cellX"); ok {
+					if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
+						if ci := nearestCampIdx(state, float64(cx), float64(cy), 9); ci >= 0 {
+							if team, ok3 := e.GetUint64("m_iTeamNum"); ok3 && (team == 2 || team == 3) {
+								cr := state.CampWaveRuns[ci]
+								if cr == nil {
+									cr = &campRuns{}
+									state.CampWaveRuns[ci] = cr
+								}
+								cr.mark(t, team == 2)
+							}
+						}
 					}
 				}
 			}
@@ -2408,6 +2649,14 @@ func main() {
 					Time:     wardTime,
 					Type:     wardType,
 					PlayerID: playerIdx,
+				}
+				// v4.6.0: ward cells (the struct fields existed since v1 but
+				// were never populated) — needed for the camp-block war.
+				if cx, ok := e.GetUint64("CBodyComponent.m_cellX"); ok {
+					if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
+						wardEvent.PositionX = float64(cx)
+						wardEvent.PositionY = float64(cy)
+					}
 				}
 
 				state.WardEvents = append(state.WardEvents, wardEvent)
@@ -3210,10 +3459,48 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 	}
 	positions := assignPositions(state, lanes)
 
-	// v4.6.0: pulls, laning stun combos, enemy-highground episodes.
+	// v4.6.0: pulls, laning stun combos, enemy-highground episodes, stacks,
+	// camp-block war, measured dead time.
 	pulls := detectPulls(state)
 	stunComboCounts, stunOverlapWasted, stunComboEvents := detectStunCombos(state)
 	hgEntries := detectHgEntries(state)
+	tiers := campTiers(state)
+	stackEvents := detectStacks(state, tiers)
+	campBlocks := detectCampBlocks(state)
+
+	// Close dead spans still open at game end (died into the end screen).
+	for i := 0; i < 10; i++ {
+		if state.DeadIsOpen[i] && duration > state.DeadOpenT[i] {
+			state.DeadSpans[i] = append(state.DeadSpans[i], deadSpan{T0: state.DeadOpenT[i], T1: duration})
+			state.DeadIsOpen[i] = false
+		}
+	}
+
+	// Lane creeps lost to neutrals per physical lane per side (0-12 min):
+	// every creepDied pull-death is assigned to the lane of the camp of the
+	// nearest pull episode in time; stray deaths without an episode default
+	// to the lane classification being unavailable and are skipped.
+	type laneKey struct {
+		radiant bool
+		lane    string
+	}
+	laneLost := map[laneKey]int{}
+	for _, d := range state.PullDeaths {
+		if !d.CreepDied || d.T > 720 {
+			continue
+		}
+		bestLane, bestDT := "", 45.0
+		for pi := 0; pi < 10; pi++ {
+			for _, ev := range pulls[pi] {
+				if dt := math.Abs(ev.Time - d.T); dt < bestDT {
+					bestDT, bestLane = dt, laneOfCamp(ev.CampX, ev.CampY)
+				}
+			}
+		}
+		if bestLane != "" {
+			laneLost[laneKey{radiant: d.Radiant, lane: bestLane}]++
+		}
+	}
 
 	for i := 0; i < 10; i++ {
 		ps := state.Players[i]
@@ -3353,6 +3640,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 				StunComboCount:       stunComboCounts[i],
 				StunOverlapWastedSec: stunOverlapWasted[i],
 				StunComboEvents:      stunComboEvents[i],
+				LaneCreepsLostToNeutrals: laneLost[laneKey{
+					radiant: ps.IsRadiant, lane: physicalLane(lane, ps.IsRadiant)}],
 			},
 			VisionStats: VisionExposure{
 				SmokeUsageCount: ps.SmokeCount,
@@ -3362,6 +3651,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			TPCount:   ps.TPCount,
 			HgEntries:      hgEntries[i],
 			HgEntriesCount: len(hgEntries[i]),
+			StackEvents:    stackEvents[i],
 			CreepKills: CreepKillPhases{
 				LaneCreepsPre10:    ps.LaneCreepsPre10,
 				LaneCreeps10to25:   ps.LaneCreeps10to25,
@@ -3378,6 +3668,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 				stats.HgDeaths++
 			}
 		}
+		// v4.6.0: measured dead time — per-death spans and the total.
+		stats.TotalDeadTimeSec = applyDeadSpans(state.DeadSpans[i], stats.DeathEvents)
 
 		players[i] = Player{
 			SteamAccountID:      ps.SteamID,
@@ -3487,6 +3779,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		Teamfights:             detectTeamfights(state),
 		PositionSamples:        state.PositionSamples,
 		SmokeEvents:            detectSmokeEvents(state),
+		CampBlocks:             campBlocks,
 		Players:                players,
 		ParsedFromReplay:       true,
 		ParserVersion:          "4.6.0",
@@ -3623,73 +3916,51 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 
 // ============= v4.6.0: PULLS / STUN COMBOS / HIGHGROUND =============
 
-// detectPulls clusters lane-creep<->neutral deaths (0:00-12:00, gap ≤15s per
-// side), locates the camp by voting neutral entity deletions matched to the
-// cluster deaths (deletion lags death by ~7.5s, measured), snaps the winner
-// to the nearest CDOTA_NeutralSpawner, and attributes the pull to the
-// same-side hero who came closest to that camp over [t0-15, t1+5] in the
-// real-hero position history. No hero within 20 cells → the wave met
-// neutrals without a puller → not a pull. Stacks never enter: a stack has
-// no lane-creep<->neutral deaths. Denies have no neutral on either side.
-// Wave-mark timing (x:15/x:45) is deliberately NOT a filter — pull timings
-// drift with wave manipulation; it stays a human sanity signal only.
+// detectPulls (v2) finds pull episodes from wave-at-camp presence: a lane
+// wave parked inside a camp (creep entity within 9 cells of the spawner for
+// ≥6s) is an engagement. Attribution follows the player's own convention —
+// "the pull is counted from the first poke into the neutrals": the earliest
+// hero->neutral hit at that camp in [contact-20s, contact-window end] wins;
+// a body pull without hits falls back to the nearest same-window hero by
+// position history (≤20 cells). A puller from the OPPOSITE side of the
+// engaged wave is an aggressive stack-pull onto the enemy wave
+// (ontoEnemyWave). Engagements need neutral evidence (a deletion at the camp
+// or a creep<->neutral death nearby in time) so a wave idling near an EMPTY
+// blocked camp never counts. Legacy death-cluster seeding (v1) survives as a
+// fallback for engagements the wave tracker missed. Validated frame-by-frame
+// against 8922693443 (Io 2:55/4:23/5:22+5:37 double, Mirana 2× small,
+// Dark Willow 2× big, Undying 0).
 func detectPulls(state *ParserState) [10][]PullEvent {
 	var out [10][]PullEvent
-	if len(state.PullDeaths) == 0 {
+	if len(state.CampSpawners) == 0 {
 		return out
 	}
+
 	deaths := make([]pullDeathRec, len(state.PullDeaths))
 	copy(deaths, state.PullDeaths)
 	sort.Slice(deaths, func(i, j int) bool { return deaths[i].T < deaths[j].T })
 
-	type pullCluster struct {
-		t0, t1     float64
-		radiant    bool
-		creepsDied int
-		deaths     []float64
+	// Every poke belongs to exactly ONE camp — its nearest within 8 cells.
+	// A radius test per episode double-counted hits between adjacent camps
+	// (8-10 cells apart around the safe lanes) and smeared attributions.
+	hitCamp := make([]int, len(state.HeroNeutHits))
+	for i, h := range state.HeroNeutHits {
+		hitCamp[i] = nearestCampIdx(state, h.X, h.Y, 8)
 	}
-	var clusters []pullCluster
-	open := map[bool]int{true: -1, false: -1} // open cluster index per side
-	for _, d := range deaths {
-		if ci := open[d.Radiant]; ci >= 0 && d.T-clusters[ci].t1 <= 15 {
-			c := &clusters[ci]
-			c.t1 = d.T
-			c.deaths = append(c.deaths, d.T)
-			if d.CreepDied {
-				c.creepsDied++
-			}
-		} else {
-			c := pullCluster{t0: d.T, t1: d.T, radiant: d.Radiant, deaths: []float64{d.T}}
-			if d.CreepDied {
-				c.creepsDied = 1
-			}
-			clusters = append(clusters, c)
-			open[d.Radiant] = len(clusters) - 1
-		}
-	}
-
-	snapCamp := func(x, y float64) (float64, float64) {
-		bx, by, bd := x, y, math.MaxFloat64
-		for _, sp := range state.CampSpawners {
-			if d := math.Hypot(sp[0]-x, sp[1]-y); d < bd {
-				bd, bx, by = d, sp[0], sp[1]
+	hitsAtCamp := func(ci int, t0, t1 float64) []neutHit {
+		var hs []neutHit
+		for i, h := range state.HeroNeutHits {
+			if hitCamp[i] == ci && h.T >= t0 && h.T <= t1 {
+				hs = append(hs, h)
 			}
 		}
-		if bd <= 15 {
-			return bx, by
-		}
-		return x, y // no spawner nearby — keep the measured cell
+		return hs
 	}
-
-	// Nearest same-side hero to a point over the cluster window.
-	nearestHero := func(c pullCluster, cx, cy float64) (int, float64) {
+	nearestByHistory := func(cx, cy, t0, t1 float64) (int, float64) {
 		bestIdx, bestD := -1, math.MaxFloat64
 		for i := 0; i < 10; i++ {
-			if state.Players[i].IsRadiant != c.radiant {
-				continue
-			}
 			for _, s := range state.PosHistory[i] {
-				if s.T < c.t0-15 || s.T > c.t1+5 {
+				if s.T < t0 || s.T > t1 {
 					continue
 				}
 				if d := math.Hypot(s.X-cx, s.Y-cy); d < bestD {
@@ -3699,28 +3970,211 @@ func detectPulls(state *ParserState) [10][]PullEvent {
 		}
 		return bestIdx, bestD
 	}
+	// Neutral evidence must be POSITIONAL (a deletion at this very camp):
+	// combat-log deaths carry no location, and lanes run within 2-6 cells of
+	// some camps — time-only evidence turned every passing wave into a pull.
+	campHasEvidence := func(cx, cy, t0, t1 float64) bool {
+		for _, nd := range state.NeutDeletions {
+			if nd.T >= t0-5 && nd.T <= t1+45 {
+				if dx, dy := nd.X-cx, nd.Y-cy; dx*dx+dy*dy <= 12*12 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	pullDeathsIn := func(radiantWave bool, t0, t1 float64) int {
+		n := 0
+		for _, d := range deaths {
+			if d.Radiant == radiantWave && d.T >= t0-5 && d.T <= t1+20 {
+				n++
+			}
+		}
+		return n
+	}
+	creepsDiedIn := func(radiantWave bool, t0, t1 float64) int {
+		n := 0
+		for _, d := range deaths {
+			if d.CreepDied && d.Radiant == radiantWave && d.T >= t0-5 && d.T <= t1+20 {
+				n++
+			}
+		}
+		return n
+	}
 
-	for _, c := range clusters {
-		if c.t0 > 720 { // pull window is 0:00-12:00
+	type pullEpisode struct {
+		player  int
+		ev      PullEvent
+		t0, t1  float64
+		campIdx int
+	}
+	var episodes []pullEpisode
+
+	for ci, runsBySide := range state.CampWaveRuns {
+		if ci >= len(state.CampSpawners) {
 			continue
 		}
-		// Camp vote: neutral deletions within [death-1, death+10] of any
-		// cluster death (corpse removal lags the combat-log death by ~7.5s,
-		// measured; this also catches camp members finished by the puller).
+		cx, cy := state.CampSpawners[ci][0], state.CampSpawners[ci][1]
+		for _, side := range []bool{true, false} {
+			runs := runsBySide.Dire
+			if side {
+				runs = runsBySide.Rad
+			}
+			for _, r := range runs {
+				// A wave WALKING past a lane-adjacent camp pings the radius
+				// for ~6-9s; an engaged wave parks. ≥10s dwell, ≥12s when no
+				// creep<->neutral deaths back the episode up.
+				dwell := r.T1 - r.T0
+				anyDeaths := pullDeathsIn(true, r.T0, r.T1)+pullDeathsIn(false, r.T0, r.T1) > 0
+				if r.T0 > 720 || dwell < 10 || (!anyDeaths && dwell < 12) {
+					continue
+				}
+				if !campHasEvidence(cx, cy, r.T0, r.T1) {
+					continue
+				}
+				hs := hitsAtCamp(ci, r.T0-20, r.T1)
+				who, tStart := -1, r.T0
+				if len(hs) > 0 {
+					sort.Slice(hs, func(a, b int) bool { return hs[a].T < hs[b].T })
+					who, tStart = hs[0].Player, hs[0].T
+				} else if w, d := nearestByHistory(cx, cy, r.T0-20, r.T1); w >= 0 && d <= 20 {
+					who = w
+				}
+				// No pull exists before the first wave can physically reach
+				// a camp (~1:10) — earlier pokes are spawn-block aggro.
+				if who < 0 || tStart < 70 || tStart > 720 || state.Players[who] == nil {
+					continue
+				}
+				// Pull direction: if the puller's OWN wave parked at this
+				// camp it is a normal pull, no matter what else died around
+				// (simultaneous pulls on other lanes pollute time-only death
+				// counts); a strong enemy-death surplus overrides. With no
+				// own-side run the engaged wave is the enemy's.
+				ownSide := state.Players[who].IsRadiant
+				ownRuns := runsBySide.Dire
+				if ownSide {
+					ownRuns = runsBySide.Rad
+				}
+				ownRunDwell := 0.0
+				for _, or_ := range ownRuns {
+					lo, hi := math.Max(or_.T0, r.T0-5), math.Min(or_.T1, r.T1+5)
+					if hi-lo > ownRunDwell {
+						ownRunDwell = hi - lo
+					}
+				}
+				ownEv := pullDeathsIn(ownSide, r.T0, r.T1)
+				enemyEv := pullDeathsIn(!ownSide, r.T0, r.T1)
+				onto := false
+				if ownRunDwell >= 8 {
+					onto = enemyEv-ownEv >= 2
+				} else if side != ownSide {
+					onto = true
+				} else {
+					onto = enemyEv > ownEv
+				}
+				engagedSide := ownSide
+				if onto {
+					engagedSide = !ownSide
+				}
+				episodes = append(episodes, pullEpisode{
+					player: who,
+					ev: PullEvent{
+						Time:          tStart,
+						CampX:         cx,
+						CampY:         cy,
+						CreepsDied:    creepsDiedIn(engagedSide, r.T0, r.T1),
+						OntoEnemyWave: onto,
+					},
+					t0: r.T0, t1: r.T1, campIdx: ci,
+				})
+			}
+		}
+	}
+
+	// One engagement at one camp = ONE pull: overlapping/adjacent windows
+	// (≤12s apart) collapse regardless of who else poked — the earliest
+	// poke keeps the attribution (episodes are pre-sorted by poke time).
+	sort.Slice(episodes, func(a, b int) bool { return episodes[a].ev.Time < episodes[b].ev.Time })
+	var merged []pullEpisode
+	for _, ep := range episodes {
+		dup := false
+		for k := range merged {
+			m := &merged[k]
+			if m.campIdx == ep.campIdx && ep.t0 <= m.t1+12 && m.t0 <= ep.t1+12 {
+				if ep.t1 > m.t1 {
+					m.t1 = ep.t1
+				}
+				if ep.ev.CreepsDied > m.ev.CreepsDied {
+					m.ev.CreepsDied = ep.ev.CreepsDied
+				}
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			merged = append(merged, ep)
+		}
+	}
+
+	// v1 fallback: death clusters not covered by any wave-run episode (the
+	// wave tracker can miss engagements right at its radius edge).
+	type cluster struct {
+		t0, t1     float64
+		radiant    bool
+		creepsDied int
+		deaths     []float64
+	}
+	var clusters []cluster
+	open := map[bool]int{true: -1, false: -1}
+	for _, d := range deaths {
+		if ci := open[d.Radiant]; ci >= 0 && d.T-clusters[ci].t1 <= 15 {
+			c := &clusters[ci]
+			c.t1 = d.T
+			c.deaths = append(c.deaths, d.T)
+			if d.CreepDied {
+				c.creepsDied++
+			}
+		} else {
+			c := cluster{t0: d.T, t1: d.T, radiant: d.Radiant, deaths: []float64{d.T}}
+			if d.CreepDied {
+				c.creepsDied = 1
+			}
+			clusters = append(clusters, c)
+			open[d.Radiant] = len(clusters) - 1
+		}
+	}
+	for _, c := range clusters {
+		if c.t0 > 720 {
+			continue
+		}
+		covered := false
+		for _, m := range merged {
+			if c.t0 <= m.t1+20 && m.t0 <= c.t1+20 {
+				covered = true
+				break
+			}
+		}
+		if covered {
+			continue
+		}
+		// Camp via deletion votes (v1 mechanism), then first-poke/nearest.
+		var campX, campY float64
+		haveCamp := false
+		bestVotes := 0
 		type campVote struct {
 			x, y float64
 			n    int
 		}
 		var votes []campVote
 		for _, nd := range state.NeutDeletions {
-			matched := false
+			matchedD := false
 			for _, dt := range c.deaths {
 				if nd.T >= dt-1 && nd.T <= dt+10 {
-					matched = true
+					matchedD = true
 					break
 				}
 			}
-			if !matched {
+			if !matchedD {
 				continue
 			}
 			placed := false
@@ -3735,34 +4189,289 @@ func detectPulls(state *ParserState) [10][]PullEvent {
 				votes = append(votes, campVote{x: nd.X, y: nd.Y, n: 1})
 			}
 		}
-		var campX, campY float64
-		haveCamp := false
-		bestVotes := 0
 		for _, v := range votes {
 			if v.n > bestVotes {
 				bestVotes, campX, campY, haveCamp = v.n, v.x, v.y, true
 			}
 		}
+		if !haveCamp {
+			continue
+		}
+		if ci := nearestCampIdx(state, campX, campY, 15); ci >= 0 {
+			campX, campY = state.CampSpawners[ci][0], state.CampSpawners[ci][1]
+		}
+		fbCi := nearestCampIdx(state, campX, campY, 8)
+		var hs []neutHit
+		if fbCi >= 0 {
+			hs = hitsAtCamp(fbCi, c.t0-25, c.t1+5)
+		}
+		who, tStart := -1, c.t0
+		if len(hs) > 0 {
+			sort.Slice(hs, func(a, b int) bool { return hs[a].T < hs[b].T })
+			who, tStart = hs[0].Player, hs[0].T
+		} else if w, d := nearestByHistory(campX, campY, c.t0-20, c.t1+5); w >= 0 && d <= 20 {
+			who = w
+		}
+		if who < 0 {
+			continue
+		}
+		merged = append(merged, pullEpisode{
+			player: who,
+			ev: PullEvent{
+				Time: tStart, CampX: campX, CampY: campY, CreepsDied: c.creepsDied,
+				OntoEnemyWave: state.Players[who] != nil && state.Players[who].IsRadiant != c.radiant,
+			},
+			t0: c.t0, t1: c.t1, campIdx: -1,
+		})
+	}
 
-		who, dist := -1, math.MaxFloat64
-		if haveCamp {
-			campX, campY = snapCamp(campX, campY)
-			who, dist = nearestHero(c, campX, campY)
-		} else {
-			// No deletion evidence (rare): the (hero, camp) pair with the
-			// smallest distance — the puller stands at the camp.
-			for _, sp := range state.CampSpawners {
-				if w, d := nearestHero(c, sp[0], sp[1]); w >= 0 && d < dist {
-					who, dist, campX, campY = w, d, sp[0], sp[1]
+	sort.Slice(merged, func(a, b int) bool { return merged[a].ev.Time < merged[b].ev.Time })
+	for _, ep := range merged {
+		out[ep.player] = append(out[ep.player], ep.ev)
+	}
+	return out
+}
+
+// campTiers votes each camp's tier from pack-LEADER species in
+// hero->neutral hits at that camp (see campLeaderTier). Per-demo empirical —
+// no hardcoded camp map.
+func campTiers(state *ParserState) []string {
+	votes := make([]map[string]int, len(state.CampSpawners))
+	for _, h := range state.HeroNeutHits {
+		tier, ok := campLeaderTier[h.Species]
+		if !ok {
+			continue
+		}
+		ci := nearestCampIdx(state, h.X, h.Y, 6)
+		if ci < 0 {
+			continue
+		}
+		// Skip hits sitting between two adjacent camps (8-10 cells apart
+		// around the safe lanes) — a near-tie vote poisons the wrong camp.
+		ambiguous := false
+		for j, sp := range state.CampSpawners {
+			if j == ci {
+				continue
+			}
+			d2 := math.Hypot(sp[0]-h.X, sp[1]-h.Y)
+			d1 := math.Hypot(state.CampSpawners[ci][0]-h.X, state.CampSpawners[ci][1]-h.Y)
+			if d2-d1 < 2 {
+				ambiguous = true
+				break
+			}
+		}
+		if ambiguous {
+			continue
+		}
+		if votes[ci] == nil {
+			votes[ci] = map[string]int{}
+		}
+		votes[ci][tier]++
+	}
+	tiers := make([]string, len(state.CampSpawners))
+	for i, v := range votes {
+		best, bestN := "", 0
+		for tier, n := range v {
+			if n > bestN {
+				best, bestN = tier, n
+			}
+		}
+		tiers[i] = best
+	}
+	return tiers
+}
+
+// detectStacks turns m_iCampsStacked increments into located stack events:
+// the camp is the one nearest to the stacker shortly before the increment
+// (the counter fires at ~x:00 while the stacker is still running out of the
+// camp). Increments with no camp within 25 cells stay count-only (they are
+// already in campsStacked).
+func detectStacks(state *ParserState, tiers []string) [10][]StackEvent {
+	var out [10][]StackEvent
+	for _, si := range state.StackIncrs {
+		bestCi, bestD := -1, math.MaxFloat64
+		// Sample the stacker's position over the aggro-to-credit window.
+		for dt := -9.0; dt <= -3.0; dt += 1.0 {
+			if x, y, ok := posAtFresh(state.PosHistory[si.Player], si.T+dt, 3); ok {
+				if ci := nearestCampIdx(state, x, y, 25); ci >= 0 {
+					sp := state.CampSpawners[ci]
+					if d := math.Hypot(sp[0]-x, sp[1]-y); d < bestD {
+						bestD, bestCi = d, ci
+					}
 				}
 			}
 		}
-		if who < 0 || dist > 20 {
-			continue // nobody escorted the wave → not a pull
+		if bestCi < 0 {
+			continue
 		}
-		out[who] = append(out[who], PullEvent{Time: c.t0, CampX: campX, CampY: campY, CreepsDied: c.creepsDied})
+		ev := StackEvent{
+			Time:  math.Round(si.T*10) / 10,
+			CampX: state.CampSpawners[bestCi][0],
+			CampY: state.CampSpawners[bestCi][1],
+		}
+		if bestCi < len(tiers) {
+			ev.CampTier = tiers[bestCi]
+		}
+		out[si.Player] = append(out[si.Player], ev)
 	}
 	return out
+}
+
+// detectCampBlocks builds the laning camp-block war (0:00-12:00): wards
+// parked in a spawn box (≤9 cells from the spawner) block from placement to
+// ward death; a hero standing in an EMPTY, un-warded box at a minute tick
+// body-blocks that one spawn. Camp occupancy comes from neutral first-seen /
+// deletion times per camp.
+func detectCampBlocks(state *ParserState) []CampBlock {
+	if len(state.CampSpawners) == 0 {
+		return nil
+	}
+	var out []CampBlock
+
+	type wardBlock struct {
+		ci       int
+		from, to float64 // to = +inf while alive
+	}
+	var wblocks []wardBlock
+	for pi := 0; pi < 10; pi++ {
+		ps := state.Players[pi]
+		if ps == nil {
+			continue
+		}
+		for _, w := range ps.Wards {
+			if w.Time > 720 || (w.PositionX == 0 && w.PositionY == 0) {
+				continue
+			}
+			ci := nearestCampIdx(state, w.PositionX, w.PositionY, 9)
+			if ci < 0 {
+				continue
+			}
+			from := w.Time
+			if from < 0 {
+				from = 0
+			}
+			to := math.Inf(1)
+			if w.EndTime != 0 && w.EndTime >= w.Time {
+				to = w.EndTime // inverted lifecycles (entity churn) stay open-ended
+			}
+			wt := "observer"
+			if w.Type == 1 {
+				wt = "sentry"
+			}
+			cb := CampBlock{
+				CampX: state.CampSpawners[ci][0], CampY: state.CampSpawners[ci][1],
+				Method: "ward", WardType: wt, Player: pi,
+				From: math.Round(from*10) / 10,
+			}
+			if !math.IsInf(to, 1) && to <= 720 {
+				cb.To = math.Round(to*10) / 10
+			}
+			wblocks = append(wblocks, wardBlock{ci: ci, from: from, to: to})
+			out = append(out, cb)
+		}
+	}
+
+	countBefore := func(times []float64, t float64) int {
+		n := 0
+		for _, x := range times {
+			if x <= t {
+				n++
+			}
+		}
+		return n
+	}
+	for minute := 1; minute <= 12; minute++ {
+		t := float64(minute * 60)
+		for ci := range state.CampSpawners {
+			// occupied?
+			seen, deleted := 0, 0
+			if ci < len(state.CampSeenTimes) {
+				seen = countBefore(state.CampSeenTimes[ci], t)
+				deleted = countBefore(state.CampDelTimes[ci], t)
+			}
+			if seen-deleted > 0 {
+				continue // camp not empty — no spawn to block anyway
+			}
+			warded := false
+			for _, wb := range wblocks {
+				if wb.ci == ci && wb.from <= t && t <= wb.to {
+					warded = true
+					break
+				}
+			}
+			if warded {
+				continue // already counted as a ward block
+			}
+			sp := state.CampSpawners[ci]
+			who, bestD := -1, 9.0
+			for pi := 0; pi < 10; pi++ {
+				if x, y, ok := posAtFresh(state.PosHistory[pi], t, 3); ok {
+					if d := math.Hypot(sp[0]-x, sp[1]-y); d <= bestD {
+						bestD, who = d, pi
+					}
+				}
+			}
+			if who >= 0 {
+				out = append(out, CampBlock{
+					CampX: sp[0], CampY: sp[1], Method: "body", Player: who,
+					From: t, To: t,
+				})
+			}
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].From < out[b].From })
+	return out
+}
+
+// applyDeadSpans stamps measured dead spans onto death events (a span that
+// starts within [death-2, death+8] belongs to that death) and returns the
+// summed measured dead time. Spans with no matching death event (illusion
+// noise never opens one) still count toward the total — the total is the
+// player's real time off the map.
+func applyDeadSpans(spans []deadSpan, events []DeathEvent) float64 {
+	total := 0.0
+	for _, sp := range spans {
+		total += sp.T1 - sp.T0
+		for k := range events {
+			d := &events[k]
+			if d.DeadDurationSec == 0 && sp.T0 >= d.Time-2 && sp.T0 <= d.Time+8 {
+				d.DeadDurationSec = math.Round((sp.T1-sp.T0)*10) / 10
+				break
+			}
+		}
+	}
+	return math.Round(total*10) / 10
+}
+
+// laneOfCamp classifies a camp cell to the physical lane whose wave a pull
+// there eats: bot (south jungles), top (west jungles) or mid (central).
+func laneOfCamp(x, y float64) string {
+	if x < 108 && y > 120 {
+		return "top"
+	}
+	if y < 108 && x > 120 {
+		return "bot"
+	}
+	return "mid"
+}
+
+// physicalLane maps a player's laneStats.lane label to the physical lane.
+func physicalLane(lane string, isRadiant bool) string {
+	switch lane {
+	case "mid":
+		return "mid"
+	case "safe":
+		if isRadiant {
+			return "bot"
+		}
+		return "top"
+	case "off":
+		if isRadiant {
+			return "top"
+		}
+		return "bot"
+	}
+	return ""
 }
 
 // detectStunCombos finds laning-phase control chains per enemy target: 2+
@@ -3904,6 +4613,16 @@ func (z hgZones) inBase(x, y float64, radiantBase bool) bool {
 func posAt(hs []posSample, t float64) (float64, float64, bool) {
 	lo := sort.Search(len(hs), func(k int) bool { return hs[k].T > t })
 	if lo == 0 {
+		return 0, 0, false
+	}
+	return hs[lo-1].X, hs[lo-1].Y, true
+}
+
+// posAtFresh is posAt with a staleness bound — history gaps (dead hero, no
+// entity updates) must not smear a player over moments he wasn't seen at.
+func posAtFresh(hs []posSample, t, maxAge float64) (float64, float64, bool) {
+	lo := sort.Search(len(hs), func(k int) bool { return hs[k].T > t })
+	if lo == 0 || t-hs[lo-1].T > maxAge {
 		return 0, 0, false
 	}
 	return hs[lo-1].X, hs[lo-1].Y, true

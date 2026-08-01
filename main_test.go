@@ -526,6 +526,204 @@ func TestDetectPulls(t *testing.T) {
 	})
 }
 
+// v4.6.0 pull v2: attribution follows the FIRST poke into the neutrals —
+// the support who aggroed the camp gets the pull even when the carry
+// farms the pulled creeps standing closer at fight time (live case: Mirana
+// vs SF, bot lane 8922693443).
+func TestDetectPullsFirstPoke(t *testing.T) {
+	mkState := func() *ParserState {
+		s := &ParserState{CampWaveRuns: make(map[int]*campRuns)}
+		for i := 0; i < 10; i++ {
+			s.Players[i] = &PlayerState{IsRadiant: i < 5}
+		}
+		s.CampSpawners = [][2]float64{{158, 88}}
+		return s
+	}
+
+	t.Run("earliest poke wins over nearest body", func(t *testing.T) {
+		s := mkState()
+		// Radiant wave parked in the camp 155-170s.
+		s.CampWaveRuns[0] = &campRuns{Rad: []waveRun{{T0: 155, T1: 170}}}
+		s.NeutDeletions = []neutDeletion{{T: 168, X: 158, Y: 87}}
+		// Support (4) poked at 148, carry (0) farmed the camp from 158.
+		s.HeroNeutHits = []neutHit{
+			{T: 148, Player: 4, X: 160, Y: 84, Species: "kobold_tunneler"},
+			{T: 158, Player: 0, X: 158, Y: 86, Species: "kobold_tunneler"},
+		}
+		s.PullDeaths = []pullDeathRec{{T: 162, Radiant: true}}
+		pulls := detectPulls(s)
+		if len(pulls[4]) != 1 || len(pulls[0]) != 0 {
+			t.Fatalf("first poker must win: support=%v carry=%v", pulls[4], pulls[0])
+		}
+		if pulls[4][0].Time != 148 || pulls[4][0].OntoEnemyWave {
+			t.Errorf("event: %+v, want time=148 ontoEnemyWave=false", pulls[4][0])
+		}
+	})
+
+	t.Run("pull without any creep deaths is still seen", func(t *testing.T) {
+		s := mkState()
+		// Small camp melted by wave+hero: zero creep<->neutral deaths, only
+		// wave presence + a deletion at the camp (live case: Mirana 4:30).
+		s.CampWaveRuns[0] = &campRuns{Rad: []waveRun{{T0: 272, T1: 284}}}
+		s.NeutDeletions = []neutDeletion{{T: 280, X: 158, Y: 88}}
+		s.HeroNeutHits = []neutHit{{T: 268, Player: 4, X: 159, Y: 85, Species: "gnoll_assassin"}}
+		pulls := detectPulls(s)
+		if len(pulls[4]) != 1 {
+			t.Fatalf("deathless pull missed: %+v", pulls)
+		}
+		if pulls[4][0].CreepsDied != 0 {
+			t.Errorf("creepsDied: got %d, want 0", pulls[4][0].CreepsDied)
+		}
+	})
+
+	t.Run("stack-pull onto the enemy wave flags direction", func(t *testing.T) {
+		s := mkState()
+		// RADIANT wave engaged, but the poker is DIRE (Io 4:23 case).
+		s.CampWaveRuns[0] = &campRuns{Rad: []waveRun{{T0: 265, T1: 280}}}
+		s.NeutDeletions = []neutDeletion{{T: 275, X: 158, Y: 88}}
+		s.HeroNeutHits = []neutHit{{T: 263, Player: 7, X: 156, Y: 90, Species: "centaur_khan"}}
+		s.PullDeaths = []pullDeathRec{{T: 270, Radiant: true, CreepDied: true}}
+		pulls := detectPulls(s)
+		if len(pulls[7]) != 1 {
+			t.Fatalf("offensive pull missed: %+v", pulls)
+		}
+		ev := pulls[7][0]
+		if !ev.OntoEnemyWave || ev.CreepsDied != 1 {
+			t.Errorf("event: %+v, want ontoEnemyWave=true creepsDied=1", ev)
+		}
+	})
+
+	t.Run("idle wave near an empty camp is not a pull", func(t *testing.T) {
+		s := mkState()
+		// Wave parked near the camp but no neutral evidence at all.
+		s.CampWaveRuns[0] = &campRuns{Rad: []waveRun{{T0: 300, T1: 330}}}
+		s.HeroNeutHits = []neutHit{{T: 298, Player: 4, X: 159, Y: 85, Species: "gnoll_assassin"}}
+		pulls := detectPulls(s)
+		for i := 0; i < 10; i++ {
+			if len(pulls[i]) != 0 {
+				t.Fatalf("empty-camp idle counted as pull: %+v", pulls[i])
+			}
+		}
+	})
+}
+
+// v4.6.0: stack events from the authoritative m_iCampsStacked counter —
+// located at the camp the stacker was running out of, tiered empirically.
+func TestDetectStacks(t *testing.T) {
+	s := &ParserState{}
+	for i := 0; i < 10; i++ {
+		s.Players[i] = &PlayerState{IsRadiant: i < 5}
+	}
+	s.CampSpawners = [][2]float64{{90, 158}, {158, 88}}
+	// Stacker at the big camp during x:53-x:00, credit fires at 120.2.
+	for tt := 110.0; tt <= 121; tt++ {
+		s.PosHistory[8] = append(s.PosHistory[8], posSample{T: tt, X: 92, Y: 156})
+	}
+	s.StackIncrs = []stackIncr{{T: 120.2, Player: 8}}
+	// Tier votes: ursa warrior (large leader) poked at that camp.
+	s.HeroNeutHits = []neutHit{{T: 115, Player: 8, X: 91, Y: 157, Species: "polar_furbolg_ursa_warrior"}}
+	events := detectStacks(s, campTiers(s))
+	if len(events[8]) != 1 {
+		t.Fatalf("stack events: %+v", events)
+	}
+	ev := events[8][0]
+	if ev.CampX != 90 || ev.CampY != 158 || ev.CampTier != "large" {
+		t.Errorf("event: %+v, want camp (90,158) tier large", ev)
+	}
+	// Increment with nobody near any camp → count-only, no event.
+	s2 := &ParserState{CampSpawners: [][2]float64{{90, 158}}}
+	for i := 0; i < 10; i++ {
+		s2.Players[i] = &PlayerState{}
+	}
+	s2.StackIncrs = []stackIncr{{T: 240, Player: 3}}
+	ev2 := detectStacks(s2, campTiers(s2))
+	if len(ev2[3]) != 0 {
+		t.Errorf("unlocated increment must not produce an event: %+v", ev2[3])
+	}
+}
+
+// v4.6.0: camp-block war. A sentry in the spawn box blocks from placement
+// to ward death; a hero in an EMPTY un-warded box at a minute tick is a
+// body block; an occupied camp can't be blocked.
+func TestDetectCampBlocks(t *testing.T) {
+	mk := func() *ParserState {
+		s := &ParserState{}
+		for i := 0; i < 10; i++ {
+			s.Players[i] = &PlayerState{IsRadiant: i < 5}
+		}
+		s.CampSpawners = [][2]float64{{96, 164}}
+		s.CampSeenTimes = make([][]float64, 1)
+		s.CampDelTimes = make([][]float64, 1)
+		return s
+	}
+
+	t.Run("sentry in box blocks until dewarded", func(t *testing.T) {
+		s := mk()
+		s.Players[9].Wards = []WardEvent{{
+			Time: 18, Type: 1, PlayerID: 9, PositionX: 100, PositionY: 166, EndTime: 305,
+		}}
+		blocks := detectCampBlocks(s)
+		if len(blocks) != 1 {
+			t.Fatalf("blocks: %+v", blocks)
+		}
+		b := blocks[0]
+		if b.Method != "ward" || b.WardType != "sentry" || b.Player != 9 || b.From != 18 || b.To != 305 {
+			t.Errorf("block: %+v", b)
+		}
+	})
+
+	t.Run("ward far from any camp does not block", func(t *testing.T) {
+		s := mk()
+		s.Players[2].Wards = []WardEvent{{Time: 30, Type: 0, PositionX: 130, PositionY: 130}}
+		if blocks := detectCampBlocks(s); len(blocks) != 0 {
+			t.Fatalf("river ward counted as block: %+v", blocks)
+		}
+	})
+
+	t.Run("body block only on an empty camp", func(t *testing.T) {
+		s := mk()
+		// Camp occupied through minute 1 (seen at 40, never deleted) —
+		// hero standing there at 1:00 is stacking/farming, not blocking.
+		s.CampSeenTimes[0] = []float64{40}
+		for tt := 55.0; tt <= 125; tt++ {
+			s.PosHistory[3] = append(s.PosHistory[3], posSample{T: tt, X: 96, Y: 163})
+		}
+		blocks := detectCampBlocks(s)
+		if len(blocks) != 0 {
+			t.Fatalf("occupied camp body-blocked: %+v", blocks)
+		}
+		// Camp emptied at 70 → the 2:00 spawn is body-blocked.
+		s.CampDelTimes[0] = []float64{70}
+		blocks = detectCampBlocks(s)
+		if len(blocks) != 1 || blocks[0].Method != "body" || blocks[0].Player != 3 || blocks[0].From != 120 {
+			t.Fatalf("body block missing: %+v", blocks)
+		}
+	})
+}
+
+// v4.6.0: measured dead time replaces guessing — a span is matched to its
+// death event, aegis-style instant revives keep their true short span, and
+// spans without a death event (illusion noise) still count in the total.
+func TestApplyDeadSpans(t *testing.T) {
+	events := []DeathEvent{{Time: 1000, TimeDead: 100}, {Time: 1009, TimeDead: 100}}
+	spans := []deadSpan{
+		{T0: 1000.5, T1: 1005.5}, // aegis death: 5s real, table said 100
+		{T0: 1009.4, T1: 1062.4}, // real death: 53s
+	}
+	total := applyDeadSpans(spans, events)
+	if events[0].DeadDurationSec != 5 || events[1].DeadDurationSec != 53 {
+		t.Errorf("per-death spans: %+v", events)
+	}
+	if total != 58 {
+		t.Errorf("total: got %v, want 58", total)
+	}
+	// Span with no event still counts toward the total.
+	total2 := applyDeadSpans([]deadSpan{{T0: 50, T1: 60}}, nil)
+	if total2 != 10 {
+		t.Errorf("unmatched span total: got %v, want 10", total2)
+	}
+}
+
 // v4.6.0: highground episodes. Two zone touches within 10s merge into one
 // episode; a death inside truncates it (corpse freezes in zone until the
 // respawn jump); outcome covers [entry, exit+10].
