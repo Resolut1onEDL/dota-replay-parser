@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/bzip2"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -38,9 +40,10 @@ var (
 	// parserVersion is asked from the binary itself (--version, v4.6.0+);
 	// older binaries have no flag and fall back to the basename so /healthz
 	// still answers. Resolved once at startup.
-	parserVersion = detectParserVersion()
-	token     = os.Getenv("PARSE_TOKEN")
-	sem       chan struct{}
+	parserVersion   = detectParserVersion()
+	token           = os.Getenv("PARSE_TOKEN")
+	sem             chan struct{}
+	inFlightMatches sync.Map
 	// Replay download client with a total timeout. Valve's replay CDN is
 	// wildly variable — some servers deliver a 150 MB .dem.bz2 at ~7 MB/s
 	// (~20s), others at ~0.2 MB/s (12+ min). The default no-timeout client
@@ -134,12 +137,24 @@ func writeDem(src io.Reader) (string, int64, error) {
 	return f.Name(), written, nil
 }
 
-func runParser(demPath string) ([]byte, time.Duration, error) {
-	sem <- struct{}{}
-	defer func() { <-sem }()
+func reserveSlot(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() != nil {
+		http.Error(w, `{"error":"request_cancelled"}`, http.StatusRequestTimeout)
+		return false
+	}
+	select {
+	case sem <- struct{}{}:
+		return true
+	default:
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, `{"error":"parser_busy"}`, http.StatusServiceUnavailable)
+		return false
+	}
+}
 
+func runParser(ctx context.Context, demPath string) ([]byte, time.Duration, error) {
 	start := time.Now()
-	cmd := exec.Command(parserBin, demPath)
+	cmd := exec.CommandContext(ctx, parserBin, demPath)
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	return out, time.Since(start), err
@@ -150,6 +165,10 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
+	if !reserveSlot(w, r) {
+		return
+	}
+	defer func() { <-sem }()
 	demPath, size, err := writeDem(http.MaxBytesReader(w, r.Body, 500<<20))
 	if err != nil {
 		http.Error(w, `{"error":"bad_body"}`, http.StatusBadRequest)
@@ -157,7 +176,7 @@ func handleParse(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.Remove(demPath)
 	log.Printf("parse: received %d MB", size>>20)
-	serveParsed(w, demPath, 0)
+	serveParsed(r.Context(), w, demPath, 0)
 }
 
 type valveReq struct {
@@ -177,13 +196,27 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"bad_params"}`, http.StatusBadRequest)
 		return
 	}
+	if _, loaded := inFlightMatches.LoadOrStore(req.MatchID, struct{}{}); loaded {
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, `{"error":"parse_in_progress"}`, http.StatusServiceUnavailable)
+		return
+	}
+	defer inFlightMatches.Delete(req.MatchID)
+	if !reserveSlot(w, r) {
+		return
+	}
+	defer func() { <-sem }()
 
 	url := fmt.Sprintf("http://replay%d.valve.net/570/%d_%d.dem.bz2",
 		req.Cluster, req.MatchID, req.Salt)
 	log.Printf("parse-valve: downloading %s", url)
 
 	dlStart := time.Now()
-	resp, err := downloadClient.Get(url)
+	dlReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	var resp *http.Response
+	if err == nil {
+		resp, err = downloadClient.Do(dlReq)
+	}
 	if err != nil {
 		log.Printf("parse-valve: download error after %s: %v", time.Since(dlStart).Round(time.Millisecond), err)
 		http.Error(w, `{"error":"valve_unreachable"}`, http.StatusBadGateway)
@@ -206,7 +239,7 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 	defer os.Remove(demPath)
 	dl := time.Since(dlStart)
 	log.Printf("parse-valve: downloaded+unpacked %d MB in %s", size>>20, dl.Round(time.Millisecond))
-	serveParsed(w, demPath, dl)
+	serveParsed(r.Context(), w, demPath, dl)
 }
 
 type urlReq struct {
@@ -224,6 +257,10 @@ func handleParseURL(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"bad_params"}`, http.StatusBadRequest)
 		return
 	}
+	if !reserveSlot(w, r) {
+		return
+	}
+	defer func() { <-sem }()
 
 	// signed URLs carry auth in the query string — keep it out of logs
 	logURL := req.URL
@@ -233,7 +270,11 @@ func handleParseURL(w http.ResponseWriter, r *http.Request) {
 	log.Printf("parse-url: downloading %s", logURL)
 
 	dlStart := time.Now()
-	resp, err := downloadClient.Get(req.URL)
+	dlReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, req.URL, nil)
+	var resp *http.Response
+	if err == nil {
+		resp, err = downloadClient.Do(dlReq)
+	}
 	if err != nil {
 		log.Printf("parse-url: download error after %s: %v", time.Since(dlStart).Round(time.Millisecond), err)
 		http.Error(w, `{"error":"source_unreachable"}`, http.StatusBadGateway)
@@ -256,11 +297,11 @@ func handleParseURL(w http.ResponseWriter, r *http.Request) {
 	defer os.Remove(demPath)
 	dl := time.Since(dlStart)
 	log.Printf("parse-url: downloaded+unpacked %d MB in %s", size>>20, dl.Round(time.Millisecond))
-	serveParsed(w, demPath, dl)
+	serveParsed(r.Context(), w, demPath, dl)
 }
 
-func serveParsed(w http.ResponseWriter, demPath string, download time.Duration) {
-	out, parseDur, err := runParser(demPath)
+func serveParsed(ctx context.Context, w http.ResponseWriter, demPath string, download time.Duration) {
+	out, parseDur, err := runParser(ctx, demPath)
 	if err != nil {
 		log.Printf("parser failed: %v", err)
 		http.Error(w, `{"error":"parse_failed"}`, http.StatusUnprocessableEntity)

@@ -5,7 +5,7 @@ primary_region = "arn"
   dockerfile = "Dockerfile"
 
 [env]
-  MAX_CONCURRENT = "2"
+  MAX_CONCURRENT = "1"
   PORT = "8080"
 
 [http_service]
@@ -23,7 +23,7 @@ primary_region = "arn"
     method = "GET"
     path = "/healthz"
 
-# Parsing a large replay loads entity state in memory — give it headroom.
+# Parsing needs sustained CPU; shared CPU throttled production jobs past the deadline.
 [[vm]]
-  size = "shared-cpu-2x"
+  size = "performance-1x"
   memory = "2gb"
