@@ -18,7 +18,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.7.2"
+const parserVersion = "4.8.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -130,6 +130,14 @@ type DeathEvent struct {
 	DeadDurationSec float64 `json:"deadDurationSec,omitempty"`
 	NetworthAtDeath int     `json:"networthAtDeath,omitempty"`
 	HadTP           bool    `json:"hadTP,omitempty"`
+	// v4.8.0: seconds between the last TP-scroll/Travel channel START and
+	// this death — "died without TP" 18s after teleporting into the fight is
+	// a decision, not a forgotten scroll. Nil when no teleport was started
+	// before this death.
+	TPUsedSecBefore *int  `json:"tpUsedSecBefore,omitempty"`
+	// v4.8.0: that last channel was cut short — the player tried to leave
+	// and did not get out.
+	TPInterrupted   bool  `json:"tpInterrupted,omitempty"`
 	NearbyAllies    []int   `json:"nearbyAllies,omitempty"`
 	NearbyEnemies   []int   `json:"nearbyEnemies,omitempty"`
 }
@@ -965,6 +973,17 @@ type PlayerState struct {
 	// TP tracking
 	TPCount      int
 	CurrentHasTP bool // tracked from m_hItems.0015 entity
+	// v4.8.0: game-second of the last TP-scroll/Travel channel START
+	// (modifier_teleporting), so a death can say how long ago the scroll went
+	// into a teleport. TPStarted guards the zero value — pre-horn time is
+	// negative, so 0 is a real second.
+	LastTPStart float64
+	TPStarted   bool
+	// Outcome of that last channel from its MODIFIER_REMOVE: resolved once
+	// the removal arrived, interrupted when the channel was shorter than the
+	// scroll's 3s (stun, damage, or the death itself).
+	LastTPResolved    bool
+	LastTPInterrupted bool
 
 	// Smoke tracking
 	SmokeCount int
@@ -1758,6 +1777,8 @@ func main() {
 						PositionY:       deathY,
 						NetworthAtDeath: state.Players[targetIdx].NetWorth,
 						HadTP:           state.Players[targetIdx].CurrentHasTP,
+						TPUsedSecBefore: secondsSinceTP(state.Players[targetIdx].TPStarted, state.Players[targetIdx].LastTPStart, actualTime),
+						TPInterrupted:   state.Players[targetIdx].TPStarted && state.Players[targetIdx].LastTPResolved && state.Players[targetIdx].LastTPInterrupted,
 						NearbyAllies:    nearbyAllies,
 						NearbyEnemies:   nearbyEnemies,
 						TimeDead:        respawnTime(state.Players[targetIdx].Level),
@@ -2107,12 +2128,19 @@ func main() {
 			// dramatically (NP can show 50+ "TPs" in a 30-min game).
 			if modifierName == "modifier_teleporting" && strings.Contains(targetName, "hero") {
 				modAbility := state.LookupName(m.GetModifierAbility())
+				if os.Getenv("TP_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "TPDBG ADD t=%.2f target=%s ability=%q\n", actualTime, targetName, modAbility)
+				}
 				isItemTP := modAbility == "item_tpscroll" ||
 					strings.Contains(modAbility, "travel_boots")
 				if isItemTP {
 					targetIdx := heroNameToPlayerIndex(targetName, state)
 					if targetIdx >= 0 && targetIdx < 10 {
 						state.Players[targetIdx].TPCount++
+						state.Players[targetIdx].LastTPStart = actualTime
+						state.Players[targetIdx].TPStarted = true
+						state.Players[targetIdx].LastTPResolved = false
+						state.Players[targetIdx].LastTPInterrupted = false
 					}
 				}
 			}
@@ -2155,6 +2183,25 @@ func main() {
 						Time:      actualTime,
 						PlayerIdx: targetIdx,
 					})
+				}
+			}
+			// v4.8.0: the end of a TP-scroll/Travel channel. Arrival, an
+			// interruption and a death mid-channel all fire the same REMOVE; a
+			// channel shorter than the scroll's 3s did not complete. Ability
+			// teleports (Nature's Prophet) share the modifier name and carry no
+			// ability on REMOVE, so only a removal that follows the last SCROLL
+			// start within one channel is attributed to it.
+			if modifierName == "modifier_teleporting" && strings.Contains(targetName, "hero") {
+				if os.Getenv("TP_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "TPDBG REMOVE t=%.2f target=%s ability=%q\n", actualTime, targetName, state.LookupName(m.GetModifierAbility()))
+				}
+				targetIdx := heroNameToPlayerIndex(targetName, state)
+				if targetIdx >= 0 && targetIdx < 10 {
+					ps := state.Players[targetIdx]
+					if ps.TPStarted && !ps.LastTPResolved && actualTime-ps.LastTPStart <= tpChannelAttributeSec {
+						ps.LastTPResolved = true
+						ps.LastTPInterrupted = tpInterrupted(ps.LastTPStart, actualTime)
+					}
 				}
 			}
 
@@ -2968,6 +3015,31 @@ func respawnTime(level int) int {
 	// Index 0 unused, levels 1-30
 	table := []int{0, 6, 8, 10, 14, 16, 26, 28, 30, 32, 34, 36, 46, 48, 50, 52, 54, 56, 66, 70, 74, 78, 82, 86, 90, 100, 100, 100, 100, 100, 100}
 	return table[level]
+}
+
+// A TP scroll (and Boots of Travel) channels for 3s; a modifier_teleporting
+// removal earlier than that is an interruption. tpChannelAttributeSec bounds
+// how long after a scroll start a removal can still belong to that channel.
+const (
+	tpChannelSec          = 3.0
+	tpChannelAttributeSec = 10.0
+)
+
+// tpInterrupted: did the channel that started at startSec end before it
+// could complete? Half a second of slack covers tick rounding on arrival.
+func tpInterrupted(startSec, removeSec float64) bool {
+	return removeSec-startSec < tpChannelSec-0.5
+}
+
+// secondsSinceTP answers "how long before `now` did the last teleport start",
+// rounded to whole seconds; nil when no teleport has started yet or the clock
+// is behind the start (out-of-order combat-log entries).
+func secondsSinceTP(started bool, lastStart, now float64) *int {
+	if !started || now < lastStart {
+		return nil
+	}
+	v := int(math.Round(now - lastStart))
+	return &v
 }
 
 func heroNameToPlayerIndex(combatLogName string, state *ParserState) int {

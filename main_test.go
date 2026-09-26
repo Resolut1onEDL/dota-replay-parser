@@ -1162,3 +1162,34 @@ func TestSetGameStartTimeRebasesPreStartSkillBuild(t *testing.T) {
 		t.Errorf("GameStartTime = %v, want 286.4", s.GameStartTime)
 	}
 }
+
+// v4.8.0: the seconds between a teleport start and a death, so the web coach
+// can tell "died without TP right after flying into the fight" from "never
+// carried one". Pre-horn game time is negative — the zero value is a real
+// second, hence the explicit started flag.
+func TestSecondsSinceTP(t *testing.T) {
+	if got := secondsSinceTP(false, 0, 100); got != nil {
+		t.Fatalf("no teleport yet: want nil, got %d", *got)
+	}
+	if got := secondsSinceTP(true, 1182.4, 1200.0); got == nil || *got != 18 {
+		t.Fatalf("18s after the channel start: got %v", got)
+	}
+	if got := secondsSinceTP(true, -30, 0); got == nil || *got != 30 {
+		t.Fatalf("pre-horn start: got %v", got)
+	}
+	if got := secondsSinceTP(true, 500, 499); got != nil {
+		t.Fatalf("clock behind the start: want nil, got %d", *got)
+	}
+}
+
+func TestTPInterrupted(t *testing.T) {
+	if tpInterrupted(100, 103.03) {
+		t.Fatal("a full 3s channel (tick rounding on arrival) is not an interruption")
+	}
+	if !tpInterrupted(100, 101.2) {
+		t.Fatal("a channel cut at 1.2s is an interruption")
+	}
+	if tpInterrupted(100, 102.6) {
+		t.Fatal("2.6s is inside the slack: treated as completed")
+	}
+}
