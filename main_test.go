@@ -1130,3 +1130,35 @@ func TestSkillBuildOwnership(t *testing.T) {
 		}
 	})
 }
+
+// Regression: skill points taken before the horn were recorded while
+// GameStartTime was still 0, so ActualGameSeconds returned the raw server
+// time (seconds since the demo started) instead of a pre-horn time. Match
+// 8665357419: Invoker's first point (exort, hero level 1) landed at 200s,
+// after quas at 79s. Once m_flGameStartTime arrives (286.4s raw) those early
+// entries must be rebased onto the game clock.
+func TestSetGameStartTimeRebasesPreStartSkillBuild(t *testing.T) {
+	s := &ParserState{}
+	s.Players[1] = &PlayerState{SkillBuild: []SkillLevelUp{
+		{Time: 200.5, AbilityName: "invoker_exort", Level: 1, HeroLevel: 1},
+	}}
+
+	s.setGameStartTime(286.4)
+	s.Players[1].SkillBuild = append(s.Players[1].SkillBuild,
+		SkillLevelUp{Time: 79.4, AbilityName: "invoker_quas", Level: 1, HeroLevel: 2})
+	s.setGameStartTime(286.4) // repeated updates of the same value change nothing
+
+	got := filterSkillBuild(s.Players[1].SkillBuild)
+	if len(got) != 2 || got[0].AbilityName != "invoker_exort" || got[1].AbilityName != "invoker_quas" {
+		t.Fatalf("order = %+v, want exort then quas", got)
+	}
+	if d := got[0].Time - (200.5 - 286.4); d > 1e-6 || d < -1e-6 {
+		t.Errorf("exort time = %v, want %v (pre-horn)", got[0].Time, 200.5-286.4)
+	}
+	if got[1].Time != 79.4 {
+		t.Errorf("quas time = %v, want 79.4 (recorded after start, untouched)", got[1].Time)
+	}
+	if s.GameStartTime != 286.4 {
+		t.Errorf("GameStartTime = %v, want 286.4", s.GameStartTime)
+	}
+}

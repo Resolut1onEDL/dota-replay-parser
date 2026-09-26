@@ -18,7 +18,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.7.1"
+const parserVersion = "4.7.2"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -1399,6 +1399,24 @@ func (s *ParserState) ActualGameSeconds(rawTime float64) float64 {
 	return rawTime
 }
 
+// setGameStartTime stores m_flGameStartTime. It arrives only at the horn;
+// skill points taken before it (the first point is usually pre-horn) were
+// timed while GameStartTime was 0, i.e. in raw server seconds — rebase them
+// onto the game clock so they read as pre-horn instead of minutes in.
+func (s *ParserState) setGameStartTime(t float64) {
+	if s.GameStartTime == 0 && t > 0 {
+		for _, ps := range s.Players {
+			if ps == nil {
+				continue
+			}
+			for i := range ps.SkillBuild {
+				ps.SkillBuild[i].Time -= t
+			}
+		}
+	}
+	s.GameStartTime = t
+}
+
 // isWardDeward сообщает, что смерть варда — это снос врагом (а не естественное
 // истечение). Combat-log называет истёкший вард так, что attacker == target
 // ("npc_dota_*_wards" сам себя); снос даёт attacker = герой/юнит. (v4.3.0)
@@ -2581,7 +2599,7 @@ func main() {
 			}
 			// Track game start/end times for duration calculation
 			if startTime, ok := e.GetFloat32("m_pGameRules.m_flGameStartTime"); ok {
-				state.GameStartTime = float64(startTime)
+				state.setGameStartTime(float64(startTime))
 			}
 			// HornTick is set from the combat-log callback (see below) on the
 			// first event with actualTime >= 0. m_pGameRules.m_iGameState is
