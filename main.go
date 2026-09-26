@@ -18,7 +18,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.7.0"
+const parserVersion = "4.7.1"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -226,6 +226,15 @@ type SkillLevelUp struct {
 type AbilityEntityInfo struct {
 	Name  string
 	Level int
+}
+
+// skillAbility is an ability entity seen in a player's REAL hero's
+// m_vecAbilities (not an illusion's, not a stolen spell): only its in-place
+// level rises are skill points.
+type skillAbility struct {
+	Player int
+	Name   string
+	Level  int
 }
 
 // Talent is a chosen hero talent — a special_bonus_* ability on the hero
@@ -939,7 +948,7 @@ type PlayerState struct {
 	
 	// Skill build tracking
 	SkillBuild      []SkillLevelUp
-	PrevAbilityLvls map[string]int // ability name → last known level
+	PrevAbilityLvls map[string]int // ability name → highest recorded level
 
 	// Talent tracking: ability slot index (m_vecAbilities.NNNN) → talent
 	// info for special_bonus_* abilities. Overwritten on every hero entity
@@ -1031,6 +1040,9 @@ type ParserState struct {
 
 	// Ability entity tracking for skill build
 	AbilityEntities map[int32]*AbilityEntityInfo
+	// v4.7.1: ability entity index → owning player, filled only from real
+	// heroes' own abilities (see observeHeroAbility).
+	SkillAbilities map[int32]*skillAbility
 
 	// Ward entity → in-flight ward, для длительности (v4.3.0)
 	ActiveWards map[int32]*activeWard
@@ -1308,6 +1320,7 @@ func NewParserState(p *manta.Parser) *ParserState {
 		BuildingKills: make([]BuildingEvent, 0),
 		ItemEntities:       make(map[int32]string),
 		AbilityEntities:    make(map[int32]*AbilityEntityInfo),
+		SkillAbilities:     make(map[int32]*skillAbility),
 		ActiveWards:        make(map[int32]*activeWard),
 		PendingRunes:       make(map[int32]*RuneEntityInfo),
 		HeroEntityToPlayer: make(map[int32]int),
@@ -2424,8 +2437,16 @@ func main() {
 						state.Players[playerIdx].CurrentHasTP = false
 					}
 
-					// Track ability ownership for skill build (scan ability handles via m_vecAbilities)
-					for ai := 0; ai < 24; ai++ {
+					// Track ability ownership for skill build (scan ability handles via m_vecAbilities).
+					// v4.7.1: illusions owned by this player (Terrorblade's
+					// Reflection, Dark Seer's Wall of Replica, Shadow Demon's
+					// Disruption) carry copies of OTHER heroes' abilities and
+					// talents — skip them; same illusion test as RealPos above.
+					isIllusion := false
+					if repl, okR := e.GetUint32("m_hReplicatingOtherHeroModel"); okR && repl != 16777215 {
+						isIllusion = true
+					}
+					for ai := 0; ai < 24 && !isIllusion; ai++ {
 						key := fmt.Sprintf("m_vecAbilities.%04d", ai)
 						if handle, ok := e.GetUint32(key); ok && handle > 0 && handle < 16777215 {
 							entityIdx := int32(handle & 0x3FFF)
@@ -2465,19 +2486,9 @@ func main() {
 								abilityLevel = int(lvl)
 							}
 
-							if _, tracked := state.Players[playerIdx].PrevAbilityLvls[abilityName]; !tracked {
-								// First time seeing this ability — just register baseline, don't record
-								state.Players[playerIdx].PrevAbilityLvls[abilityName] = abilityLevel
-							} else if abilityLevel > state.Players[playerIdx].PrevAbilityLvls[abilityName] {
-								// Level increased — record skill up
-								state.Players[playerIdx].SkillBuild = append(state.Players[playerIdx].SkillBuild, SkillLevelUp{
-									Time:        actualGameTime,
-									AbilityName: abilityName,
-									Level:       abilityLevel,
-									HeroLevel:   state.Players[playerIdx].Level,
-								})
-								state.Players[playerIdx].PrevAbilityLvls[abilityName] = abilityLevel
-							}
+							// Rubick's stolen spells sit in his own slots, flagged m_bStolen.
+							stolen, _ := abEnt.GetBool("m_bStolen")
+							state.observeHeroAbility(playerIdx, entityIdx, abilityName, abilityLevel, stolen, actualGameTime)
 						}
 					}
 				}
@@ -2866,21 +2877,9 @@ func main() {
 			} else {
 				// Check for level change
 				if abilityLevel > info.Level && abilityLevel > 0 {
-					// Find which player owns this ability
-					for pi := 0; pi < 10; pi++ {
-						if prevLvl, ok := state.Players[pi].PrevAbilityLvls[abilityName]; ok && prevLvl < abilityLevel {
-							state.Players[pi].SkillBuild = append(state.Players[pi].SkillBuild, SkillLevelUp{
-								Time:        actualGameTime,
-								AbilityName: abilityName,
-								Level:       abilityLevel,
-								HeroLevel:   state.Players[pi].Level,
-							})
-							state.Players[pi].PrevAbilityLvls[abilityName] = abilityLevel
-							break
-						} else if !ok {
-							// Not yet tracked for this player — skip, will be assigned on first hero entity scan
-						}
-					}
+					// v4.7.1: the owner is whoever's real hero holds THIS
+					// entity, not the first player who has a same-named ability.
+					state.observeAbilityLevel(idx, abilityName, abilityLevel, actualGameTime)
 				}
 				info.Level = abilityLevel
 				info.Name = abilityName
@@ -3380,6 +3379,53 @@ var genericAbilities = map[string]bool{
 	"generic_hidden":                true,
 	"neutral_upgrade":               true,
 	"special_bonus_base":            true,
+}
+
+// observeHeroAbility handles one ability slot of a player's hero entity.
+// Stolen spells are never skill points. The first sighting of an entity is
+// its baseline: a new entity (morphed or devoured ability, re-created slot)
+// appearing at level N is not N skill points. Only a later level rise of
+// the same entity is recorded.
+func (s *ParserState) observeHeroAbility(player int, idx int32, name string, level int, stolen bool, t float64) {
+	if stolen {
+		delete(s.SkillAbilities, idx)
+		return
+	}
+	sa, ok := s.SkillAbilities[idx]
+	if !ok || sa.Player != player || sa.Name != name {
+		s.SkillAbilities[idx] = &skillAbility{Player: player, Name: name, Level: level}
+		return
+	}
+	if level > sa.Level {
+		sa.Level = level
+		s.recordSkillUp(player, name, level, t)
+	}
+}
+
+// observeAbilityLevel handles a level change seen on the ability entity
+// itself (it can arrive before the hero entity's next update). It is
+// credited only when a real hero's scan already claimed this entity.
+func (s *ParserState) observeAbilityLevel(idx int32, name string, level int, t float64) {
+	sa, ok := s.SkillAbilities[idx]
+	if !ok || sa.Name != name || level <= sa.Level {
+		return
+	}
+	sa.Level = level
+	s.recordSkillUp(sa.Player, name, level, t)
+}
+
+func (s *ParserState) recordSkillUp(player int, name string, level int, t float64) {
+	ps := s.Players[player]
+	if level <= ps.PrevAbilityLvls[name] {
+		return
+	}
+	ps.SkillBuild = append(ps.SkillBuild, SkillLevelUp{
+		Time:        t,
+		AbilityName: name,
+		Level:       level,
+		HeroLevel:   ps.Level,
+	})
+	ps.PrevAbilityLvls[name] = level
 }
 
 // filterSkillBuild removes generic/shared abilities and sorts by time

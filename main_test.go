@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1043,6 +1044,89 @@ func TestFinalizeWardKilled(t *testing.T) {
 			if s.Players[3].Wards[0].Killed {
 				t.Errorf("a kill with lag %v claimed the ward", 360-killT)
 			}
+		}
+	})
+}
+
+// Regression for v4.7.1: skillBuild held other heroes' abilities (match
+// 8983627958: Terrorblade got nevermore_frenzy, rubick_spellsteal, ...;
+// match 9008951145: SF and Pudge swapped level-ups). Level-ups used to be
+// keyed by ability NAME and credited to the first player who had that name;
+// now only an in-place level rise of an entity claimed by the owner's real
+// hero counts. (Illusion hero entities are skipped before this point.)
+func TestSkillBuildOwnership(t *testing.T) {
+	names := func(s *ParserState, p int) []string {
+		out := []string{}
+		for _, su := range s.Players[p].SkillBuild {
+			out = append(out, fmt.Sprintf("%s:%d", su.AbilityName, su.Level))
+		}
+		return out
+	}
+
+	t.Run("own ability levels up through either path, once", func(t *testing.T) {
+		s := NewParserState(nil)
+		s.observeHeroAbility(0, 100, "nevermore_shadowraze1", 0, false, 0)
+		s.observeAbilityLevel(100, "nevermore_shadowraze1", 1, 10) // ability entity first
+		s.observeHeroAbility(0, 100, "nevermore_shadowraze1", 1, false, 10)
+		s.observeHeroAbility(0, 100, "nevermore_shadowraze1", 2, false, 60) // hero entity first
+		s.observeAbilityLevel(100, "nevermore_shadowraze1", 2, 60)
+		if got := names(s, 0); fmt.Sprint(got) != "[nevermore_shadowraze1:1 nevermore_shadowraze1:2]" {
+			t.Errorf("got %v", got)
+		}
+	})
+
+	t.Run("level-up goes to the entity's owner, not the first same-named player", func(t *testing.T) {
+		s := NewParserState(nil)
+		// Player 0 holds a copy of pudge_meathook (e.g. morphed) at level 1.
+		s.observeHeroAbility(0, 300, "pudge_meathook", 1, false, 0)
+		// Player 3 is Pudge.
+		s.observeHeroAbility(3, 200, "pudge_meathook", 1, false, 0)
+		s.observeAbilityLevel(200, "pudge_meathook", 2, 100)
+		if got := names(s, 0); len(got) != 0 {
+			t.Errorf("player 0 got Pudge's level-up: %v", got)
+		}
+		if got := names(s, 3); fmt.Sprint(got) != "[pudge_meathook:2]" {
+			t.Errorf("player 3 got %v", got)
+		}
+	})
+
+	t.Run("a new entity at a higher level is a baseline, not a skill point", func(t *testing.T) {
+		s := NewParserState(nil)
+		// Doom devours a creep with ability level 1, later another at level 3.
+		s.observeHeroAbility(0, 400, "black_dragon_fireball", 1, false, 300)
+		s.observeHeroAbility(0, 401, "black_dragon_fireball", 3, false, 900)
+		if got := names(s, 0); len(got) != 0 {
+			t.Errorf("devoured ability recorded as skill points: %v", got)
+		}
+	})
+
+	t.Run("stolen spells never count, even when re-stolen at a higher level", func(t *testing.T) {
+		s := NewParserState(nil)
+		s.observeHeroAbility(0, 500, "lina_dragonslave", 2, true, 400)
+		s.observeHeroAbility(0, 500, "lina_dragonslave", 4, true, 1200) // Rubick reuses the entity
+		s.observeAbilityLevel(500, "lina_dragonslave", 4, 1200)
+		if got := names(s, 0); len(got) != 0 {
+			t.Errorf("stolen spell recorded: %v", got)
+		}
+	})
+
+	t.Run("unclaimed ability entities (illusion copies) are ignored", func(t *testing.T) {
+		s := NewParserState(nil)
+		s.observeAbilityLevel(600, "earthspirit_rollingboulder", 2, 900)
+		for p := 0; p < 10; p++ {
+			if got := names(s, p); len(got) != 0 {
+				t.Errorf("player %d got %v", p, got)
+			}
+		}
+	})
+
+	t.Run("a recycled entity index is re-baselined for its new ability", func(t *testing.T) {
+		s := NewParserState(nil)
+		s.observeHeroAbility(0, 700, "nevermore_necromastery", 1, false, 0)
+		s.observeHeroAbility(0, 700, "terrorblade_reflection", 2, false, 500)
+		s.observeAbilityLevel(700, "nevermore_necromastery", 3, 600)
+		if got := names(s, 0); len(got) != 0 {
+			t.Errorf("got %v", got)
 		}
 	})
 }
