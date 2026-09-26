@@ -34,6 +34,11 @@ scripts/release-sync.sh vX.Y.Z
   the local `dist-release/` shortcut is opt-in via `DOTA_PARSER_DIST` only
   (the local-first default once shipped stale 4.3.1 to players).
 - `dist-release/` loose files are dev leftovers, never a distribution source.
+- `fly deploy` and the local `go build` ship the WORKING TREE, not git. release-sync
+  refuses a `PARSER_REPO` that is not exactly the tag commit with a clean tree
+  (`scripts/check-release-tree.sh`) — 2026-09-26 it shipped uncommitted 4.8.0
+  work from the main checkout. Run it against a clean copy of the tag:
+  `git worktree add --detach ../dota-replay-parser-vX.Y.Z vX.Y.Z`.
 - Web keeps `compareParserVersions` guard: an older-parser upload never
   overwrites a newer parse of the same match.
 - Checking sync state at any moment:

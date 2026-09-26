@@ -41,6 +41,8 @@ if ! git -C "$PARSER_REPO" rev-parse "$V" >/dev/null 2>&1 &&
   echo "  cd $PARSER_REPO && git tag $V && git push origin $V"
   exit 1
 fi
+# Fly and step 4 build PARSER_REPO's working tree — it must be the tag, clean.
+"$(dirname "$0")/check-release-tree.sh" "$PARSER_REPO" "$V" || fail "PARSER_REPO не совпадает с $V"
 # CI builds the three assets on the tag — poll until they are all there.
 for i in $(seq 1 30); do
   n=$(gh release view "$V" -R "$REPO_SLUG" --json assets \
