@@ -734,6 +734,19 @@ func TestIllusionEcho(t *testing.T) {
 	}
 }
 
+// v4.7.4: final GPM is total earned gold over the minutes since the horn, as
+// Valve's gold_per_min. Match 9023007039, slot 0 (21.84 min): 11977 earned at
+// the game's end → 548, OpenDota says 548; the old net-worth proxy (12140) said
+// 555. A replay without the team-data field keeps that proxy.
+func TestFinalGPM(t *testing.T) {
+	if got := finalGPM(11977, 12140, 1310.37); got != 548 {
+		t.Errorf("total earned gold: got %d, want 548", got)
+	}
+	if got := finalGPM(0, 12140, 1310.37); got != 555 {
+		t.Errorf("net-worth fallback: got %d, want 555", got)
+	}
+}
+
 // v4.6.0: measured dead time replaces guessing — a span is matched to its
 // death event, aegis-style instant revives keep their true short span, and
 // spans without a death event (illusion noise) still count in the total.
