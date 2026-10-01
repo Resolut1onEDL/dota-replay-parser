@@ -14,6 +14,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/dotabuff/manta/dota"
 )
 
 type opendotaPlayer struct {
@@ -700,6 +702,36 @@ func TestDetectCampBlocks(t *testing.T) {
 			t.Fatalf("body block missing: %+v", blocks)
 		}
 	})
+}
+
+// v4.7.3: combat-log entries made by a player's illusions carry the hero's
+// name. Match 9014833909: Bane's two scepter illusions repeated each Fiend's
+// Grip (24 casts logged, 10 pressed). While the real hero is alive (lifeState
+// 0) they are echoes; a dead Vengeful Spirit's scepter illusion (lifeState
+// 1/2) is still the player's hands.
+func TestIllusionEcho(t *testing.T) {
+	yes, no := true, false
+	s := &ParserState{}
+	s.LifePrev[3] = 2 // dead
+	s.LifePrev[4] = 1 // dying
+	cases := []struct {
+		name     string
+		illusion *bool
+		player   int
+		want     bool
+	}{
+		{"illusion of a living hero", &yes, 0, true},
+		{"the hero itself", &no, 0, false},
+		{"flag absent", nil, 0, false},
+		{"illusion of a dead hero", &yes, 3, false},
+		{"illusion of a dying hero", &yes, 4, false},
+	}
+	for _, c := range cases {
+		m := &dota.CMsgDOTACombatLogEntry{IsAttackerIllusion: c.illusion}
+		if got := s.illusionEcho(m, c.player); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
 }
 
 // v4.6.0: measured dead time replaces guessing — a span is matched to its
