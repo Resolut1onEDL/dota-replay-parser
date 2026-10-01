@@ -18,7 +18,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.7.2"
+const parserVersion = "4.7.3"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -1149,6 +1149,15 @@ func (s *ParserState) entityActual() float64 {
 	return s.ActualGameSeconds(s.GameTime()) + s.EntityAxisOffset
 }
 
+// illusionEcho reports a combat-log entry made by one of the player's
+// illusions while the real hero is alive (v4.7.3): Bane's scepter illusions
+// repeat every Fiend's Grip, Manta illusions toggle Split Shot, Chaos Knight's
+// toggle the Armlet — not the player's input. A dead hero's illusion (Vengeful
+// Spirit's scepter) is the player's hands until the respawn, so it still counts.
+func (s *ParserState) illusionEcho(m *dota.CMsgDOTACombatLogEntry, playerIdx int) bool {
+	return m.GetIsAttackerIllusion() && s.LifePrev[playerIdx] == 0
+}
+
 // v4.6.0 internal records.
 type posSample struct{ T, X, Y float64 }
 
@@ -2038,7 +2047,7 @@ func main() {
 			attackerName := state.LookupName(m.GetAttackerName())
 			abilityName := state.LookupName(m.GetInflictorName())
 			attackerIdx := heroNameToPlayerIndex(attackerName, state)
-			if attackerIdx >= 0 && attackerIdx < 10 && abilityName != "" {
+			if attackerIdx >= 0 && attackerIdx < 10 && abilityName != "" && !state.illusionEcho(m, attackerIdx) {
 				state.Players[attackerIdx].AbilityCasts[abilityName]++
 				// v4.4.0: timestamped cast timeline. Toggles are excluded —
 				// armlet/treads-style spam would drown the real casts.
@@ -2223,7 +2232,7 @@ func main() {
 			heroName := state.LookupName(m.GetAttackerName())
 			itemName := state.LookupName(m.GetInflictorName())
 			playerIdx := heroNameToPlayerIndex(heroName, state)
-			if playerIdx >= 0 && playerIdx < 10 && itemName != "" {
+			if playerIdx >= 0 && playerIdx < 10 && itemName != "" && !state.illusionEcho(m, playerIdx) {
 				if state.Players[playerIdx].ItemUsage == nil {
 					state.Players[playerIdx].ItemUsage = make(map[string]int)
 				}
