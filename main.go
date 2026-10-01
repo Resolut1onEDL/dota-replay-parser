@@ -18,7 +18,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.7.3"
+const parserVersion = "4.7.4"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -893,6 +893,7 @@ type PlayerState struct {
 	Denies          int
 	Gold            int
 	NetWorth        int
+	TotalEarnedGold int // v4.7.4: team-data m_iTotalEarnedGold, frozen at the game's end
 	XP              int
 	Level           int
 	HeroDamage      int
@@ -2727,12 +2728,18 @@ func main() {
 				if xp, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iTotalEarnedXP", i)); ok && xp > 0 {
 					ps.XP = int(xp) // Override combat log XP with entity value
 				}
-				
+				gameOver := state.GameEndTime > 0 && state.GameTime() > state.GameEndTime
+				// v4.7.4: the source of Valve's gold_per_min. Frozen at the game's end:
+				// the replay's post-game tail keeps adding income to some players
+				// (+1000 gold for five of them in match 9023007039).
+				if g, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iTotalEarnedGold", i)); ok && g > 0 && !gameOver {
+					ps.TotalEarnedGold = int(g)
+				}
+
 				// Record per-minute snapshot (only after GameStartTime is known
 				// and before game-end). LastMinute starts at -1 so the first
 				// snapshot fires at gameMinute=0 (horn), aligning ours[i] with
 				// OpenDota's *_t[i] at minute i.
-				gameOver := state.GameEndTime > 0 && state.GameTime() > state.GameEndTime
 				if gameMinute > ps.LastMinute && state.GameStartTime > 0 && !gameOver {
 					ps.MinuteSnapshots = append(ps.MinuteSnapshots, MinuteSnapshot{
 						Gold:   ps.Gold,
@@ -3651,6 +3658,19 @@ func detectTeamfights(state *ParserState) []Teamfight {
 	return teamfights
 }
 
+// finalGPM is Valve's gold_per_min (v4.7.4): total earned gold at the game's end
+// over the minutes since the horn — equal to OpenDota's on every player of four
+// real matches (22–70 min). A replay without the team-data field falls back to
+// the net-worth proxy, which undercounts long games: gold lost on deaths, spent on
+// buybacks and consumables and sold items is not in net worth (−29% at 70 min).
+func finalGPM(totalEarnedGold, netWorth int, duration float64) int {
+	gold := totalEarnedGold
+	if gold <= 0 {
+		gold = netWorth
+	}
+	return int(float64(gold) / (duration / 60.0))
+}
+
 func buildMatchOutput(state *ParserState, duration float64) Match {
 	players := make([]Player, 10)
 
@@ -3750,15 +3770,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		gpm := 0
 		xpm := 0
 		if duration > 0 {
-			// gpm uses NetWorth/minutes as a proxy. The "true" total-gold-
-			// earned isn't available without reconstructing from combat log
-			// gold events with reason filtering — matching OpenDota's
-			// gold_per_min exactly would require reverse-engineering their
-			// reason allowlist. Currently within ~10% of OpenDota; consumers
-			// that need higher precision should compute from `goldPerMinute[]`
-			// (cumulative current cash) or pull gold_per_min from OpenDota
-			// directly. See deriveGpm() in src/lib/games.ts (Next.js).
-			gpm = int(float64(ps.NetWorth) / (duration / 60.0))
+			gpm = finalGPM(ps.TotalEarnedGold, ps.NetWorth, duration)
 			xpm = int(float64(ps.XP) / (duration / 60.0))
 		}
 
