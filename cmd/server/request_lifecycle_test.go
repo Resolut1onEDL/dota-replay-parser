@@ -16,6 +16,13 @@ import (
 	"time"
 )
 
+// lifecycleWait only guards against a hung test: passing runs never wait it
+// out. The fakes block for far longer (the parser sleeps 30s, downloads wait
+// for cleanup), so finishing inside it still proves the cancel stopped them.
+// A 1s start / 250ms stop budget failed under CPU load (macOS took >1s to
+// start the fake parser script) with the server behaving correctly.
+const lifecycleWait = 10 * time.Second
+
 type lifecycleTransport func(*http.Request) (*http.Response, error)
 
 func (f lifecycleTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
@@ -93,7 +100,7 @@ func TestConcurrentMatchIsNotDownloadedTwice(t *testing.T) {
 	t.Cleanup(func() { close(release); <-done })
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(lifecycleWait):
 		t.Fatal("first download did not start")
 	}
 	w := httptest.NewRecorder()
@@ -126,7 +133,7 @@ func TestDownloadStopsWhenRequestIsCancelled(t *testing.T) {
 			t.Cleanup(func() { close(release); <-done })
 			select {
 			case <-started:
-			case <-time.After(time.Second):
+			case <-time.After(lifecycleWait):
 				t.Fatal("download did not start")
 			}
 			cancel()
@@ -135,7 +142,7 @@ func TestDownloadStopsWhenRequestIsCancelled(t *testing.T) {
 				if len(sem) != 0 {
 					t.Fatal("cancelled download retained its slot")
 				}
-			case <-time.After(250 * time.Millisecond):
+			case <-time.After(lifecycleWait):
 				t.Fatal("download kept running after the client cancelled")
 			}
 		})
@@ -169,10 +176,15 @@ func TestParserStopsWhenRequestIsCancelled(t *testing.T) {
 		}
 		<-done
 	})
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(lifecycleWait)
 	for {
 		if _, err := os.Stat(marker); err == nil {
 			break
+		}
+		select {
+		case <-done:
+			t.Fatal("handler returned before the parser process started")
+		default:
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("parser process did not start")
@@ -192,7 +204,7 @@ func TestParserStopsWhenRequestIsCancelled(t *testing.T) {
 		if _, err := os.Stat(strings.TrimSpace(string(data))); !os.IsNotExist(err) {
 			t.Fatalf("cancelled parser left its temporary replay: %v", err)
 		}
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(lifecycleWait):
 		t.Fatal("parser kept running after the client cancelled")
 	}
 }
