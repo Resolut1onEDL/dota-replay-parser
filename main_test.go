@@ -322,54 +322,25 @@ func TestFinalizeWard(t *testing.T) {
 	})
 }
 
-// assignPositions must ALWAYS emit a clean 1..5 permutation per team — the
-// bucket-per-lane version it replaced could not: a safe-lane trilane produced
-// 1+5+5 and no pos-4 (live case: match 8919464063, Dire [5,1,3,5,2] — the
-// roaming four and the hard five both labelled 5).
-func TestAssignPositionsTrilanePermutation(t *testing.T) {
-	mkPlayer := func(radiant bool, nwAtAnchor int) *PlayerState {
-		ps := &PlayerState{IsRadiant: radiant, NetWorth: nwAtAnchor * 2}
-		// 30 minutes of snapshots, linear growth to nwAtAnchor*2 at the end.
-		for m := 1; m <= 30; m++ {
-			ps.MinuteSnapshots = append(ps.MinuteSnapshots, MinuteSnapshot{NW: nwAtAnchor * 2 * m / 30})
+// rolePlayer builds a PlayerState with the fields assignPositions reads:
+// last hits at minute 10 and over the match, wards placed, final net worth.
+func rolePlayer(radiant bool, lh10, lh, wards, nw int) *PlayerState {
+	ps := &PlayerState{HeroID: 1, IsRadiant: radiant, LastHits: lh, NetWorth: nw}
+	for m := 1; m <= 30; m++ {
+		cur := lh10 * m / 10
+		if m > 10 {
+			cur = lh10 + (lh-lh10)*(m-10)/20
 		}
-		return ps
+		ps.MinuteSnapshots = append(ps.MinuteSnapshots, MinuteSnapshot{LH: cur})
 	}
-	state := &ParserState{}
-	// Dire mirrors Даня's game: trilane on safe (rich Lifestealer, roaming
-	// Pudge, poor Lion), SF mid, Rubick alone on off.
-	state.Players[0] = mkPlayer(false, 12000) // Lifestealer, safe
-	state.Players[1] = mkPlayer(false, 5000)  // Pudge, safe (roams)
-	state.Players[2] = mkPlayer(false, 3500)  // Lion, safe
-	state.Players[3] = mkPlayer(false, 11000) // SF, mid
-	state.Players[4] = mkPlayer(false, 4800)  // Rubick, off solo
-	// Radiant: an ordinary 2-1-2.
-	state.Players[5] = mkPlayer(true, 13000) // carry, safe
-	state.Players[6] = mkPlayer(true, 4000)  // hard support, safe
-	state.Players[7] = mkPlayer(true, 11500) // mid
-	state.Players[8] = mkPlayer(true, 9000)  // offlaner
-	state.Players[9] = mkPlayer(true, 5500)  // soft support, off
+	for w := 0; w < wards; w++ {
+		ps.Wards = append(ps.Wards, WardEvent{Time: float64(60 * (w + 1))})
+	}
+	return ps
+}
 
-	lanes := map[int]string{
-		0: "safe", 1: "safe", 2: "safe", 3: "mid", 4: "off",
-		5: "safe", 6: "safe", 7: "mid", 8: "off", 9: "off",
-	}
-	pos := assignPositions(state, lanes)
-
-	want := map[int]int{
-		0: 1, // richest of the trilane → carry
-		3: 2,
-		4: 3, // alone on off → offlaner (Даня: «меня провозгласили тройкой»)
-		1: 4, // richer leftover → the roaming four
-		2: 5,
-		5: 1, 6: 5, 7: 2, 8: 3, 9: 4,
-	}
-	for idx, p := range want {
-		if pos[idx] != p {
-			t.Errorf("player %d: got pos %d, want %d", idx, pos[idx], p)
-		}
-	}
-	// The invariant itself, both teams.
+func checkPermutation(t *testing.T, pos map[int]int) {
+	t.Helper()
 	for _, team := range [][]int{{0, 1, 2, 3, 4}, {5, 6, 7, 8, 9}} {
 		seen := map[int]bool{}
 		for _, idx := range team {
@@ -380,6 +351,122 @@ func TestAssignPositionsTrilanePermutation(t *testing.T) {
 				t.Errorf("team %v: slot %d missing — not a permutation: %v", team, s, pos)
 			}
 		}
+	}
+}
+
+// assignPositions must ALWAYS emit a clean 1..5 permutation per team — the
+// bucket-per-lane version before 4.6 could not: a safe-lane trilane produced
+// 1+5+5 and no pos-4 (live case: match 8919464063, Dire [5,1,3,5,2] — the
+// roaming four and the hard five both labelled 5).
+func TestAssignPositionsTrilanePermutation(t *testing.T) {
+	state := &ParserState{}
+	// Dire mirrors Даня's game: trilane on safe (farming Lifestealer, roaming
+	// Pudge, warding Lion), SF mid, Rubick alone on off and farming it.
+	state.Players[0] = rolePlayer(false, 55, 300, 0, 24000) // Lifestealer, safe
+	state.Players[1] = rolePlayer(false, 8, 60, 6, 10000)   // Pudge, safe (roams)
+	state.Players[2] = rolePlayer(false, 4, 40, 25, 7000)   // Lion, safe
+	state.Players[3] = rolePlayer(false, 60, 280, 1, 22000) // SF, mid
+	state.Players[4] = rolePlayer(false, 30, 150, 2, 9600)  // Rubick, off solo
+	// Radiant: an ordinary 2-1-2.
+	state.Players[5] = rolePlayer(true, 60, 320, 0, 26000) // carry, safe
+	state.Players[6] = rolePlayer(true, 5, 40, 30, 8000)   // hard support, safe
+	state.Players[7] = rolePlayer(true, 55, 260, 2, 23000) // mid
+	state.Players[8] = rolePlayer(true, 40, 200, 0, 18000) // offlaner
+	state.Players[9] = rolePlayer(true, 10, 70, 15, 11000) // soft support, off
+
+	lanes := map[int]string{
+		0: "safe", 1: "safe", 2: "safe", 3: "mid", 4: "off",
+		5: "safe", 6: "safe", 7: "mid", 8: "off", 9: "off",
+	}
+	pos := assignPositions(state, lanes, 1800)
+
+	want := map[int]int{
+		0: 1, // the farmer of the trilane → carry
+		3: 2,
+		4: 3, // alone on off and farming it → offlaner
+		1: 4, // two supports in one lane: the one who farmed more is the four
+		2: 5,
+		5: 1, 6: 5, 7: 2, 8: 3, 9: 4,
+	}
+	for idx, p := range want {
+		if pos[idx] != p {
+			t.Errorf("player %d: got pos %d, want %d", idx, pos[idx], p)
+		}
+	}
+	checkPermutation(t, pos)
+}
+
+// v4.7.5 regression, match 9029043679 (real numbers). The 4.7.4 rule let a
+// lane's net worth at mid-game pick its core: Zeus out-earned the Io carry by
+// kills and became pos 1 with Io pos 4; Dire's lone warding Lion became the
+// carry and the farming Monkey King (lane "jungle") the leftover pos 4.
+func TestAssignPositionsLastHitsBeatKillGold(t *testing.T) {
+	state := &ParserState{}
+	// lh10, lh, wards (max of placed and bought), final net worth
+	state.Players[0] = rolePlayer(true, 39, 213, 3, 13109)   // Sniper, mid
+	state.Players[1] = rolePlayer(true, 42, 100, 0, 9069)    // Magnus, off
+	state.Players[2] = rolePlayer(true, 3, 148, 26, 12663)   // Earthshaker, off
+	state.Players[3] = rolePlayer(true, 21, 167, 5, 11820)   // Io, safe
+	state.Players[4] = rolePlayer(true, 9, 97, 22, 12984)    // Zeus, safe
+	state.Players[5] = rolePlayer(false, 52, 268, 0, 25448)  // Monkey King, jungle
+	state.Players[6] = rolePlayer(false, 38, 290, 3, 25549)  // Nature's Prophet, off
+	state.Players[7] = rolePlayer(false, 2, 62, 38, 11600)   // Shadow Shaman, off
+	state.Players[8] = rolePlayer(false, 6, 42, 34, 11083)   // Lion, safe
+	state.Players[9] = rolePlayer(false, 33, 158, 1, 16813)  // Primal Beast, mid
+	lanes := map[int]string{
+		0: "mid", 1: "off", 2: "off", 3: "safe", 4: "safe",
+		5: "jungle", 6: "off", 7: "off", 8: "safe", 9: "mid",
+	}
+	pos := assignPositions(state, lanes, 2069)
+	want := map[int]int{
+		0: 2, 1: 3, 2: 4, 3: 1, 4: 5,
+		5: 1, 6: 3, 7: 4, 8: 5, 9: 2,
+	}
+	for idx, p := range want {
+		if pos[idx] != p {
+			t.Errorf("player %d: got pos %d, want %d", idx, pos[idx], p)
+		}
+	}
+	checkPermutation(t, pos)
+}
+
+// A ward BUYER counts as a support even when the placements were dropped
+// (wards placed by a teammate after a drop are credited to the placer).
+func TestAssignPositionsCountsWardPurchases(t *testing.T) {
+	state := &ParserState{}
+	for i := 0; i < 10; i++ {
+		state.Players[i] = rolePlayer(i < 5, 30, 150, 0, 15000-i*100)
+	}
+	// Radiant: player 4 farmed like a core but bought 30 wards.
+	for w := 0; w < 30; w++ {
+		state.Players[4].ItemPurchases = append(state.Players[4].ItemPurchases, ItemPurchase{ItemName: "item_ward_observer"})
+	}
+	state.Players[3] = rolePlayer(true, 5, 30, 0, 6000)
+	lanes := map[int]string{0: "safe", 1: "mid", 2: "off", 3: "off", 4: "safe", 5: "safe", 6: "mid", 7: "off", 8: "off", 9: "safe"}
+	pos := assignPositions(state, lanes, 1800)
+	if pos[4] < 4 {
+		t.Errorf("ward buyer: got pos %d, want a support slot", pos[4])
+	}
+	checkPermutation(t, pos)
+}
+
+// A 1v1 (live case 8999975429: KotL vs Ember, eight empty slots) must not
+// hand the empty slots positions past 5 — they belong to no team.
+func TestAssignPositionsOneVsOne(t *testing.T) {
+	state := &ParserState{}
+	for i := 0; i < 10; i++ {
+		state.Players[i] = &PlayerState{IsRadiant: false} // empty slot, HeroID 0
+	}
+	state.Players[0] = rolePlayer(true, 71, 201, 2, 14452)
+	state.Players[5] = rolePlayer(false, 8, 10, 1, 2637)
+	pos := assignPositions(state, map[int]string{0: "mid", 5: "mid"}, 1260)
+	for i, p := range pos {
+		if p < 1 || p > 5 {
+			t.Errorf("player %d: position %d outside 1..5", i, p)
+		}
+	}
+	if pos[0] != 1 || pos[5] != 1 {
+		t.Errorf("the two heroes: got %d/%d, want 1/1", pos[0], pos[5])
 	}
 }
 
@@ -905,17 +992,17 @@ func TestHgZones(t *testing.T) {
 }
 
 // Dead lanes (parser gaps, heavy smokes) must still yield a permutation —
-// farm rank, crude but never a duplicate.
+// the farm split alone, crude but never a duplicate.
 func TestAssignPositionsDeadLanesPermutation(t *testing.T) {
 	state := &ParserState{}
 	for i := 0; i < 10; i++ {
-		state.Players[i] = &PlayerState{IsRadiant: i < 5, NetWorth: 1000 * (i + 1)}
+		state.Players[i] = &PlayerState{HeroID: i + 1, IsRadiant: i < 5, NetWorth: 1000 * (i + 1)}
 	}
 	lanes := map[int]string{}
 	for i := 0; i < 10; i++ {
 		lanes[i] = "unknown"
 	}
-	pos := assignPositions(state, lanes)
+	pos := assignPositions(state, lanes, 1800)
 	for _, team := range [][]int{{0, 1, 2, 3, 4}, {5, 6, 7, 8, 9}} {
 		seen := map[int]bool{}
 		for _, idx := range team {
@@ -1028,6 +1115,46 @@ func TestDetectSmokeRoutes(t *testing.T) {
 			if r0.Path[i].T-r0.Path[i-1].T < 1.8 {
 				t.Fatalf("path not thinned: dt=%v at %d", r0.Path[i].T-r0.Path[i-1].T, i)
 			}
+		}
+	})
+
+	// v4.8.1: the smoke both teams press on their way out of the base, before the creeps. Its life is on the
+	// negative side of the clock, where "EndTime > 0" used to mean "no end was found" — and where
+	// PosHistory had no samples at all, so the event came out without an activation point.
+	t.Run("a smoke pressed before the horn keeps its point, its route and its end", func(t *testing.T) {
+		s := &ParserState{}
+		s.Players[0] = &PlayerState{IsRadiant: true}
+		s.Players[1] = &PlayerState{IsRadiant: true}
+		for i := 0; i <= 90; i++ { // the pregame: out of the fountain, towards the lanes
+			tm := -90.0 + float64(i)
+			s.PosHistory[0] = append(s.PosHistory[0], posSample{T: tm, X: 70 + float64(i)/3, Y: 70 + float64(i)/3})
+			s.PosHistory[1] = append(s.PosHistory[1], posSample{T: tm, X: 72 + float64(i)/3, Y: 68 + float64(i)/3})
+		}
+		s.SmokeModifierAdds = []SmokeModifierAdd{{Time: -73, PlayerIdx: 0}, {Time: -72.5, PlayerIdx: 1}}
+		s.SmokeModifierRemoves = []SmokeModifierAdd{{Time: -40, PlayerIdx: 0}, {Time: -38, PlayerIdx: 1}}
+		evs := detectSmokeEvents(s)
+		if len(evs) != 1 {
+			t.Fatalf("events = %d, want 1", len(evs))
+		}
+		ev := evs[0]
+		if ev.GameTime != -73 {
+			t.Errorf("gameTime = %v, want -73", ev.GameTime)
+		}
+		if ev.X == 0 || ev.Y == 0 {
+			t.Errorf("activation = (%v,%v), want a real point, not the missing one that hid the smoke", ev.X, ev.Y)
+		}
+		if ev.EndTime != -38 {
+			t.Errorf("event endTime = %v, want -38 (the last participant's, negative)", ev.EndTime)
+		}
+		r0 := ev.Routes[0]
+		if r0.EndTime != -40 || r0.EndX == 0 {
+			t.Errorf("route0 end = %v at (%v,%v), want -40 with a position", r0.EndTime, r0.EndX, r0.EndY)
+		}
+		if len(r0.Path) < 2 {
+			t.Fatalf("route0 path has %d points, want a walked route", len(r0.Path))
+		}
+		if last := r0.Path[len(r0.Path)-1]; last.T > -40 {
+			t.Errorf("path runs past the buff end: %v", last.T)
 		}
 	})
 
@@ -1182,16 +1309,16 @@ func TestSkillBuildOwnership(t *testing.T) {
 // 8665357419: Invoker's first point (exort, hero level 1) landed at 200s,
 // after quas at 79s. Once m_flGameStartTime arrives (286.4s raw) those early
 // entries must be rebased onto the game clock.
-func TestSetGameStartTimeRebasesPreStartSkillBuild(t *testing.T) {
+func TestPreHornRebaseKeepsFirstSkillPointPreHorn(t *testing.T) {
+	// Recorded while the horn was unknown: parked on the pregame epoch (raw 200.5 s).
 	s := &ParserState{}
 	s.Players[1] = &PlayerState{SkillBuild: []SkillLevelUp{
-		{Time: 200.5, AbilityName: "invoker_exort", Level: 1, HeroLevel: 1},
+		{Time: 200.5 - preHornEpoch, AbilityName: "invoker_exort", Level: 1, HeroLevel: 1},
 	}}
-
-	s.setGameStartTime(286.4)
+	s.rebasePreHorn(286.4)
+	s.GameStartTime = 286.4
 	s.Players[1].SkillBuild = append(s.Players[1].SkillBuild,
 		SkillLevelUp{Time: 79.4, AbilityName: "invoker_quas", Level: 1, HeroLevel: 2})
-	s.setGameStartTime(286.4) // repeated updates of the same value change nothing
 
 	got := filterSkillBuild(s.Players[1].SkillBuild)
 	if len(got) != 2 || got[0].AbilityName != "invoker_exort" || got[1].AbilityName != "invoker_quas" {
@@ -1202,8 +1329,5 @@ func TestSetGameStartTimeRebasesPreStartSkillBuild(t *testing.T) {
 	}
 	if got[1].Time != 79.4 {
 		t.Errorf("quas time = %v, want 79.4 (recorded after start, untouched)", got[1].Time)
-	}
-	if s.GameStartTime != 286.4 {
-		t.Errorf("GameStartTime = %v, want 286.4", s.GameStartTime)
 	}
 }

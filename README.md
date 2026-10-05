@@ -34,9 +34,45 @@ Stdout is the JSON output. Stderr carries progress logs. Exit code 0 = success.
   "teamfights":      [...]
   "roshanKills":     [...]
   ...
+  "damageSeconds":   [ { t, a, v, k, d } ]   // 4.9.0 wide export, see below
+  "controlEvents":   [ { t, p, a, m, ab, stun, slow, on } ]
   "parserVersion":   "<semver>"
 }
 ```
+
+### Wide export (4.9.0, `wide.go`)
+
+Raw timelines next to the aggregated counters, so a new metric over another
+window or another pair of heroes is a recompute on the stored JSON instead of
+a reparse of a `.dem` Valve deletes after ~14 days. Additive; no existing
+field changes meaning.
+
+- `damageSeconds` — damage to a real hero per game second: `a` attacker slot
+  (its illusions included) or −1 lane creep / −2 neutral / −3 building /
+  −4 other, `v` victim slot, `k` damage type (1 physical, 2 magical, 4 pure),
+  `d` sum. Hits on illusions are left out. Not named `combatSeconds`: the web
+  fight detector reserves that name for a hero→hero-only stream.
+- `controlEvents` — modifiers the combat log gives a stun or a slow duration,
+  applied to (`on`) and removed from (`!on`) a real hero.
+- `players[].stats.vitals` — `{hp, hpMax, mana, manaMax}`, one value per game
+  second from the horn (index = second).
+- `players[].stats.itemGains` — `[{t, item, n}]`: an item arriving on the hero
+  (a new item entity in the inventory, backpack or neutral slot, or more
+  charges on one held). Healing Lotuses (`item_famango`) arrive only this way.
+
+Size: ~3 MB JSON (~200 KB gzipped) for a 36-minute pub, about 4× 4.7.4.
+
+Cast flags: `abilityCastEvents[].isStolen` comes from the ability entity's
+`m_bStolen` (4.9.0) — Valve leaves the combat log's flag empty, so before
+4.9.0 it was always false. `isUltimate` is still always false: no entity field
+marks an ultimate, and the hero table it needs changes every patch — consumers
+take it from Valve's hero datafeed (ResoAI-web `src/lib/ultimates-static.json`).
+
+4.9.0 also carries what was developed in the web repo's vendored copy as
+"4.8.0–4.8.1": every pregame stamp (purchases, wards, smokes, casts, damage)
+is parked on an epoch and moved onto the game clock when
+`m_flGameStartTime` arrives (it subsumes the skill-build-only 4.7.2 fix), and
+hero positions are sampled before the horn too (smoke routes).
 
 ### Wall-clock alignment (e.g. voice transcripts → game events)
 

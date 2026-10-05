@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -18,7 +19,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.7.4"
+const parserVersion = "4.9.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -473,6 +474,10 @@ type PlayerStats struct {
 	// does not).
 	StackEvents      []StackEvent `json:"stackEvents,omitempty"`
 	TotalDeadTimeSec float64      `json:"totalDeadTimeSec"`
+
+	// v4.9.0 wide export (wide.go): HP/mana per second and items arriving on the hero.
+	Vitals    *Vitals    `json:"vitals,omitempty"`
+	ItemGains []ItemGain `json:"itemGains,omitempty"`
 }
 
 type Player struct {
@@ -561,6 +566,9 @@ type Match struct {
 	PositionSamples []PositionSample `json:"positionSamples,omitempty"`
 	SmokeEvents     []SmokeEvent     `json:"smokeEvents,omitempty"` // v4: group smoke detection
 	CampBlocks      []CampBlock      `json:"campBlocks,omitempty"`  // v4.6.0: laning camp-block war
+	// v4.9.0 wide export (wide.go): damage to heroes per second, control modifiers on heroes.
+	DamageSeconds  []DamageSecond  `json:"damageSeconds,omitempty"`
+	ControlEvents  []ControlEvent  `json:"controlEvents,omitempty"`
 
 	Players []Player `json:"players"`
 	
@@ -894,6 +902,7 @@ type PlayerState struct {
 	Gold            int
 	NetWorth        int
 	TotalEarnedGold int // v4.7.4: team-data m_iTotalEarnedGold, frozen at the game's end
+	Wide            wideTrack // v4.9.0: vitals and item gains (wide.go)
 	XP              int
 	Level           int
 	HeroDamage      int
@@ -1014,6 +1023,12 @@ type PlayerState struct {
 type ParserState struct {
 	Parser       *manta.Parser
 	Players      [10]*PlayerState
+	DamageHits   []damageHit     // v4.9.0: every damage entry on a real hero → combatSeconds
+	ModEvents    []ControlEvent // v4.9.0: control modifiers on real heroes
+	modActive    map[string]int  // "slot|modifier" → applications not yet removed
+	// v4.9.0: the spells each player holds stolen right now (Rubick), by their combat-log name —
+	// from the ability entities' m_bStolen, since Valve leaves the combat log's flag empty.
+	stolenNow [10]map[string]bool
 	WardEvents   []WardEvent
 	KillEvents   []KillEvent
 	MatchID      int64
@@ -1401,30 +1416,101 @@ func (s *ParserState) GameMinute() int {
 	return int(s.GameTime() / 60.0)
 }
 
+// v4.8.0: the pregame parking epoch. m_flGameStartTime — the only place the
+// horn is written down — stays 0 until the horn itself, so while the pregame
+// runs there is no clock to put an event on. Before 4.8.0 ActualGameSeconds
+// fell back to the RAW server clock, which on a real demo (8989163978) filed
+// the entire starting shop — branches, tangoes, the first sentry — at
+// 730-737s, i.e. minute 12 of the game, and buried every pregame smoke in the
+// same place. Pregame stamps are now parked far below any real value and
+// rebased onto the game clock the moment the horn becomes known; anything
+// still down there is unmistakably a pregame stamp, since game clocks live in
+// ±10⁴ and map cells in ±10³.
+const (
+	preHornEpoch = 1000000.0
+	preHornBand  = -900000.0
+)
+
 // ActualGameSeconds converts raw server time to game clock (0 = horn, negative = pregame)
 func (s *ParserState) ActualGameSeconds(rawTime float64) float64 {
 	if s.GameStartTime > 0 {
 		return rawTime - s.GameStartTime
 	}
-	return rawTime
+	return rawTime - preHornEpoch
 }
 
-// setGameStartTime stores m_flGameStartTime. It arrives only at the horn;
-// skill points taken before it (the first point is usually pre-horn) were
-// timed while GameStartTime was 0, i.e. in raw server seconds — rebase them
-// onto the game clock so they read as pre-horn instead of minutes in.
-func (s *ParserState) setGameStartTime(t float64) {
-	if s.GameStartTime == 0 && t > 0 {
-		for _, ps := range s.Players {
-			if ps == nil {
-				continue
-			}
-			for i := range ps.SkillBuild {
-				ps.SkillBuild[i].Time -= t
-			}
+// rebasePreHorn moves every parked pregame stamp onto the game clock (0 =
+// horn). It runs once, at the instant m_flGameStartTime first arrives: by
+// definition nothing recorded before that instant is post-horn, so the whole
+// state can be swept in one go. The sweep is reflective on purpose — pregame
+// stamps land in a dozen different slices (purchases, wards, smokes, runes,
+// pauses…) and a hand-written list of them would rot silently as new ones are
+// added. Only values inside the parking band are touched, so cells, gold and
+// net worth are never at risk.
+func (s *ParserState) rebasePreHorn(gameStart float64) int {
+	delta := preHornEpoch - gameStart
+	n := rebaseBand(reflect.ValueOf(s).Elem(), delta, 0)
+	// Unexported fields are invisible to reflection; the two that can carry a
+	// pregame stamp are handled by hand.
+	for _, w := range s.ActiveWards {
+		if w != nil && w.start <= preHornBand {
+			w.start += delta
+			n++
 		}
 	}
-	s.GameStartTime = t
+	for i := range s.PendingDewards {
+		if s.PendingDewards[i].t <= preHornBand {
+			s.PendingDewards[i].t += delta
+			n++
+		}
+	}
+	return n
+}
+
+func rebaseBand(v reflect.Value, delta float64, depth int) int {
+	if depth > 16 {
+		return 0
+	}
+	n := 0
+	switch v.Kind() {
+	case reflect.Float64, reflect.Float32:
+		if v.CanSet() && v.Float() <= preHornBand {
+			v.SetFloat(v.Float() + delta)
+			n++
+		}
+	case reflect.Pointer, reflect.Interface:
+		if !v.IsNil() {
+			n += rebaseBand(v.Elem(), delta, depth+1)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			n += rebaseBand(v.Index(i), delta, depth+1)
+		}
+	case reflect.Map:
+		for _, k := range v.MapKeys() {
+			ev := v.MapIndex(k)
+			if ev.Kind() == reflect.Pointer || ev.Kind() == reflect.Interface {
+				n += rebaseBand(ev, delta, depth+1)
+				continue
+			}
+			cp := reflect.New(ev.Type()).Elem()
+			cp.Set(ev)
+			if got := rebaseBand(cp, delta, depth+1); got > 0 {
+				v.SetMapIndex(k, cp)
+				n += got
+			}
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Type().Field(i)
+			// Parser is the live manta reader, not data — never walk into it.
+			if f.PkgPath != "" || f.Name == "Parser" {
+				continue
+			}
+			n += rebaseBand(v.Field(i), delta, depth+1)
+		}
+	}
+	return n
 }
 
 // isWardDeward сообщает, что смерть варда — это снос врагом (а не естественное
@@ -1556,6 +1642,16 @@ func hasBountyGoldNear(state *ParserState, time float64, playerIdx int) bool {
 
 // ============= MAIN PARSER =============
 
+// claudedashboard diagnostic state (CD_DEBUG_PREHORN): see the combat-log callback.
+var (
+	debugPreHorn     = os.Getenv("CD_DEBUG_PREHORN") != ""
+	preHornSeen      int
+	preHornNegative  int
+	preHornMinRaw    = math.Inf(1)
+	preHornMinActual = math.Inf(1)
+	preHornRulesDump bool
+)
+
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--version" {
 		fmt.Println(parserVersion)
@@ -1567,12 +1663,18 @@ func main() {
 
 	replayPath := os.Args[1]
 	log.Printf("Parsing replay: %s", replayPath)
+	if debugPreHorn {
+		defer func() {
+			fmt.Fprintf(os.Stderr, "[prehorn] summary: entries=%d negative=%d minRaw=%.2f minActual=%.2f\n", preHornSeen, preHornNegative, preHornMinRaw, preHornMinActual)
+		}()
+	}
 
-	f, err := os.Open(replayPath)
+	// claudedashboard: sniff bzip2 / zstd / raw (parser/input.go)
+	f, closeInput, err := openDemo(replayPath)
 	if err != nil {
 		log.Fatalf("Failed to open replay: %v", err)
 	}
-	defer f.Close()
+	defer closeInput()
 
 	p, err := manta.NewStreamParser(f)
 	if err != nil {
@@ -1660,6 +1762,28 @@ func main() {
 		gameTime := float64(m.GetTimestamp())
 		actualTime := state.ActualGameSeconds(gameTime) // 0 = horn
 		logType := m.GetType()
+
+		// claudedashboard diagnostic (CD_DEBUG_PREHORN=1): the parsed output holds no event before the horn —
+		// no starting purchases, no wards, no smokes (159 maps checked). This records what the combat log
+		// actually delivers so the cause can be seen on a real .dem: the first entries, their raw timestamps,
+		// and whether GameStartTime was known at that moment.
+		if debugPreHorn {
+			preHornSeen++
+			if preHornSeen <= 12 || (gameTime < 0 && preHornNegative < 12) {
+				if gameTime < 0 {
+					preHornNegative++
+				}
+				fmt.Fprintf(os.Stderr, "[prehorn] #%d type=%v raw=%.2f actual=%.2f gameStart=%.2f target=%q value=%q\n",
+					preHornSeen, logType, gameTime, actualTime, state.GameStartTime,
+					state.LookupName(m.GetTargetName()), state.LookupName(m.GetValue()))
+			}
+			if gameTime < preHornMinRaw {
+				preHornMinRaw = gameTime
+			}
+			if actualTime < preHornMinActual {
+				preHornMinActual = actualTime
+			}
+		}
 
 		// HornTick: first combat-log event at or after horn (game-clock >= 0)
 		// once GameStartTime is known. Combat-log entries arrive every server
@@ -1909,6 +2033,7 @@ func main() {
 			targetName := state.LookupName(m.GetTargetName())
 			damage := int(m.GetValue())
 			damageType := m.GetDamageType()
+			state.recordDamage(m, actualTime, attackerName, targetName, damage, damageType)
 
 			if strings.Contains(targetName, "hero") && strings.Contains(attackerName, "hero") {
 				attackerIdx := heroNameToPlayerIndex(attackerName, state)
@@ -2058,7 +2183,7 @@ func main() {
 						Time:       actualTime,
 						Ability:    abilityName,
 						IsUltimate: m.GetIsUltimateAbility(),
-						IsStolen:   m.GetInflictorIsStolenAbility(),
+						IsStolen:   m.GetInflictorIsStolenAbility() || state.stolenNow[attackerIdx][abilityName],
 					}
 					targetName := state.LookupName(m.GetTargetName())
 					if strings.Contains(targetName, "hero") && !m.GetIsTargetIllusion() {
@@ -2076,6 +2201,7 @@ func main() {
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_MODIFIER_ADD:
 			targetName := state.LookupName(m.GetTargetName())
 			modifierName := state.LookupName(m.GetInflictorName())
+			state.recordModifier(m, actualTime, true)
 
 			// Track stun duration dealt (from modifier events, not damage)
 			stunDur := float64(m.GetStunDuration())
@@ -2156,6 +2282,7 @@ func main() {
 			// v4.7.0: the end of each hero's smoke. Expiry, proximity reveal
 			// and death all fire the same REMOVE — kept raw, disambiguated by
 			// the web layer.
+			state.recordModifier(m, actualTime, false)
 			targetName := state.LookupName(m.GetTargetName())
 			modifierName := state.LookupName(m.GetInflictorName())
 			if modifierName == "modifier_smoke_of_deceit" && strings.Contains(targetName, "hero") {
@@ -2391,7 +2518,13 @@ func main() {
 									state.RealPos[playerIdx] = [2]float64{float64(cellX), float64(cellY)}
 								}
 								cgt := gt + state.EntityAxisOffset
-								if state.GameStartTime > 0 && cgt >= 0 && cellX > 0 && cellY > 0 {
+								// v4.8.1: the pregame is sampled too. A smoke clicked before the
+								// horn had no activation point and no route without it — the
+								// point comes from PosHistory, and PosHistory started at the
+								// horn. Pregame stamps are parked (cgt ≈ −10⁶) and rebased with
+								// everything else when the horn arrives; the consumers that must
+								// not see them are all bounded by a time window.
+								if (state.GameStartTime == 0 || cgt >= 0) && cellX > 0 && cellY > 0 {
 									hs := state.PosHistory[playerIdx]
 									if len(hs) == 0 || cgt-hs[len(hs)-1].T >= 0.9 {
 										state.PosHistory[playerIdx] = append(hs,
@@ -2415,6 +2548,7 @@ func main() {
 									}
 									state.LifePrev[playerIdx] = lsv
 								}
+								state.sampleWide(e, state.Players[playerIdx], state.entityActual())
 							}
 						}
 					}
@@ -2474,6 +2608,7 @@ func main() {
 					if repl, okR := e.GetUint32("m_hReplicatingOtherHeroModel"); okR && repl != 16777215 {
 						isIllusion = true
 					}
+					stolenNames := map[string]bool{}
 					for ai := 0; ai < 24 && !isIllusion; ai++ {
 						key := fmt.Sprintf("m_vecAbilities.%04d", ai)
 						if handle, ok := e.GetUint32(key); ok && handle > 0 && handle < 16777215 {
@@ -2517,7 +2652,17 @@ func main() {
 							// Rubick's stolen spells sit in his own slots, flagged m_bStolen.
 							stolen, _ := abEnt.GetBool("m_bStolen")
 							state.observeHeroAbility(playerIdx, entityIdx, abilityName, abilityLevel, stolen, actualGameTime)
+							// v4.9.0: the combat log names a cast by the ability's entity name
+							// (lina_laguna_blade), not by its class (lina_lagunablade).
+							if nameIdx, okN := abEnt.GetInt32("m_pEntity.m_nameStringTableIndex"); stolen && okN && nameIdx >= 0 {
+								if entName, okT := state.Parser.LookupStringByIndex("EntityNames", nameIdx); okT {
+									stolenNames[entName] = true
+								}
+							}
 						}
+					}
+					if !isIllusion {
+						state.stolenNow[playerIdx] = stolenNames
 					}
 				}
 			}
@@ -2601,6 +2746,22 @@ func main() {
 
 		// Track game rules
 		if className == "CDOTAGamerulesProxy" {
+			// claudedashboard diagnostic (CD_DEBUG_PREHORN=1): which clock
+			// fields the gamerules entity actually exposes in this schema, so
+			// a future version can tell whether the horn is knowable during
+			// the pregame (m_flStateTransitionTime / m_flPreGameStartTime)
+			// instead of parking stamps on the epoch.
+			if debugPreHorn && !preHornRulesDump {
+				preHornRulesDump = true
+				keys := make([]string, 0, 16)
+				for k, v := range e.Map() {
+					if strings.Contains(k, "Time") || strings.Contains(k, "State") || strings.Contains(k, "PreGame") {
+						keys = append(keys, fmt.Sprintf("%s=%v", k, v))
+					}
+				}
+				sort.Strings(keys)
+				fmt.Fprintf(os.Stderr, "[prehorn] gamerules clock fields: %s\n", strings.Join(keys, " "))
+			}
 			if gameWinner, ok := e.GetInt32("m_pGameRules.m_nGameWinner"); ok {
 				state.RadiantWin = gameWinner == 2
 			}
@@ -2609,7 +2770,24 @@ func main() {
 			}
 			// Track game start/end times for duration calculation
 			if startTime, ok := e.GetFloat32("m_pGameRules.m_flGameStartTime"); ok {
-				state.setGameStartTime(float64(startTime))
+				if st := float64(startTime); st > 0 {
+					// v4.8.0: the horn just became knowable. Everything
+					// recorded so far is pregame and parked on the epoch —
+					// move it onto the game clock before anything else reads
+					// it. Zero is ignored rather than assigned: the field is
+					// 0 for the whole pregame, and re-entering pregame mode
+					// after the horn would park live events.
+					if state.GameStartTime == 0 {
+						state.GameStartTime = st
+						moved := state.rebasePreHorn(st)
+						if debugPreHorn {
+							fmt.Fprintf(os.Stderr, "[prehorn] horn known: m_flGameStartTime=%.2f tick=%d entityClock=%.2f rebased=%d stamps\n",
+								st, p.NetTick, state.GameTime(), moved)
+						}
+					} else {
+						state.GameStartTime = st
+					}
+				}
 			}
 			// HornTick is set from the combat-log callback (see below) on the
 			// first event with actualTime >= 0. m_pGameRules.m_iGameState is
@@ -2633,8 +2811,13 @@ func main() {
 				if paused && !state.PauseActive {
 					state.PauseActive = true
 					state.PauseStartTick = p.NetTick
-					if state.GameStartTime > 0 && state.TickInterval > 0 {
-						state.PauseStartGameSec = float64(p.NetTick)*float64(state.TickInterval) - state.GameStartTime
+					// v4.8.0: identical to the old formula once the horn is
+					// known; before it, the stamp parks on the epoch and is
+					// rebased with everything else (a pregame pause used to
+					// be filed at game-time 0 — match 8989163978 had a 14s
+					// one 30s before the horn).
+					if state.TickInterval > 0 {
+						state.PauseStartGameSec = state.ActualGameSeconds(float64(p.NetTick) * float64(state.TickInterval))
 					} else {
 						state.PauseStartGameSec = 0
 					}
@@ -3161,10 +3344,10 @@ func laneZoneToLane(zone string, isRadiant bool) string {
 // lane qualifies.
 //
 // This feeds laneStats.lane — the coach's prose, the laning report and the
-// lane grade — and deliberately NOT role assignment: roles derive from the
-// mean-based map, which matches the human-approved camp standard except on
-// the rows the human overrode by hand. A roaming four who genuinely stood a
-// lane keeps her ROLE; she just stops being told she «играл(а) лес».
+// lane grade — and, since v4.7.5, role assignment. Core vs support no longer
+// depends on the lane at all (last hits and wards decide it), so a roaming
+// four who genuinely stood a lane stays a support; the lane only names her
+// slot (off → 4, safe → 5), the same way the web does from laneStats.lane.
 func detectErasedLane(positions []struct{ X, Y float64 }, isRadiant bool) string {
 	if len(positions) < 100 {
 		return ""
@@ -3239,142 +3422,213 @@ func detectLanePartner(state *ParserState, playerIdx int) int {
 	return bestPartner
 }
 
+// wardItems mark the buyer as the team's vision support.
+var wardItems = map[string]bool{
+	"item_ward_observer":  true,
+	"item_ward_sentry":    true,
+	"item_ward_dispenser": true,
+}
+
 // assignPositions classifies each player to a Dota position 1-5 — and ALWAYS
 // emits a clean permutation of 1..5 per team.
 //
-// This is a port of the web/camp engine's deriveMatchPositions (ResoAI-web
-// src/lib/odb/positions.ts), validated on the ODB S3 camp corpus. The previous
-// bucket-per-lane version assigned lanes independently and could not keep the
-// permutation invariant: a safe-lane trilane emitted 1+5+5 and no pos-4 at all
-// (live case: match 8919464063, Dire [5,1,3,5,2] — a roaming pos-4 Pudge and a
-// hard-5 Lion both labelled 5). Downstream consumers treat position as a role
-// and a duplicate silently breaks their rubrics.
+// v4.7.5 — the same rule as the web coach (ResoAI-web src/lib/engine/rating.ts
+// deriveTeamRoles), so the parser and the web agree on the same replay.
 //
-// Algorithm (lane-first, farm fills the gaps):
-//  1. If >=4 of a team's lanes are known: the farm-richest player of each core
-//     lane takes that core slot (mid → 2, safe → 1, off → 3). EVERYONE else —
-//     second safe-laners, junglers, roamers, unknowns — is ranked by farm
-//     priority and fills the remaining free slots, richer to the lower number.
-//     That split is exactly "stood the lane and farmed → core, stood the lane
-//     and didn't → support", and the leftover ranking is what separates the
-//     roaming 4 from the hard 5.
-//  2. Lanes dead (smoked lanes, parser gaps): farm-priority rank 1..5 — crude,
-//     but still a permutation.
+// Regression (match 9029043679, reported): the previous version let a lane's
+// NET WORTH at mid-game pick its core, and a support's kill gold beat a slow
+// carry's farm — a safe-lane Io carry (167 last hits, 2 wards) came out pos 4
+// and the Zeus beside him (97 last hits, 15 wards) pos 1; a lone safe-lane
+// Lion with 18 wards became Dire's carry and a 25k Monkey King tagged
+// "jungle" the leftover pos 4.
 //
-// Farm priority is networth at the MIDDLE of the match (duration/2 clamped to
-// [15,30] minutes): the final total lies about greedy roamers, the 10-minute
-// snapshot lies about slow-starting carries. Same anchor as the web engine so
-// parser and web derivation agree on the same replay.
+// Algorithm:
+//  1. Core score = last hits at 10 minutes and over the match, each as a share
+//     of the team's best, averaged, minus 0.4 × min(1, wards / minute) — wards
+//     placed or bought, whichever is larger. Kill gold no longer counts.
+//  2. The three best are cores — except that a lone mid-laner who did less
+//     than a quarter of the team's warding is always a core.
+//  3. Lanes name the slots: mid core → 2, safe core → 1, off core → 3;
+//     leftover cores take the free core slots, the farmer first.
+//  4. Supports: the one who stood the safe lane is 5, the off-lane one 4; when
+//     lanes don't tell them apart, the one who farmed more is 4.
+//
+// lanes must be the EXPORTED lanes (laneStats.lane) — the web re-derives from
+// those, so anything else lets the two disagree.
 //
 // Returns map[playerIdx]position.
-func assignPositions(state *ParserState, lanes map[int]string) map[int]int {
-	// Anchor from the snapshot series length (≈ match minutes) — the caller's
-	// duration isn't in scope and the series is what farmPriority reads anyway.
-	matchMinutes := 0
-	for i := 0; i < 10; i++ {
-		if n := len(state.Players[i].MinuteSnapshots); n > matchMinutes {
-			matchMinutes = n
-		}
+func assignPositions(state *ParserState, lanes map[int]string, duration float64) map[int]int {
+	minutes := float64(int(duration)) / 60
+	if minutes < 10 {
+		minutes = 10
 	}
-	anchor := (matchMinutes + 1) / 2
-	if anchor < 15 {
-		anchor = 15
-	}
-	if anchor > 30 {
-		anchor = 30
-	}
-
-	// Source order mirrors the web engine: nw@anchor → nw@10 → cs@10 → total
-	// (scales kept apart so a better source always outranks a worse one).
-	farmPriority := func(ps *PlayerState) float64 {
-		total := float64(ps.NetWorth) / 100_000
-		if len(ps.MinuteSnapshots) >= anchor {
-			return float64(ps.MinuteSnapshots[anchor-1].NW)*1_000 + total
-		}
-		if ps.NWAt10 > 0 {
-			return float64(ps.NWAt10)*1_000 + total
-		}
+	lh10 := func(ps *PlayerState) float64 {
+		// MinuteSnapshots[9] is lastHitsPerMinute[9] in the JSON.
 		if len(ps.MinuteSnapshots) >= 10 {
-			return float64(ps.MinuteSnapshots[9].LH)*100 + total
+			return float64(ps.MinuteSnapshots[9].LH)
 		}
-		return total
+		return 0
+	}
+	wards := func(ps *PlayerState) float64 {
+		bought := 0
+		for _, it := range ps.ItemPurchases {
+			if wardItems[it.ItemName] {
+				bought++
+			}
+		}
+		if len(ps.Wards) > bought {
+			return float64(len(ps.Wards))
+		}
+		return float64(bought)
 	}
 
 	pos := make(map[int]int, 10)
 	for _, side := range []bool{true, false} {
 		var team []int
 		for i := 0; i < 10; i++ {
-			if state.Players[i].IsRadiant == side {
+			// Empty slots (HeroID 0 — a 1v1 or a lobby with gaps) are no one's
+			// teammate; they fall back to the caller's default.
+			if state.Players[i].IsRadiant == side && state.Players[i].HeroID > 0 {
 				team = append(team, i)
 			}
 		}
-		assigned := make(map[int]int, 5) // playerIdx → position
+		if len(team) != 5 {
+			// Not a 5-player side: rank by last hits, never past slot 5.
+			sort.SliceStable(team, func(a, b int) bool {
+				return state.Players[team[a]].LastHits > state.Players[team[b]].LastHits
+			})
+			for k, i := range team {
+				p := k + 1
+				if p > 5 {
+					p = 5
+				}
+				pos[i] = p
+			}
+			continue
+		}
 
-		known := 0
+		maxLh10, maxLh := 1.0, 1.0
+		teamWards := 0.0
 		for _, i := range team {
-			if l := lanes[i]; l != "" && l != "unknown" {
-				known++
+			ps := state.Players[i]
+			if v := lh10(ps); v > maxLh10 {
+				maxLh10 = v
 			}
+			if v := float64(ps.LastHits); v > maxLh {
+				maxLh = v
+			}
+			teamWards += wards(ps)
+		}
+		score := make(map[int]float64, 5)
+		for _, i := range team {
+			ps := state.Players[i]
+			penalty := wards(ps) / minutes
+			if penalty > 1 {
+				penalty = 1
+			}
+			score[i] = (lh10(ps)/maxLh10+float64(ps.LastHits)/maxLh)/2 - 0.4*penalty
+		}
+		farmerFirst := func(list []int) {
+			sort.SliceStable(list, func(a, b int) bool {
+				sa, sb := score[list[a]], score[list[b]]
+				if sa != sb {
+					return sa > sb
+				}
+				return state.Players[list[a]].NetWorth > state.Players[list[b]].NetWorth
+			})
 		}
 
-		if known >= 4 {
-			// Farm-richest unassigned player of a lane takes its core slot.
-			claim := func(lane string, slot int) {
-				best, bestFP := -1, 0.0
-				for _, i := range team {
-					if _, taken := assigned[i]; taken {
-						continue
-					}
-					if lanes[i] != lane {
-						continue
-					}
-					if fp := farmPriority(state.Players[i]); best < 0 || fp > bestFP {
-						best, bestFP = i, fp
-					}
-				}
-				if best >= 0 {
-					assigned[best] = slot
-				}
+		soloMid := -1
+		var mids []int
+		for _, i := range team {
+			if lanes[i] == "mid" {
+				mids = append(mids, i)
 			}
-			claim("mid", 2)
-			claim("safe", 1)
-			claim("off", 3)
-
-			var left []int
-			for _, i := range team {
-				if _, taken := assigned[i]; !taken {
-					left = append(left, i)
-				}
+		}
+		if len(mids) == 1 && (teamWards < 5 || wards(state.Players[mids[0]]) < 0.25*teamWards) {
+			soloMid = mids[0]
+		}
+		var ranked []int
+		for _, i := range team {
+			if i != soloMid {
+				ranked = append(ranked, i)
 			}
-			sort.Slice(left, func(a, b int) bool {
-				return farmPriority(state.Players[left[a]]) > farmPriority(state.Players[left[b]])
-			})
-			used := make(map[int]bool, 5)
-			for _, p := range assigned {
-				used[p] = true
-			}
-			var free []int
-			for s := 1; s <= 5; s++ {
-				if !used[s] {
-					free = append(free, s)
-				}
-			}
-			for k, i := range left {
-				if k < len(free) {
-					assigned[i] = free[k]
-				} else {
-					assigned[i] = 4 // unreachable with 5 players; belt and braces
-				}
-			}
+		}
+		farmerFirst(ranked)
+		var cores []int
+		if soloMid >= 0 {
+			cores = append([]int{soloMid}, ranked[:2]...)
 		} else {
-			ranked := append([]int(nil), team...)
-			sort.Slice(ranked, func(a, b int) bool {
-				return farmPriority(state.Players[ranked[a]]) > farmPriority(state.Players[ranked[b]])
-			})
-			for r, i := range ranked {
-				assigned[i] = r + 1
+			cores = append([]int(nil), ranked[:3]...)
+		}
+		isCore := make(map[int]bool, 3)
+		for _, i := range cores {
+			isCore[i] = true
+		}
+		var supports []int
+		for _, i := range team {
+			if !isCore[i] {
+				supports = append(supports, i)
 			}
 		}
+		farmerFirst(supports)
+		farmerFirst(cores)
+
+		assigned := make(map[int]int, 5)
+		used := make(map[int]bool, 5)
+		for _, ls := range []struct {
+			lane string
+			slot int
+		}{{"mid", 2}, {"safe", 1}, {"off", 3}} {
+			for _, i := range cores {
+				if _, taken := assigned[i]; !taken && lanes[i] == ls.lane {
+					assigned[i] = ls.slot
+					used[ls.slot] = true
+					break
+				}
+			}
+		}
+		var free []int
+		for s := 1; s <= 3; s++ {
+			if !used[s] {
+				free = append(free, s)
+			}
+		}
+		k := 0
+		for _, i := range cores {
+			if _, taken := assigned[i]; !taken {
+				assigned[i] = free[k]
+				k++
+			}
+		}
+
+		richer, poorer := supports[0], supports[1]
+		var inSafe, inOff []int
+		for _, i := range supports {
+			switch lanes[i] {
+			case "safe":
+				inSafe = append(inSafe, i)
+			case "off":
+				inOff = append(inOff, i)
+			}
+		}
+		five := poorer
+		if len(inSafe) == 1 {
+			five = inSafe[0]
+		} else if len(inOff) == 1 {
+			if inOff[0] == richer {
+				five = poorer
+			} else {
+				five = richer
+			}
+		}
+		assigned[five] = 5
+		if five == richer {
+			assigned[poorer] = 4
+		} else {
+			assigned[richer] = 4
+		}
+
 		for i, p := range assigned {
 			pos[i] = p
 		}
@@ -3672,6 +3926,15 @@ func finalGPM(totalEarnedGold, netWorth int, duration float64) int {
 }
 
 func buildMatchOutput(state *ParserState, duration float64) Match {
+	// v4.8.0 safety net: a demo whose m_flGameStartTime never arrives (cut
+	// short, corrupt, or a lobby that never started) leaves pregame stamps
+	// parked on the epoch. There is no game clock to put them on, so they go
+	// back to the raw server clock — exactly what every parser before 4.8.0
+	// emitted for them.
+	if state.GameStartTime <= 0 {
+		state.rebasePreHorn(0)
+	}
+
 	players := make([]Player, 10)
 
 	// Three-pass build: pass 1 classifies lane per player (geometry),
@@ -3705,12 +3968,9 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			lanes[i] = other
 		}
 	}
-	positions := assignPositions(state, lanes)
-
 	// Reporting lanes: restore lanes the mean erased for zoned laners
-	// (detectErasedLane). Applied AFTER role assignment on purpose — roles
-	// keep deriving from the mean-based map that matches the approved camp
-	// standard; only what the coach SAYS about the lane changes.
+	// (detectErasedLane), so the coach doesn't tell a zoned laner he «played
+	// jungle». Since v4.7.5 roles derive from these exported lanes too.
 	reportLanes := make(map[int]string, 10)
 	for i := 0; i < 10; i++ {
 		reportLanes[i] = lanes[i]
@@ -3720,6 +3980,9 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			}
 		}
 	}
+	// The web re-derives roles from the same laneStats.lane, so the two can't
+	// disagree.
+	positions := assignPositions(state, reportLanes, duration)
 
 	// v4.6.0: pulls, laning stun combos, enemy-highground episodes, stacks,
 	// camp-block war, measured dead time.
@@ -3906,6 +4169,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			HgEntries:      hgEntries[i],
 			HgEntriesCount: len(hgEntries[i]),
 			StackEvents:    stackEvents[i],
+			Vitals:         ps.Wide.vitals(int(duration)),
+			ItemGains:      ps.Wide.ItemGains,
 			CreepKills: CreepKillPhases{
 				LaneCreepsPre10:    ps.LaneCreepsPre10,
 				LaneCreeps10to25:   ps.LaneCreeps10to25,
@@ -4034,6 +4299,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		PositionSamples:        state.PositionSamples,
 		SmokeEvents:            detectSmokeEvents(state),
 		CampBlocks:             campBlocks,
+		DamageSeconds:          damageSeconds(state.DamageHits),
+		ControlEvents:          state.ModEvents,
 		Players:                players,
 		ParsedFromReplay:       true,
 		ParserVersion:          parserVersion,
@@ -4180,16 +4447,21 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 		const routeStepSec = 1.8     // thin PosHistory (~1/s) to keep JSON sane
 		var sumX, sumY float64
 		var nPos int
+		anyEnd := false
 		for _, idx := range parts {
 			r := SmokeRoute{Idx: idx}
+			// v4.8.1: found, not "> 0" — a smoke pressed before the horn ends at a negative
+			// game time, and 0 is the horn itself, a perfectly ordinary moment.
+			hasEnd := false
 			for _, rm := range removes {
 				if rm.PlayerIdx == idx && rm.Time > c.startTime && rm.Time <= c.startTime+removeCapSec {
 					r.EndTime = rm.Time
+					hasEnd = true
 					break
 				}
 			}
 			pathEnd := c.startTime + routeCapSec
-			if r.EndTime > 0 {
+			if hasEnd {
 				pathEnd = r.EndTime
 			}
 			lastT := math.Inf(-1)
@@ -4203,7 +4475,7 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 				lastT = ps.T
 				r.Path = append(r.Path, PathPoint{T: ps.T, X: ps.X, Y: ps.Y})
 			}
-			if r.EndTime > 0 {
+			if hasEnd {
 				if ex, ey, ok := posAtFresh(state.PosHistory[idx], r.EndTime, 5.0); ok {
 					r.EndX = ex
 					r.EndY = ey
@@ -4214,8 +4486,9 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 				sumY += ay
 				nPos++
 			}
-			if r.EndTime > ev.EndTime {
+			if hasEnd && (!anyEnd || r.EndTime > ev.EndTime) {
 				ev.EndTime = r.EndTime
+				anyEnd = true
 			}
 			ev.Routes = append(ev.Routes, r)
 		}
