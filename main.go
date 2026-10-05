@@ -1026,6 +1026,9 @@ type ParserState struct {
 	DamageHits   []damageHit     // v4.9.0: every damage entry on a real hero → combatSeconds
 	ModEvents    []ControlEvent // v4.9.0: control modifiers on real heroes
 	modActive    map[string]int  // "slot|modifier" → applications not yet removed
+	// v4.9.0: the spells each player holds stolen right now (Rubick), by their combat-log name —
+	// from the ability entities' m_bStolen, since Valve leaves the combat log's flag empty.
+	stolenNow [10]map[string]bool
 	WardEvents   []WardEvent
 	KillEvents   []KillEvent
 	MatchID      int64
@@ -2180,7 +2183,7 @@ func main() {
 						Time:       actualTime,
 						Ability:    abilityName,
 						IsUltimate: m.GetIsUltimateAbility(),
-						IsStolen:   m.GetInflictorIsStolenAbility(),
+						IsStolen:   m.GetInflictorIsStolenAbility() || state.stolenNow[attackerIdx][abilityName],
 					}
 					targetName := state.LookupName(m.GetTargetName())
 					if strings.Contains(targetName, "hero") && !m.GetIsTargetIllusion() {
@@ -2605,6 +2608,7 @@ func main() {
 					if repl, okR := e.GetUint32("m_hReplicatingOtherHeroModel"); okR && repl != 16777215 {
 						isIllusion = true
 					}
+					stolenNames := map[string]bool{}
 					for ai := 0; ai < 24 && !isIllusion; ai++ {
 						key := fmt.Sprintf("m_vecAbilities.%04d", ai)
 						if handle, ok := e.GetUint32(key); ok && handle > 0 && handle < 16777215 {
@@ -2648,7 +2652,17 @@ func main() {
 							// Rubick's stolen spells sit in his own slots, flagged m_bStolen.
 							stolen, _ := abEnt.GetBool("m_bStolen")
 							state.observeHeroAbility(playerIdx, entityIdx, abilityName, abilityLevel, stolen, actualGameTime)
+							// v4.9.0: the combat log names a cast by the ability's entity name
+							// (lina_laguna_blade), not by its class (lina_lagunablade).
+							if nameIdx, okN := abEnt.GetInt32("m_pEntity.m_nameStringTableIndex"); stolen && okN && nameIdx >= 0 {
+								if entName, okT := state.Parser.LookupStringByIndex("EntityNames", nameIdx); okT {
+									stolenNames[entName] = true
+								}
+							}
 						}
+					}
+					if !isIllusion {
+						state.stolenNow[playerIdx] = stolenNames
 					}
 				}
 			}

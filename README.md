@@ -62,6 +62,12 @@ field changes meaning.
 
 Size: ~3 MB JSON (~200 KB gzipped) for a 36-minute pub, about 4× 4.7.4.
 
+Cast flags: `abilityCastEvents[].isStolen` comes from the ability entity's
+`m_bStolen` (4.9.0) — Valve leaves the combat log's flag empty, so before
+4.9.0 it was always false. `isUltimate` is still always false: no entity field
+marks an ultimate, and the hero table it needs changes every patch — consumers
+take it from Valve's hero datafeed (ResoAI-web `src/lib/ultimates-static.json`).
+
 4.9.0 also carries what was developed in the web repo's vendored copy as
 "4.8.0–4.8.1": every pregame stamp (purchases, wards, smokes, casts, damage)
 is parked on an epoch and moved onto the game clock when
