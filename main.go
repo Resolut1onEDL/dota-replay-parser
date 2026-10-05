@@ -4061,12 +4061,22 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 				Count:       count,
 			})
 		}
+		// Map iteration is random: most casts first, ties by name, so the
+		// same demo always yields the same array.
+		sort.Slice(abilityCasts, func(a, b int) bool {
+			if abilityCasts[a].Count != abilityCasts[b].Count {
+				return abilityCasts[a].Count > abilityCasts[b].Count
+			}
+			return abilityCasts[a].AbilityName < abilityCasts[b].AbilityName
+		})
 
 		// Build damage report
 		var damageReport []DamageTarget
 		for _, dmg := range ps.DamageByTarget {
 			damageReport = append(damageReport, *dmg)
 		}
+		// Target slot order — map iteration is random.
+		sort.Slice(damageReport, func(a, b int) bool { return damageReport[a].Target < damageReport[b].Target })
 
 		// Build item usage report (map → sorted slice)
 		var itemUsed []ItemUsed
@@ -4077,7 +4087,13 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 				Count:    count,
 			})
 		}
-		sort.Slice(itemUsed, func(a, b int) bool { return itemUsed[a].Count > itemUsed[b].Count })
+		// Ties by name — equal counts came out in random map order.
+		sort.Slice(itemUsed, func(a, b int) bool {
+			if itemUsed[a].Count != itemUsed[b].Count {
+				return itemUsed[a].Count > itemUsed[b].Count
+			}
+			return itemUsed[a].ItemName < itemUsed[b].ItemName
+		})
 
 		// Build damage received report
 		var damageReceivedReport *DamageReceivedReport
@@ -4591,14 +4607,24 @@ func detectPulls(state *ParserState) [10][]PullEvent {
 	}
 
 	type pullEpisode struct {
-		player  int
-		ev      PullEvent
-		t0, t1  float64
-		campIdx int
+		player     int
+		ev         PullEvent
+		t0, t1     float64
+		campIdx    int
+		engagedRad bool // the wave whose creeps ev.CreepsDied counts
 	}
 	var episodes []pullEpisode
 
-	for ci, runsBySide := range state.CampWaveRuns {
+	// Sorted camp order — map iteration is random, and two episodes with
+	// the same poke (a camp's Radiant and Dire runs) then reached the merge
+	// below in a different order on each run of the same demo.
+	campIdxs := make([]int, 0, len(state.CampWaveRuns))
+	for ci := range state.CampWaveRuns {
+		campIdxs = append(campIdxs, ci)
+	}
+	sort.Ints(campIdxs)
+	for _, ci := range campIdxs {
+		runsBySide := state.CampWaveRuns[ci]
 		if ci >= len(state.CampSpawners) {
 			continue
 		}
@@ -4673,7 +4699,7 @@ func detectPulls(state *ParserState) [10][]PullEvent {
 						CreepsDied:    creepsDiedIn(engagedSide, r.T0, r.T1),
 						OntoEnemyWave: onto,
 					},
-					t0: r.T0, t1: r.T1, campIdx: ci,
+					t0: r.T0, t1: r.T1, campIdx: ci, engagedRad: engagedSide,
 				})
 			}
 		}
@@ -4682,18 +4708,49 @@ func detectPulls(state *ParserState) [10][]PullEvent {
 	// One engagement at one camp = ONE pull: overlapping/adjacent windows
 	// (≤12s apart) collapse regardless of who else poked — the earliest
 	// poke keeps the attribution (episodes are pre-sorted by poke time).
-	sort.Slice(episodes, func(a, b int) bool { return episodes[a].ev.Time < episodes[b].ev.Time })
+	// Ties (one poke seeds a camp's Radiant AND Dire run) break by camp,
+	// then wave-run window, then player — an explicit total order, so the
+	// merge never depends on the unstable sort.
+	sort.SliceStable(episodes, func(a, b int) bool {
+		ea, eb := episodes[a], episodes[b]
+		if ea.ev.Time != eb.ev.Time {
+			return ea.ev.Time < eb.ev.Time
+		}
+		if ea.campIdx != eb.campIdx {
+			return ea.campIdx < eb.campIdx
+		}
+		if ea.t0 != eb.t0 {
+			return ea.t0 < eb.t0
+		}
+		if ea.t1 != eb.t1 {
+			return ea.t1 < eb.t1
+		}
+		return ea.player < eb.player
+	})
 	var merged []pullEpisode
 	for _, ep := range episodes {
 		dup := false
 		for k := range merged {
 			m := &merged[k]
-			if m.campIdx == ep.campIdx && ep.t0 <= m.t1+12 && m.t0 <= ep.t1+12 {
+			// The poke must land inside the earlier engagement too: a wave
+			// that idled at the camp before a NEW poke (camp cleared and
+			// respawned in between) only bridged the windows, and the later
+			// pull vanished into the earlier one (9006039853, SB 600.7).
+			if m.campIdx == ep.campIdx && ep.t0 <= m.t1+12 && m.t0 <= ep.t1+12 && ep.ev.Time <= m.t1+12 {
 				if ep.t1 > m.t1 {
 					m.t1 = ep.t1
 				}
 				if ep.ev.CreepsDied > m.ev.CreepsDied {
 					m.ev.CreepsDied = ep.ev.CreepsDied
+					// Same poke seen through the camp's other wave run: the
+					// direction names the wave the count is taken from — a
+					// wave walking past with no losses must not decide it
+					// (9016805053, Doom 498.2). Merges of different pokes
+					// keep the first poke's direction.
+					if ep.player == m.player && ep.ev.Time == m.ev.Time {
+						m.engagedRad = ep.engagedRad
+						m.ev.OntoEnemyWave = state.Players[m.player].IsRadiant != ep.engagedRad
+					}
 				}
 				dup = true
 				break
@@ -4813,7 +4870,7 @@ func detectPulls(state *ParserState) [10][]PullEvent {
 		})
 	}
 
-	sort.Slice(merged, func(a, b int) bool { return merged[a].ev.Time < merged[b].ev.Time })
+	sort.SliceStable(merged, func(a, b int) bool { return merged[a].ev.Time < merged[b].ev.Time })
 	for _, ep := range merged {
 		out[ep.player] = append(out[ep.player], ep.ev)
 	}
@@ -4858,11 +4915,18 @@ func campTiers(state *ParserState) []string {
 	}
 	tiers := make([]string, len(state.CampSpawners))
 	for i, v := range votes {
-		best, bestN := "", 0
+		best, bestN, tied := "", 0, false
 		for tier, n := range v {
 			if n > bestN {
-				best, bestN = tier, n
+				best, bestN, tied = tier, n, false
+			} else if n == bestN {
+				tied = true
 			}
+		}
+		// A tie leaves the tier unknown rather than whichever tier the
+		// random map iteration handed out first.
+		if tied {
+			best = ""
 		}
 		tiers[i] = best
 	}
