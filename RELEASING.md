@@ -12,6 +12,7 @@ because each channel was pinned/deployed at a different moment.
 | reso-coach-companion | Immortal players (local parse → upload) | binaries baked at build, pinned by `package.json parserVersion`, shipped via electron-updater |
 | gamerjournal-replay-uploader | legacy (sunset candidate) | same scheme as companion |
 | local `./parser` binary | GamerJournal MCP tools (`DOTA_PARSER_BIN`) | `go build` by hand |
+| ResoAI-web `parser/` | team dashboard + coaching students' dashboard (GitHub Actions build it from the web repo) | source copied from the tag by release-sync, committed in the web repo |
 
 ## The train
 

@@ -1031,6 +1031,46 @@ func TestDetectSmokeRoutes(t *testing.T) {
 		}
 	})
 
+	// v4.8.1: the smoke both teams press on their way out of the base, before the creeps. Its life is on the
+	// negative side of the clock, where "EndTime > 0" used to mean "no end was found" — and where
+	// PosHistory had no samples at all, so the event came out without an activation point.
+	t.Run("a smoke pressed before the horn keeps its point, its route and its end", func(t *testing.T) {
+		s := &ParserState{}
+		s.Players[0] = &PlayerState{IsRadiant: true}
+		s.Players[1] = &PlayerState{IsRadiant: true}
+		for i := 0; i <= 90; i++ { // the pregame: out of the fountain, towards the lanes
+			tm := -90.0 + float64(i)
+			s.PosHistory[0] = append(s.PosHistory[0], posSample{T: tm, X: 70 + float64(i)/3, Y: 70 + float64(i)/3})
+			s.PosHistory[1] = append(s.PosHistory[1], posSample{T: tm, X: 72 + float64(i)/3, Y: 68 + float64(i)/3})
+		}
+		s.SmokeModifierAdds = []SmokeModifierAdd{{Time: -73, PlayerIdx: 0}, {Time: -72.5, PlayerIdx: 1}}
+		s.SmokeModifierRemoves = []SmokeModifierAdd{{Time: -40, PlayerIdx: 0}, {Time: -38, PlayerIdx: 1}}
+		evs := detectSmokeEvents(s)
+		if len(evs) != 1 {
+			t.Fatalf("events = %d, want 1", len(evs))
+		}
+		ev := evs[0]
+		if ev.GameTime != -73 {
+			t.Errorf("gameTime = %v, want -73", ev.GameTime)
+		}
+		if ev.X == 0 || ev.Y == 0 {
+			t.Errorf("activation = (%v,%v), want a real point, not the missing one that hid the smoke", ev.X, ev.Y)
+		}
+		if ev.EndTime != -38 {
+			t.Errorf("event endTime = %v, want -38 (the last participant's, negative)", ev.EndTime)
+		}
+		r0 := ev.Routes[0]
+		if r0.EndTime != -40 || r0.EndX == 0 {
+			t.Errorf("route0 end = %v at (%v,%v), want -40 with a position", r0.EndTime, r0.EndX, r0.EndY)
+		}
+		if len(r0.Path) < 2 {
+			t.Fatalf("route0 path has %d points, want a walked route", len(r0.Path))
+		}
+		if last := r0.Path[len(r0.Path)-1]; last.T > -40 {
+			t.Errorf("path runs past the buff end: %v", last.T)
+		}
+	})
+
 	t.Run("no REMOVE found: path capped, no endTime", func(t *testing.T) {
 		s := mkState()
 		evs := detectSmokeEvents(s)
@@ -1182,16 +1222,16 @@ func TestSkillBuildOwnership(t *testing.T) {
 // 8665357419: Invoker's first point (exort, hero level 1) landed at 200s,
 // after quas at 79s. Once m_flGameStartTime arrives (286.4s raw) those early
 // entries must be rebased onto the game clock.
-func TestSetGameStartTimeRebasesPreStartSkillBuild(t *testing.T) {
+func TestPreHornRebaseKeepsFirstSkillPointPreHorn(t *testing.T) {
+	// Recorded while the horn was unknown: parked on the pregame epoch (raw 200.5 s).
 	s := &ParserState{}
 	s.Players[1] = &PlayerState{SkillBuild: []SkillLevelUp{
-		{Time: 200.5, AbilityName: "invoker_exort", Level: 1, HeroLevel: 1},
+		{Time: 200.5 - preHornEpoch, AbilityName: "invoker_exort", Level: 1, HeroLevel: 1},
 	}}
-
-	s.setGameStartTime(286.4)
+	s.rebasePreHorn(286.4)
+	s.GameStartTime = 286.4
 	s.Players[1].SkillBuild = append(s.Players[1].SkillBuild,
 		SkillLevelUp{Time: 79.4, AbilityName: "invoker_quas", Level: 1, HeroLevel: 2})
-	s.setGameStartTime(286.4) // repeated updates of the same value change nothing
 
 	got := filterSkillBuild(s.Players[1].SkillBuild)
 	if len(got) != 2 || got[0].AbilityName != "invoker_exort" || got[1].AbilityName != "invoker_quas" {
@@ -1202,8 +1242,5 @@ func TestSetGameStartTimeRebasesPreStartSkillBuild(t *testing.T) {
 	}
 	if got[1].Time != 79.4 {
 		t.Errorf("quas time = %v, want 79.4 (recorded after start, untouched)", got[1].Time)
-	}
-	if s.GameStartTime != 286.4 {
-		t.Errorf("GameStartTime = %v, want 286.4", s.GameStartTime)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -18,7 +19,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.7.4"
+const parserVersion = "4.9.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -473,6 +474,10 @@ type PlayerStats struct {
 	// does not).
 	StackEvents      []StackEvent `json:"stackEvents,omitempty"`
 	TotalDeadTimeSec float64      `json:"totalDeadTimeSec"`
+
+	// v4.9.0 wide export (wide.go): HP/mana per second and items arriving on the hero.
+	Vitals    *Vitals    `json:"vitals,omitempty"`
+	ItemGains []ItemGain `json:"itemGains,omitempty"`
 }
 
 type Player struct {
@@ -561,6 +566,9 @@ type Match struct {
 	PositionSamples []PositionSample `json:"positionSamples,omitempty"`
 	SmokeEvents     []SmokeEvent     `json:"smokeEvents,omitempty"` // v4: group smoke detection
 	CampBlocks      []CampBlock      `json:"campBlocks,omitempty"`  // v4.6.0: laning camp-block war
+	// v4.9.0 wide export (wide.go): damage to heroes per second, control modifiers on heroes.
+	DamageSeconds  []DamageSecond  `json:"damageSeconds,omitempty"`
+	ControlEvents  []ControlEvent  `json:"controlEvents,omitempty"`
 
 	Players []Player `json:"players"`
 	
@@ -894,6 +902,7 @@ type PlayerState struct {
 	Gold            int
 	NetWorth        int
 	TotalEarnedGold int // v4.7.4: team-data m_iTotalEarnedGold, frozen at the game's end
+	Wide            wideTrack // v4.9.0: vitals and item gains (wide.go)
 	XP              int
 	Level           int
 	HeroDamage      int
@@ -1014,6 +1023,9 @@ type PlayerState struct {
 type ParserState struct {
 	Parser       *manta.Parser
 	Players      [10]*PlayerState
+	DamageHits   []damageHit     // v4.9.0: every damage entry on a real hero → combatSeconds
+	ModEvents    []ControlEvent // v4.9.0: control modifiers on real heroes
+	modActive    map[string]int  // "slot|modifier" → applications not yet removed
 	WardEvents   []WardEvent
 	KillEvents   []KillEvent
 	MatchID      int64
@@ -1401,30 +1413,101 @@ func (s *ParserState) GameMinute() int {
 	return int(s.GameTime() / 60.0)
 }
 
+// v4.8.0: the pregame parking epoch. m_flGameStartTime — the only place the
+// horn is written down — stays 0 until the horn itself, so while the pregame
+// runs there is no clock to put an event on. Before 4.8.0 ActualGameSeconds
+// fell back to the RAW server clock, which on a real demo (8989163978) filed
+// the entire starting shop — branches, tangoes, the first sentry — at
+// 730-737s, i.e. minute 12 of the game, and buried every pregame smoke in the
+// same place. Pregame stamps are now parked far below any real value and
+// rebased onto the game clock the moment the horn becomes known; anything
+// still down there is unmistakably a pregame stamp, since game clocks live in
+// ±10⁴ and map cells in ±10³.
+const (
+	preHornEpoch = 1000000.0
+	preHornBand  = -900000.0
+)
+
 // ActualGameSeconds converts raw server time to game clock (0 = horn, negative = pregame)
 func (s *ParserState) ActualGameSeconds(rawTime float64) float64 {
 	if s.GameStartTime > 0 {
 		return rawTime - s.GameStartTime
 	}
-	return rawTime
+	return rawTime - preHornEpoch
 }
 
-// setGameStartTime stores m_flGameStartTime. It arrives only at the horn;
-// skill points taken before it (the first point is usually pre-horn) were
-// timed while GameStartTime was 0, i.e. in raw server seconds — rebase them
-// onto the game clock so they read as pre-horn instead of minutes in.
-func (s *ParserState) setGameStartTime(t float64) {
-	if s.GameStartTime == 0 && t > 0 {
-		for _, ps := range s.Players {
-			if ps == nil {
-				continue
-			}
-			for i := range ps.SkillBuild {
-				ps.SkillBuild[i].Time -= t
-			}
+// rebasePreHorn moves every parked pregame stamp onto the game clock (0 =
+// horn). It runs once, at the instant m_flGameStartTime first arrives: by
+// definition nothing recorded before that instant is post-horn, so the whole
+// state can be swept in one go. The sweep is reflective on purpose — pregame
+// stamps land in a dozen different slices (purchases, wards, smokes, runes,
+// pauses…) and a hand-written list of them would rot silently as new ones are
+// added. Only values inside the parking band are touched, so cells, gold and
+// net worth are never at risk.
+func (s *ParserState) rebasePreHorn(gameStart float64) int {
+	delta := preHornEpoch - gameStart
+	n := rebaseBand(reflect.ValueOf(s).Elem(), delta, 0)
+	// Unexported fields are invisible to reflection; the two that can carry a
+	// pregame stamp are handled by hand.
+	for _, w := range s.ActiveWards {
+		if w != nil && w.start <= preHornBand {
+			w.start += delta
+			n++
 		}
 	}
-	s.GameStartTime = t
+	for i := range s.PendingDewards {
+		if s.PendingDewards[i].t <= preHornBand {
+			s.PendingDewards[i].t += delta
+			n++
+		}
+	}
+	return n
+}
+
+func rebaseBand(v reflect.Value, delta float64, depth int) int {
+	if depth > 16 {
+		return 0
+	}
+	n := 0
+	switch v.Kind() {
+	case reflect.Float64, reflect.Float32:
+		if v.CanSet() && v.Float() <= preHornBand {
+			v.SetFloat(v.Float() + delta)
+			n++
+		}
+	case reflect.Pointer, reflect.Interface:
+		if !v.IsNil() {
+			n += rebaseBand(v.Elem(), delta, depth+1)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			n += rebaseBand(v.Index(i), delta, depth+1)
+		}
+	case reflect.Map:
+		for _, k := range v.MapKeys() {
+			ev := v.MapIndex(k)
+			if ev.Kind() == reflect.Pointer || ev.Kind() == reflect.Interface {
+				n += rebaseBand(ev, delta, depth+1)
+				continue
+			}
+			cp := reflect.New(ev.Type()).Elem()
+			cp.Set(ev)
+			if got := rebaseBand(cp, delta, depth+1); got > 0 {
+				v.SetMapIndex(k, cp)
+				n += got
+			}
+		}
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Type().Field(i)
+			// Parser is the live manta reader, not data — never walk into it.
+			if f.PkgPath != "" || f.Name == "Parser" {
+				continue
+			}
+			n += rebaseBand(v.Field(i), delta, depth+1)
+		}
+	}
+	return n
 }
 
 // isWardDeward сообщает, что смерть варда — это снос врагом (а не естественное
@@ -1556,6 +1639,16 @@ func hasBountyGoldNear(state *ParserState, time float64, playerIdx int) bool {
 
 // ============= MAIN PARSER =============
 
+// claudedashboard diagnostic state (CD_DEBUG_PREHORN): see the combat-log callback.
+var (
+	debugPreHorn     = os.Getenv("CD_DEBUG_PREHORN") != ""
+	preHornSeen      int
+	preHornNegative  int
+	preHornMinRaw    = math.Inf(1)
+	preHornMinActual = math.Inf(1)
+	preHornRulesDump bool
+)
+
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--version" {
 		fmt.Println(parserVersion)
@@ -1567,12 +1660,18 @@ func main() {
 
 	replayPath := os.Args[1]
 	log.Printf("Parsing replay: %s", replayPath)
+	if debugPreHorn {
+		defer func() {
+			fmt.Fprintf(os.Stderr, "[prehorn] summary: entries=%d negative=%d minRaw=%.2f minActual=%.2f\n", preHornSeen, preHornNegative, preHornMinRaw, preHornMinActual)
+		}()
+	}
 
-	f, err := os.Open(replayPath)
+	// claudedashboard: sniff bzip2 / zstd / raw (parser/input.go)
+	f, closeInput, err := openDemo(replayPath)
 	if err != nil {
 		log.Fatalf("Failed to open replay: %v", err)
 	}
-	defer f.Close()
+	defer closeInput()
 
 	p, err := manta.NewStreamParser(f)
 	if err != nil {
@@ -1660,6 +1759,28 @@ func main() {
 		gameTime := float64(m.GetTimestamp())
 		actualTime := state.ActualGameSeconds(gameTime) // 0 = horn
 		logType := m.GetType()
+
+		// claudedashboard diagnostic (CD_DEBUG_PREHORN=1): the parsed output holds no event before the horn —
+		// no starting purchases, no wards, no smokes (159 maps checked). This records what the combat log
+		// actually delivers so the cause can be seen on a real .dem: the first entries, their raw timestamps,
+		// and whether GameStartTime was known at that moment.
+		if debugPreHorn {
+			preHornSeen++
+			if preHornSeen <= 12 || (gameTime < 0 && preHornNegative < 12) {
+				if gameTime < 0 {
+					preHornNegative++
+				}
+				fmt.Fprintf(os.Stderr, "[prehorn] #%d type=%v raw=%.2f actual=%.2f gameStart=%.2f target=%q value=%q\n",
+					preHornSeen, logType, gameTime, actualTime, state.GameStartTime,
+					state.LookupName(m.GetTargetName()), state.LookupName(m.GetValue()))
+			}
+			if gameTime < preHornMinRaw {
+				preHornMinRaw = gameTime
+			}
+			if actualTime < preHornMinActual {
+				preHornMinActual = actualTime
+			}
+		}
 
 		// HornTick: first combat-log event at or after horn (game-clock >= 0)
 		// once GameStartTime is known. Combat-log entries arrive every server
@@ -1909,6 +2030,7 @@ func main() {
 			targetName := state.LookupName(m.GetTargetName())
 			damage := int(m.GetValue())
 			damageType := m.GetDamageType()
+			state.recordDamage(m, actualTime, attackerName, targetName, damage, damageType)
 
 			if strings.Contains(targetName, "hero") && strings.Contains(attackerName, "hero") {
 				attackerIdx := heroNameToPlayerIndex(attackerName, state)
@@ -2076,6 +2198,7 @@ func main() {
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_MODIFIER_ADD:
 			targetName := state.LookupName(m.GetTargetName())
 			modifierName := state.LookupName(m.GetInflictorName())
+			state.recordModifier(m, actualTime, true)
 
 			// Track stun duration dealt (from modifier events, not damage)
 			stunDur := float64(m.GetStunDuration())
@@ -2156,6 +2279,7 @@ func main() {
 			// v4.7.0: the end of each hero's smoke. Expiry, proximity reveal
 			// and death all fire the same REMOVE — kept raw, disambiguated by
 			// the web layer.
+			state.recordModifier(m, actualTime, false)
 			targetName := state.LookupName(m.GetTargetName())
 			modifierName := state.LookupName(m.GetInflictorName())
 			if modifierName == "modifier_smoke_of_deceit" && strings.Contains(targetName, "hero") {
@@ -2391,7 +2515,13 @@ func main() {
 									state.RealPos[playerIdx] = [2]float64{float64(cellX), float64(cellY)}
 								}
 								cgt := gt + state.EntityAxisOffset
-								if state.GameStartTime > 0 && cgt >= 0 && cellX > 0 && cellY > 0 {
+								// v4.8.1: the pregame is sampled too. A smoke clicked before the
+								// horn had no activation point and no route without it — the
+								// point comes from PosHistory, and PosHistory started at the
+								// horn. Pregame stamps are parked (cgt ≈ −10⁶) and rebased with
+								// everything else when the horn arrives; the consumers that must
+								// not see them are all bounded by a time window.
+								if (state.GameStartTime == 0 || cgt >= 0) && cellX > 0 && cellY > 0 {
 									hs := state.PosHistory[playerIdx]
 									if len(hs) == 0 || cgt-hs[len(hs)-1].T >= 0.9 {
 										state.PosHistory[playerIdx] = append(hs,
@@ -2415,6 +2545,7 @@ func main() {
 									}
 									state.LifePrev[playerIdx] = lsv
 								}
+								state.sampleWide(e, state.Players[playerIdx], state.entityActual())
 							}
 						}
 					}
@@ -2601,6 +2732,22 @@ func main() {
 
 		// Track game rules
 		if className == "CDOTAGamerulesProxy" {
+			// claudedashboard diagnostic (CD_DEBUG_PREHORN=1): which clock
+			// fields the gamerules entity actually exposes in this schema, so
+			// a future version can tell whether the horn is knowable during
+			// the pregame (m_flStateTransitionTime / m_flPreGameStartTime)
+			// instead of parking stamps on the epoch.
+			if debugPreHorn && !preHornRulesDump {
+				preHornRulesDump = true
+				keys := make([]string, 0, 16)
+				for k, v := range e.Map() {
+					if strings.Contains(k, "Time") || strings.Contains(k, "State") || strings.Contains(k, "PreGame") {
+						keys = append(keys, fmt.Sprintf("%s=%v", k, v))
+					}
+				}
+				sort.Strings(keys)
+				fmt.Fprintf(os.Stderr, "[prehorn] gamerules clock fields: %s\n", strings.Join(keys, " "))
+			}
 			if gameWinner, ok := e.GetInt32("m_pGameRules.m_nGameWinner"); ok {
 				state.RadiantWin = gameWinner == 2
 			}
@@ -2609,7 +2756,24 @@ func main() {
 			}
 			// Track game start/end times for duration calculation
 			if startTime, ok := e.GetFloat32("m_pGameRules.m_flGameStartTime"); ok {
-				state.setGameStartTime(float64(startTime))
+				if st := float64(startTime); st > 0 {
+					// v4.8.0: the horn just became knowable. Everything
+					// recorded so far is pregame and parked on the epoch —
+					// move it onto the game clock before anything else reads
+					// it. Zero is ignored rather than assigned: the field is
+					// 0 for the whole pregame, and re-entering pregame mode
+					// after the horn would park live events.
+					if state.GameStartTime == 0 {
+						state.GameStartTime = st
+						moved := state.rebasePreHorn(st)
+						if debugPreHorn {
+							fmt.Fprintf(os.Stderr, "[prehorn] horn known: m_flGameStartTime=%.2f tick=%d entityClock=%.2f rebased=%d stamps\n",
+								st, p.NetTick, state.GameTime(), moved)
+						}
+					} else {
+						state.GameStartTime = st
+					}
+				}
 			}
 			// HornTick is set from the combat-log callback (see below) on the
 			// first event with actualTime >= 0. m_pGameRules.m_iGameState is
@@ -2633,8 +2797,13 @@ func main() {
 				if paused && !state.PauseActive {
 					state.PauseActive = true
 					state.PauseStartTick = p.NetTick
-					if state.GameStartTime > 0 && state.TickInterval > 0 {
-						state.PauseStartGameSec = float64(p.NetTick)*float64(state.TickInterval) - state.GameStartTime
+					// v4.8.0: identical to the old formula once the horn is
+					// known; before it, the stamp parks on the epoch and is
+					// rebased with everything else (a pregame pause used to
+					// be filed at game-time 0 — match 8989163978 had a 14s
+					// one 30s before the horn).
+					if state.TickInterval > 0 {
+						state.PauseStartGameSec = state.ActualGameSeconds(float64(p.NetTick) * float64(state.TickInterval))
 					} else {
 						state.PauseStartGameSec = 0
 					}
@@ -3672,6 +3841,15 @@ func finalGPM(totalEarnedGold, netWorth int, duration float64) int {
 }
 
 func buildMatchOutput(state *ParserState, duration float64) Match {
+	// v4.8.0 safety net: a demo whose m_flGameStartTime never arrives (cut
+	// short, corrupt, or a lobby that never started) leaves pregame stamps
+	// parked on the epoch. There is no game clock to put them on, so they go
+	// back to the raw server clock — exactly what every parser before 4.8.0
+	// emitted for them.
+	if state.GameStartTime <= 0 {
+		state.rebasePreHorn(0)
+	}
+
 	players := make([]Player, 10)
 
 	// Three-pass build: pass 1 classifies lane per player (geometry),
@@ -3906,6 +4084,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			HgEntries:      hgEntries[i],
 			HgEntriesCount: len(hgEntries[i]),
 			StackEvents:    stackEvents[i],
+			Vitals:         ps.Wide.vitals(int(duration)),
+			ItemGains:      ps.Wide.ItemGains,
 			CreepKills: CreepKillPhases{
 				LaneCreepsPre10:    ps.LaneCreepsPre10,
 				LaneCreeps10to25:   ps.LaneCreeps10to25,
@@ -4034,6 +4214,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		PositionSamples:        state.PositionSamples,
 		SmokeEvents:            detectSmokeEvents(state),
 		CampBlocks:             campBlocks,
+		DamageSeconds:          damageSeconds(state.DamageHits),
+		ControlEvents:          state.ModEvents,
 		Players:                players,
 		ParsedFromReplay:       true,
 		ParserVersion:          parserVersion,
@@ -4180,16 +4362,21 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 		const routeStepSec = 1.8     // thin PosHistory (~1/s) to keep JSON sane
 		var sumX, sumY float64
 		var nPos int
+		anyEnd := false
 		for _, idx := range parts {
 			r := SmokeRoute{Idx: idx}
+			// v4.8.1: found, not "> 0" — a smoke pressed before the horn ends at a negative
+			// game time, and 0 is the horn itself, a perfectly ordinary moment.
+			hasEnd := false
 			for _, rm := range removes {
 				if rm.PlayerIdx == idx && rm.Time > c.startTime && rm.Time <= c.startTime+removeCapSec {
 					r.EndTime = rm.Time
+					hasEnd = true
 					break
 				}
 			}
 			pathEnd := c.startTime + routeCapSec
-			if r.EndTime > 0 {
+			if hasEnd {
 				pathEnd = r.EndTime
 			}
 			lastT := math.Inf(-1)
@@ -4203,7 +4390,7 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 				lastT = ps.T
 				r.Path = append(r.Path, PathPoint{T: ps.T, X: ps.X, Y: ps.Y})
 			}
-			if r.EndTime > 0 {
+			if hasEnd {
 				if ex, ey, ok := posAtFresh(state.PosHistory[idx], r.EndTime, 5.0); ok {
 					r.EndX = ex
 					r.EndY = ey
@@ -4214,8 +4401,9 @@ func detectSmokeEvents(state *ParserState) []SmokeEvent {
 				sumY += ay
 				nPos++
 			}
-			if r.EndTime > ev.EndTime {
+			if hasEnd && (!anyEnd || r.EndTime > ev.EndTime) {
 				ev.EndTime = r.EndTime
+				anyEnd = true
 			}
 			ev.Routes = append(ev.Routes, r)
 		}

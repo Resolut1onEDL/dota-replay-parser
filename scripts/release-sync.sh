@@ -11,12 +11,13 @@
 #   3. reso-coach-companion pin + bin/                  — bumped + checksum
 #   4. gamerjournal-replay-uploader pin + bin/ (legacy) — bumped + checksum
 #   5. local GJ binary (DOTA_PARSER_BIN)                — rebuilt + --version
+#   6. ResoAI-web parser/ (dashboards' GitHub Actions)  — source copied + --version
 #
 # Steps that MUST stay human (release policy): creating the tag, and
 # publishing the companion/uploader releases (electron auto-update). The
 # script prints those commands instead of running them.
 #
-# Env overrides: PARSER_REPO, COMPANION_DIR, UPLOADER_DIR, PROJECTS_DIR.
+# Env overrides: PARSER_REPO, COMPANION_DIR, UPLOADER_DIR, WEB_DIR, PROJECTS_DIR.
 set -euo pipefail
 
 V="${1:-}"
@@ -28,6 +29,7 @@ PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
 PARSER_REPO="${PARSER_REPO:-$PROJECTS_DIR/dota-replay-parser}"
 COMPANION_DIR="${COMPANION_DIR:-$PROJECTS_DIR/reso-coach-companion}"
 UPLOADER_DIR="${UPLOADER_DIR:-$PROJECTS_DIR/gamerjournal-replay-uploader}"
+WEB_DIR="${WEB_DIR:-$PROJECTS_DIR/ResoAI-web}"
 REPO_SLUG="Resolut1onEDL/dota-replay-parser"
 FLY_APP="resoai-parse"
 
@@ -88,6 +90,21 @@ step "4/5 локальный бинарь GJ (DOTA_PARSER_BIN)"
 got=$("$PARSER_REPO/parser" --version 2>/dev/null || echo "?")
 [ "$got" = "$VER" ] || fail "локальный бинарь отдал '$got'"
 echo "  $PARSER_REPO/parser: $got ✓"
+
+step "4b/5 ResoAI-web parser/ (дашборды: GitHub Actions собирают парсер отсюда)"
+if [ -d "$WEB_DIR/parser" ]; then
+  for f in main.go main_test.go wide.go wide_test.go input.go items_constants.go go.mod go.sum; do
+    cp "$PARSER_REPO/$f" "$WEB_DIR/parser/$f"
+  done
+  git -C "$PARSER_REPO" rev-parse "$V^{commit}" > "$WEB_DIR/parser/UPSTREAM_COMMIT"
+  (cd "$WEB_DIR/parser" && go build -o parser .)
+  got=$("$WEB_DIR/parser/parser" --version 2>/dev/null || echo "?")
+  [ "$got" = "$VER" ] || fail "веб-копия парсера отдала '$got'"
+  echo "  $WEB_DIR/parser: $got ✓ — закоммить в веб-репо:"
+  echo "    cd $WEB_DIR && git add parser && git commit -m \"chore: parser $V\""
+else
+  echo "  $WEB_DIR/parser не найден, пропуск"
+fi
 
 step "5/5 осталось руками (авто-апдейт игрокам)"
 cat <<EOF
