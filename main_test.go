@@ -1585,3 +1585,22 @@ func TestFixed8ParticleBaselineReplay(t *testing.T) {
 		}
 	}
 }
+
+// lobbyType was always 0: CDemoFileInfo has no lobby type, only the game rules
+// entity does (m_pGameRules.m_lobbyType: 7 on ranked pub 9003397670, 1 on league
+// game 8943477775 — as OpenDota says). The decoder may hand it over signed or not.
+func TestEntityIntReadsAnyIntegerWidth(t *testing.T) {
+	for _, c := range []struct {
+		in   interface{}
+		want int
+		ok   bool
+	}{
+		{int32(7), 7, true}, {uint32(1), 1, true}, {uint64(2), 2, true}, {int64(7), 7, true},
+		{nil, 0, false}, {"7", 0, false}, {float32(7), 0, false},
+	} {
+		if got, ok := entityInt(c.in); got != c.want || ok != c.ok {
+			t.Errorf("entityInt(%#v) = %d, %v; want %d, %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+

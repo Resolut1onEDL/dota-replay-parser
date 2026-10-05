@@ -1513,6 +1513,24 @@ func rebaseBand(v reflect.Value, delta float64, depth int) int {
 	return n
 }
 
+// entityInt reads an integer entity field whatever width or signedness the
+// decoder gave it; anything else is not an integer.
+func entityInt(v interface{}) (int, bool) {
+	switch x := v.(type) {
+	case int32:
+		return int(x), true
+	case int64:
+		return int(x), true
+	case uint32:
+		return int(x), true
+	case uint64:
+		return int(x), true
+	case int:
+		return x, true
+	}
+	return 0, false
+}
+
 // isWardDeward сообщает, что смерть варда — это снос врагом (а не естественное
 // истечение). Combat-log называет истёкший вард так, что attacker == target
 // ("npc_dota_*_wards" сам себя); снос даёт attacker = герой/юнит. (v4.3.0)
@@ -2767,6 +2785,11 @@ func main() {
 			}
 			if gameMode, ok := e.GetInt32("m_pGameRules.m_iGameMode"); ok {
 				state.GameMode = int(gameMode)
+			}
+			// The lobby type (7 ranked matchmaking, 1 practice/league, 2 tournament, …) lives only on
+			// the game rules entity: CDemoFileInfo has no such field, so lobbyType was always 0 before.
+			if lobbyType, ok := entityInt(e.Get("m_pGameRules.m_lobbyType")); ok {
+				state.LobbyType = lobbyType
 			}
 			// Track game start/end times for duration calculation
 			if startTime, ok := e.GetFloat32("m_pGameRules.m_flGameStartTime"); ok {
