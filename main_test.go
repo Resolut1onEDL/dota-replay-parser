@@ -1416,3 +1416,81 @@ func TestPreHornRebaseKeepsFirstSkillPointPreHorn(t *testing.T) {
 		t.Errorf("quas time = %v, want 79.4 (recorded after start, untouched)", got[1].Time)
 	}
 }
+
+// The count reports are built from maps: without an explicit order the JSON
+// arrays came out shuffled on every parse of the same demo (39/39 replays),
+// and the web app's "top 6 casts" broke count ties by that order.
+func TestReportArraysDeterministic(t *testing.T) {
+	build := func() *PlayerStats {
+		s := NewParserState(nil)
+		ps := s.Players[0]
+		ps.AbilityCasts = map[string]int{
+			"pudge_meat_hook": 30, "pudge_rot": 12, "pudge_dismember": 12,
+			"item_tpscroll": 5, "pudge_flesh_heap": 0, "ability_capture": 5,
+		}
+		ps.DamageByTarget = map[int]*DamageTarget{
+			9: {Target: 9, PhysicalDamage: 100}, 5: {Target: 5, MagicalDamage: 50},
+			7: {Target: 7, PureDamage: 10}, 6: {Target: 6, PhysicalDamage: 1},
+			8: {Target: 8, MagicalDamage: 3},
+		}
+		ps.ItemUsage = map[string]int{
+			"item_tango": 4, "item_flask": 2, "item_clarity": 2,
+			"item_blink": 7, "item_bottle": 2, "item_ward_observer": 4,
+		}
+		return buildMatchOutput(s, 1800).Players[0].Stats
+	}
+	first := build()
+	for run := 0; run < 50; run++ {
+		if got := build(); !reflect.DeepEqual(got.AbilityCastReport, first.AbilityCastReport) ||
+			!reflect.DeepEqual(got.HeroDamageReport, first.HeroDamageReport) ||
+			!reflect.DeepEqual(got.ItemUsed, first.ItemUsed) {
+			t.Fatalf("run %d: report order differs between builds of the same state", run)
+		}
+	}
+	var casts, targets, items []string
+	for _, a := range first.AbilityCastReport {
+		casts = append(casts, fmt.Sprintf("%s=%d", a.AbilityName, a.Count))
+	}
+	for _, d := range first.HeroDamageReport {
+		targets = append(targets, fmt.Sprint(d.Target))
+	}
+	for _, u := range first.ItemUsed {
+		items = append(items, fmt.Sprintf("%s=%d", u.ItemName, u.Count))
+	}
+	wantCasts := []string{"pudge_meat_hook=30", "pudge_dismember=12", "pudge_rot=12",
+		"ability_capture=5", "item_tpscroll=5", "pudge_flesh_heap=0"}
+	wantTargets := []string{"5", "6", "7", "8", "9"}
+	wantItems := []string{"item_blink=7", "item_tango=4", "item_ward_observer=4",
+		"item_bottle=2", "item_clarity=2", "item_flask=2"}
+	if !reflect.DeepEqual(casts, wantCasts) {
+		t.Errorf("abilityCastReport: %v, want %v", casts, wantCasts)
+	}
+	if !reflect.DeepEqual(targets, wantTargets) {
+		t.Errorf("heroDamageReport targets: %v, want %v", targets, wantTargets)
+	}
+	if !reflect.DeepEqual(items, wantItems) {
+		t.Errorf("itemUsed: %v, want %v", items, wantItems)
+	}
+}
+
+// A camp whose leader votes tie between two tiers has no tier: the winner
+// used to be whichever tier the map iteration handed out first, so
+// stackEvents[].campTier flipped between runs (2/39 replays).
+func TestCampTiersTieIsUnknown(t *testing.T) {
+	s := &ParserState{CampSpawners: [][2]float64{{90, 158}, {158, 88}}}
+	s.HeroNeutHits = []neutHit{
+		// camp 0: one large leader, one medium leader — a tie
+		{T: 100, Player: 8, X: 91, Y: 157, Species: "polar_furbolg_ursa_warrior"},
+		{T: 160, Player: 8, X: 90, Y: 158, Species: "mud_golem"},
+		// camp 1: 2 medium vs 1 large — medium wins
+		{T: 100, Player: 1, X: 158, Y: 88, Species: "mud_golem"},
+		{T: 130, Player: 1, X: 158, Y: 89, Species: "ogre_magi"},
+		{T: 160, Player: 1, X: 157, Y: 88, Species: "polar_furbolg_ursa_warrior"},
+	}
+	for run := 0; run < 50; run++ {
+		tiers := campTiers(s)
+		if tiers[0] != "" || tiers[1] != "medium" {
+			t.Fatalf("run %d: tiers %q, want [\"\" \"medium\"]", run, tiers)
+		}
+	}
+}

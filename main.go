@@ -4061,12 +4061,22 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 				Count:       count,
 			})
 		}
+		// Map iteration is random: most casts first, ties by name, so the
+		// same demo always yields the same array.
+		sort.Slice(abilityCasts, func(a, b int) bool {
+			if abilityCasts[a].Count != abilityCasts[b].Count {
+				return abilityCasts[a].Count > abilityCasts[b].Count
+			}
+			return abilityCasts[a].AbilityName < abilityCasts[b].AbilityName
+		})
 
 		// Build damage report
 		var damageReport []DamageTarget
 		for _, dmg := range ps.DamageByTarget {
 			damageReport = append(damageReport, *dmg)
 		}
+		// Target slot order — map iteration is random.
+		sort.Slice(damageReport, func(a, b int) bool { return damageReport[a].Target < damageReport[b].Target })
 
 		// Build item usage report (map → sorted slice)
 		var itemUsed []ItemUsed
@@ -4077,7 +4087,13 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 				Count:    count,
 			})
 		}
-		sort.Slice(itemUsed, func(a, b int) bool { return itemUsed[a].Count > itemUsed[b].Count })
+		// Ties by name — equal counts came out in random map order.
+		sort.Slice(itemUsed, func(a, b int) bool {
+			if itemUsed[a].Count != itemUsed[b].Count {
+				return itemUsed[a].Count > itemUsed[b].Count
+			}
+			return itemUsed[a].ItemName < itemUsed[b].ItemName
+		})
 
 		// Build damage received report
 		var damageReceivedReport *DamageReceivedReport
@@ -4899,11 +4915,18 @@ func campTiers(state *ParserState) []string {
 	}
 	tiers := make([]string, len(state.CampSpawners))
 	for i, v := range votes {
-		best, bestN := "", 0
+		best, bestN, tied := "", 0, false
 		for tier, n := range v {
 			if n > bestN {
-				best, bestN = tier, n
+				best, bestN, tied = tier, n, false
+			} else if n == bestN {
+				tied = true
 			}
+		}
+		// A tie leaves the tier unknown rather than whichever tier the
+		// random map iteration handed out first.
+		if tied {
+			best = ""
 		}
 		tiers[i] = best
 	}
