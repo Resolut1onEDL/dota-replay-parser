@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/dotabuff/manta/dota"
@@ -680,6 +681,90 @@ func TestDetectPullsFirstPoke(t *testing.T) {
 		ev := pulls[7][0]
 		if !ev.OntoEnemyWave || ev.CreepsDied != 1 {
 			t.Errorf("event: %+v, want ontoEnemyWave=true creepsDied=1", ev)
+		}
+	})
+
+	// Live case 9006039853: Snapfire pulls the top camp at 558.7 (Dire wave
+	// there 562-582.2), the camp is cleared by 577.6 and respawns at 10:00;
+	// Spirit Breaker pokes the fresh camp at 600.7 onto the passing Dire
+	// wave (Dire run 591.7-617.4, Radiant run 605.8-637.8 — two episodes
+	// with the SAME poke time) and two Dire creeps die at 607-608. The
+	// result used to flip between runs: the tie came out of the
+	// CampWaveRuns map in random order, and the 591.7 episode, if merged
+	// first, swallowed SB's pull into Snapfire's.
+	t.Run("same-poke tie is deterministic and a later poke is a new pull", func(t *testing.T) {
+		s := mkState()
+		s.CampSpawners = [][2]float64{{96, 164}}
+		for k := 0; k < 24; k++ {
+			s.CampSpawners = append(s.CampSpawners, [2]float64{20 + 20*float64(k%6), 20 + 20*float64(k/6)})
+		}
+		s.CampWaveRuns[0] = &campRuns{
+			Rad:  []waveRun{{T0: 605.8, T1: 637.8}},
+			Dire: []waveRun{{T0: 562, T1: 582.2}, {T0: 591.7, T1: 617.4}},
+		}
+		s.HeroNeutHits = []neutHit{
+			{T: 558.7, Player: 9, X: 94, Y: 168, Species: "harpy_scout"},
+			{T: 600.7, Player: 3, X: 100, Y: 164, Species: "gnoll_assassin"},
+		}
+		s.NeutDeletions = []neutDeletion{
+			{T: 575, X: 96, Y: 164}, {T: 576.3, X: 96, Y: 164}, {T: 577.6, X: 96, Y: 164},
+			{T: 607.6, X: 96, Y: 166},
+		}
+		s.PullDeaths = []pullDeathRec{
+			{T: 607.2, Radiant: false, CreepDied: true},
+			{T: 608.5, Radiant: false, CreepDied: true},
+		}
+		// Decoy pulls at 24 far-away camps: enough episodes (>12) that the
+		// sort leaves insertion-sort territory, and enough map keys that the
+		// iteration order varies between calls.
+		for ci := 1; ci < len(s.CampSpawners); ci++ {
+			t0 := 100 + 20*float64(ci)
+			cx, cy := s.CampSpawners[ci][0], s.CampSpawners[ci][1]
+			s.CampWaveRuns[ci] = &campRuns{Rad: []waveRun{{T0: t0, T1: t0 + 15}}}
+			s.HeroNeutHits = append(s.HeroNeutHits, neutHit{T: t0 - 2, Player: 4, X: cx, Y: cy, Species: "kobold"})
+			s.NeutDeletions = append(s.NeutDeletions, neutDeletion{T: t0 + 10, X: cx, Y: cy})
+		}
+
+		first := detectPulls(s)
+		for run := 0; run < 200; run++ {
+			if got := detectPulls(s); !reflect.DeepEqual(got, first) {
+				t.Fatalf("run %d differs:\n got %+v\nwant %+v", run, got, first)
+			}
+		}
+		if len(first[3]) != 1 {
+			t.Fatalf("Spirit Breaker 600.7 pull: got %+v, want one", first[3])
+		}
+		if ev := first[3][0]; ev.Time != 600.7 || ev.CreepsDied != 2 || !ev.OntoEnemyWave {
+			t.Errorf("SB pull: %+v, want t=600.7 creepsDied=2 ontoEnemyWave", ev)
+		}
+		if len(first[9]) != 1 || first[9][0].Time != 558.7 || first[9][0].CreepsDied != 0 {
+			t.Errorf("Snapfire pull: %+v, want one at 558.7 with creepsDied=0", first[9])
+		}
+		if len(first[4]) != len(s.CampSpawners)-1 {
+			t.Errorf("decoy pulls: got %d, want %d", len(first[4]), len(s.CampSpawners)-1)
+		}
+	})
+
+	// Live case 9016805053: Doom (Radiant) pokes at 498.2 while the Dire wave
+	// walks past the camp (489.9-500.8, no losses); his own wave then parks
+	// (505.2-528.8) and loses a creep at 511.1. Both runs share the poke —
+	// the merged pull is a normal pull that cost 1 creep, not "onto enemy".
+	t.Run("merged pull direction follows the wave that lost creeps", func(t *testing.T) {
+		s := mkState()
+		s.CampSpawners = [][2]float64{{90, 158}}
+		s.CampWaveRuns[0] = &campRuns{
+			Rad:  []waveRun{{T0: 505.2, T1: 528.8}},
+			Dire: []waveRun{{T0: 489.9, T1: 500.8}},
+		}
+		s.HeroNeutHits = []neutHit{{T: 498.2, Player: 0, X: 90, Y: 160, Species: "satyr_trickster"}}
+		s.NeutDeletions = []neutDeletion{{T: 515, X: 90, Y: 158}}
+		s.PullDeaths = []pullDeathRec{{T: 511.1, Radiant: true, CreepDied: true}}
+		pulls := detectPulls(s)
+		if len(pulls[0]) != 1 {
+			t.Fatalf("Doom pulls: got %+v, want one", pulls[0])
+		}
+		if ev := pulls[0][0]; ev.Time != 498.2 || ev.CreepsDied != 1 || ev.OntoEnemyWave {
+			t.Errorf("Doom pull: %+v, want t=498.2 creepsDied=1 ontoEnemyWave=false", ev)
 		}
 	})
 
