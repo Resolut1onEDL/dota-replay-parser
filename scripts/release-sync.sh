@@ -96,6 +96,8 @@ if [ -d "$WEB_DIR/parser" ]; then
   for f in main.go main_test.go wide.go wide_test.go input.go items_constants.go go.mod go.sum; do
     cp "$PARSER_REPO/$f" "$WEB_DIR/parser/$f"
   done
+  # go.mod replaces manta with the patched copy in third_party/ (fixed8 fix)
+  rsync -a --delete "$PARSER_REPO/third_party/" "$WEB_DIR/parser/third_party/"
   git -C "$PARSER_REPO" rev-parse "$V^{commit}" > "$WEB_DIR/parser/UPSTREAM_COMMIT"
   (cd "$WEB_DIR/parser" && go build -o parser .)
   got=$("$WEB_DIR/parser/parser" --version 2>/dev/null || echo "?")

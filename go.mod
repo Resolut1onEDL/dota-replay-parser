@@ -10,3 +10,6 @@ require (
 	github.com/klauspost/compress v1.19.1 // indirect
 	google.golang.org/protobuf v1.26.0 // indirect
 )
+
+// manta v1.4.7 + fixed8 decoder patch (third_party/manta/PATCHES.md).
+replace github.com/dotabuff/manta => ./third_party/manta
