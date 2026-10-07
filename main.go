@@ -2304,7 +2304,8 @@ func main() {
 
 				// Track damage received by target (any hero→hero, even ally —
 				// this is the inverse view, useful for separate analysis).
-				if targetIdx >= 0 && targetIdx < 10 {
+				// v4.10.0: not the damage the hero's illusions took.
+				if targetIdx >= 0 && targetIdx < 10 && !m.GetIsTargetIllusion() {
 					switch damageType {
 					case 1:
 						state.Players[targetIdx].DamageReceivedPhysical += damage
@@ -2675,20 +2676,29 @@ func main() {
 				if playerIdx >= 0 && playerIdx < 10 {
 					// v4.4.4: entity→игрок для реагро-детекта по ордерам
 					state.HeroEntityToPlayer[e.GetIndex()] = playerIdx
+					// v4.10.0: an illusion (m_hReplicatingOtherHeroModel set: the player's own Manta or Conjure
+					// copies, or another hero's copy the player controls) is not the hero — its class, health,
+					// position and items were taken as the player's: in 9014199146 Terrorblade copies under
+					// Grimstroke's player id left him a carry's final inventory, and a death was placed where
+					// an illusion stood.
+					realHero := true
+					if repl, okR := e.GetUint32("m_hReplicatingOtherHeroModel"); okR && repl != 16777215 {
+						realHero = false
+					}
 					heroName := strings.TrimPrefix(className, "CDOTA_Unit_Hero_")
 					heroID := heroNameStringToID(heroName)
-					if heroID > 0 && state.Players[playerIdx].HeroID == 0 {
+					if heroID > 0 && state.Players[playerIdx].HeroID == 0 && realHero {
 						state.Players[playerIdx].HeroID = heroID
 					}
 					
 					// v4.4.0: last known max HP — denominator for near-death
 					// events in the combat-log damage handler.
-					if maxHP, ok := e.GetInt32("m_iMaxHealth"); ok && maxHP > 0 {
+					if maxHP, ok := e.GetInt32("m_iMaxHealth"); ok && maxHP > 0 && realHero {
 						state.Players[playerIdx].MaxHealth = int(maxHP)
 					}
 
 					// Track position for lane detection
-					if cellX, ok := e.GetUint64("CBodyComponent.m_cellX"); ok {
+					if cellX, ok := e.GetUint64("CBodyComponent.m_cellX"); ok && realHero {
 						if cellY, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
 							state.Players[playerIdx].LastPosX = float64(cellX)
 							state.Players[playerIdx].LastPosY = float64(cellY)
@@ -2706,8 +2716,8 @@ func main() {
 							// for pull attribution and HG episodes. Illusions
 							// carry m_hReplicatingOtherHeroModel = handle of
 							// the real hero; the real hero has 16777215/absent
-							// (verified empirically — LastPosX above keeps its
-							// historical illusion-polluted behavior untouched).
+							// (verified empirically; since v4.10.0 LastPosX above
+							// skips illusions too).
 							// Timestamps are projected onto the combat-log
 							// axis so they match death/kill event times.
 							if repl, okR := e.GetUint32("m_hReplicatingOtherHeroModel"); !okR || repl == 16777215 {
@@ -2779,14 +2789,23 @@ func main() {
 						}
 						return state.ItemEntities[entityIdx]
 					}
-					for i := 0; i < 6; i++ {
-						state.Players[playerIdx].FinalItems[i] = resolveItem(fmt.Sprintf("m_hItems.%04d", i))
+					// v4.10.0: final items frozen at the game's end, like the net worth — the post-game tail swapped
+					// and dropped items (an Aegis gone, a Phantom Lancer's Bloodthorn moved out of the slots)
+					if realHero && !(state.GameEndTime > 0 && state.GameTime() > state.GameEndTime) {
+						for i := 0; i < 6; i++ {
+							state.Players[playerIdx].FinalItems[i] = resolveItem(fmt.Sprintf("m_hItems.%04d", i))
+						}
+						for i := 0; i < 3; i++ {
+							name := resolveItem(fmt.Sprintf("m_hItems.%04d", 6+i))
+							state.Players[playerIdx].Backpack[i] = itemNameToID[name]
+						}
+						state.Players[playerIdx].FinalNeutral = resolveItem("m_hItems.0016")
 					}
 					// v4.10.0: starting items. What the hero spawns with was bought in the strategy phase, which the
 					// combat log does not record (no pre-horn purchase ever reached the output); like OpenDota, the
 					// first inventory seen before the horn is taken as purchases at that moment — minus the ones the
 					// combat log did catch.
-					if ps := state.Players[playerIdx]; !ps.StartingItemsDone && state.GameStartTime == 0 {
+					if ps := state.Players[playerIdx]; realHero && !ps.StartingItemsDone && state.GameStartTime == 0 {
 						var names []string
 						for i := 0; i < 9; i++ {
 							if n := resolveItem(fmt.Sprintf("m_hItems.%04d", i)); n != "" && n != "item_ward_dispenser" {
@@ -2818,14 +2837,11 @@ func main() {
 							}
 						}
 					}
-					for i := 0; i < 3; i++ {
-						name := resolveItem(fmt.Sprintf("m_hItems.%04d", 6+i))
-						state.Players[playerIdx].Backpack[i] = itemNameToID[name]
-					}
-					state.Players[playerIdx].FinalNeutral = resolveItem("m_hItems.0016")
 
 					// Track TP scroll in dedicated slot 15 (Dota 2 7.23+)
-					if handle, ok := e.GetUint32("m_hItems.0015"); ok && handle > 0 && handle < 16777215 {
+					if !realHero {
+						// an illusion's TP slot says nothing about the hero's
+					} else if handle, ok := e.GetUint32("m_hItems.0015"); ok && handle > 0 && handle < 16777215 {
 						entityIdx := int32(handle & 0x3FFF)
 						hasTP := false
 						if itemName, exists := state.ItemEntities[entityIdx]; exists {
