@@ -955,6 +955,9 @@ type PlayerState struct {
 	StunDurationDealt      float64
 	ValveStuns             float64 // m_fStuns of the team data entity — the source of stunDurationDealt when present
 	HasValveStuns          bool
+	ValveHeroDamage        int // m_flHeroDamage / m_flTowerDamage — the source of heroDamage / towerDamage when present
+	ValveTowerDamage       int
+	HasValveDamage         bool
 
 	// Item usage tracking (item_name → count)
 	ItemUsage  map[string]int
@@ -1075,6 +1078,10 @@ type ParserState struct {
 	// v4.7.1: ability entity index → owning player, filled only from real
 	// heroes' own abilities (see observeHeroAbility).
 	SkillAbilities map[int32]*skillAbility
+	// v4.10.0: rune pickups from the game's announcements (CHAT_MESSAGE_RUNE_PICKUP); they replace the
+	// heuristic ones when the replay has any (exported: rebasePreHorn moves their parked times)
+	ChatRunes    [10][]RuneEvent
+	HasChatRunes bool
 	// purchases whose hero had no player yet (exported: rebasePreHorn moves their parked times)
 	PendingPurchases []PendingPurchase
 	SkillHidden    map[int32]bool // ability entity → m_bHidden at its last sighting
@@ -1265,7 +1272,29 @@ func (s *ParserState) ownerByNames(src, attackerName string) int {
 			return idx
 		}
 	}
+	// a hero's unit that carries no damage source: its name starts with the hero's (Juggernaut's Healing Ward,
+	// npc_dota_juggernaut_healing_ward, heals with none)
+	if strings.HasPrefix(attackerName, "npc_dota_") {
+		return s.unitOwner(strings.TrimPrefix(attackerName, "npc_dota_"))
+	}
 	return -1
+}
+
+// unitOwner is the player whose hero's internal name prefixes a unit name (juggernaut_healing_ward → the
+// Juggernaut), the longest name winning (shadow_shaman over a hypothetical shadow); -1 when none is in the game.
+func (s *ParserState) unitOwner(unit string) int {
+	best, bestLen := -1, 0
+	for name, id := range heroNpcNameToID {
+		if len(name) <= bestLen || !strings.HasPrefix(unit, name+"_") {
+			continue
+		}
+		for i := 0; i < 10; i++ {
+			if s.Players[i].HeroID == id {
+				best, bestLen = i, len(name)
+			}
+		}
+	}
+	return best
 }
 
 // entityActual returns the entity-tick game time projected onto the
@@ -1864,6 +1893,16 @@ func main() {
 	})
 
 	p.Callbacks.OnCDOTAUserMsg_ChatEvent(func(m *dota.CDOTAUserMsg_ChatEvent) error {
+		// v4.10.0: a rune taken — the game's own announcement (rune type in value). Exact where the three
+		// heuristics below were not: wisdom runes were never seen, a bottled rune landed at the bottling, a
+		// bounty needed gold within 5 s. A bottled rune is announced when it is used, as Valve counts it.
+		if m.GetType() == dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_RUNE_PICKUP {
+			if pid := int(m.GetPlayerid_1()); pid >= 0 && pid < 10 {
+				state.ChatRunes[pid] = append(state.ChatRunes[pid], RuneEvent{Time: state.entityActual(), RuneType: int(m.GetValue()), Action: 1})
+				state.HasChatRunes = true
+			}
+			return nil
+		}
 		var kind string
 		switch m.GetType() {
 		case dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_AEGIS:
@@ -2313,14 +2352,15 @@ func main() {
 			attackerName := state.LookupName(m.GetAttackerName())
 			targetName := state.LookupName(m.GetTargetName())
 			value := int(m.GetValue())
-			attackerIdx := heroNameToPlayerIndex(attackerName, state)
+			// v4.10.0: a summon's healing is its owner's (Juggernaut's Healing Ward: 0 → 7350, as Valve)
+			attackerIdx := state.damageOwner(m, attackerName)
 			targetIdx := heroNameToPlayerIndex(targetName, state)
 			// hero_healing = healing applied to *allied* heroes excluding self,
 			// to match OpenDota's definition. Skip self-heal, non-hero targets,
 			// regen, and enemy heroes.
 			if attackerIdx >= 0 && attackerIdx < 10 &&
 				strings.Contains(targetName, "hero") &&
-				attackerName != targetName &&
+				attackerIdx != targetIdx &&
 				targetIdx >= 0 && targetIdx < 10 &&
 				state.Players[attackerIdx].IsRadiant == state.Players[targetIdx].IsRadiant {
 				state.Players[attackerIdx].HeroHealing += value
@@ -2693,11 +2733,20 @@ func main() {
 								// ==2 for OpenDota life_state parity.
 								if lsv, okL := e.GetUint64("m_lifeState"); okL && lsv != state.LifePrev[playerIdx] {
 									t := state.entityActual()
-									if lsv == 2 && !state.DeadIsOpen[playerIdx] && state.GameStartTime > 0 {
+									// v4.10.0: from the dying state on (1, then 2 = dead), as OpenDota's life_state_dead
+									// counts — the death animation is time out of the game too
+									if lsv >= 1 && !state.DeadIsOpen[playerIdx] && state.GameStartTime > 0 {
 										state.DeadIsOpen[playerIdx] = true
 										state.DeadOpenT[playerIdx] = t
 									} else if lsv == 0 && state.DeadIsOpen[playerIdx] {
 										state.DeadIsOpen[playerIdx] = false
+										// v4.10.0: a hero dead at the game's end respawned in the post-game tail;
+										// the span stops at the end (it ran on to the respawn: +60-90 s)
+										if state.GameEndTime > 0 {
+											if end := state.ActualGameSeconds(state.GameEndTime); t > end {
+												t = end
+											}
+										}
 										if t > state.DeadOpenT[playerIdx] {
 											state.DeadSpans[playerIdx] = append(state.DeadSpans[playerIdx],
 												deadSpan{T0: state.DeadOpenT[playerIdx], T1: t})
@@ -3202,6 +3251,14 @@ func main() {
 				if st, ok := e.GetFloat32(fmt.Sprintf("m_vecDataTeam.%04d.m_fStuns", i)); ok && !gameOver {
 					ps.ValveStuns, ps.HasValveStuns = float64(st), true
 				}
+				// v4.10.0: Valve's own hero and building damage — the scoreboard's numbers, exact where the
+				// combat-log sum had to guess (Io's tether: 125 315 vs 89 260)
+				if hd, ok := e.GetFloat32(fmt.Sprintf("m_vecDataTeam.%04d.m_flHeroDamage", i)); ok && !gameOver {
+					ps.ValveHeroDamage, ps.HasValveDamage = int(math.Round(float64(hd))), true
+					if td, ok2 := e.GetFloat32(fmt.Sprintf("m_vecDataTeam.%04d.m_flTowerDamage", i)); ok2 {
+						ps.ValveTowerDamage = int(math.Round(float64(td)))
+					}
+				}
 			}
 
 			// Sample all 10 hero positions at each minute boundary (for zone analysis)
@@ -3409,6 +3466,11 @@ func main() {
 		state.matchSkills(i, math.Inf(1)) // the last level rises of the replay
 	}
 	state.flushPendingPurchases()
+	if state.HasChatRunes {
+		for i := 0; i < 10; i++ {
+			state.Players[i].Runes = append([]RuneEvent{}, state.ChatRunes[i]...)
+		}
+	}
 	match := buildMatchOutput(state, duration)
 
 	jsonData, err := json.MarshalIndent(match, "", "  ")
@@ -4613,8 +4675,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			NumLastHits:         ps.LastHits,
 			NumDenies:           ps.Denies,
 			Level:               ps.Level,
-			HeroDamage:          ps.HeroDamage,
-			TowerDamage:         ps.TowerDamage,
+			HeroDamage:          valveOr(ps.HasValveDamage, ps.ValveHeroDamage, ps.HeroDamage),
+			TowerDamage:         valveOr(ps.HasValveDamage, ps.ValveTowerDamage, ps.TowerDamage),
 			HeroHealing:         ps.HeroHealing,
 			Lane:                laneInt,
 			Role:                role,
@@ -5779,4 +5841,12 @@ func stunsOut(ps *PlayerState) float64 {
 		return math.Round(ps.ValveStuns*100) / 100
 	}
 	return ps.StunDurationDealt
+}
+
+// valveOr is Valve's own counter when the replay carries it, the combat-log reconstruction otherwise.
+func valveOr(has bool, valve, combat int) int {
+	if has {
+		return valve
+	}
+	return combat
 }

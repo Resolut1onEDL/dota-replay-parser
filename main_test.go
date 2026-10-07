@@ -1610,7 +1610,7 @@ func TestEntityIntReadsAnyIntegerWidth(t *testing.T) {
 // no hero is behind them.
 func TestOwnerByNames(t *testing.T) {
 	s := NewParserState(nil)
-	for i, h := range []int{77, 109, 94, 1, 2, 3, 4, 5, 6, 7} { // Lycan, Terrorblade, Medusa, …
+	for i, h := range []int{77, 109, 94, 8, 27, 3, 4, 5, 6, 7} { // Lycan, Terrorblade, Medusa, Juggernaut, Shadow Shaman, …
 		s.Players[i].HeroID = h
 	}
 	for _, c := range []struct {
@@ -1623,6 +1623,10 @@ func TestOwnerByNames(t *testing.T) {
 		{"", "npc_dota_hero_medusa", 2},
 		{"npc_dota_creep_badguys_melee", "npc_dota_creep_badguys_melee", -1},
 		{"npc_dota_roshan", "npc_dota_roshan", -1},
+		// a unit with no damage source: its name names the hero
+		{"", "npc_dota_juggernaut_healing_ward", 3},
+		{"npc_dota_shadow_shaman_ward_1", "npc_dota_shadow_shaman_ward_1", 4},
+		{"", "npc_dota_furion_treant", -1}, // no Nature's Prophet in this game
 	} {
 		if got := s.ownerByNames(c.src, c.attacker); got != c.want {
 			t.Errorf("%s / %s: got %d, want %d", c.src, c.attacker, got, c.want)
@@ -1694,5 +1698,12 @@ func TestStunsOut(t *testing.T) {
 	}
 	if got := stunsOut(&PlayerState{StunDurationDealt: 46}); got != 46 {
 		t.Errorf("no valve field: got %v", got)
+	}
+}
+
+// v4.10.0: heroDamage and towerDamage are Valve's counters when the replay has them.
+func TestValveOr(t *testing.T) {
+	if valveOr(true, 89260, 125315) != 89260 || valveOr(false, 0, 125315) != 125315 {
+		t.Error("valveOr picks the wrong source")
 	}
 }

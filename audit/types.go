@@ -122,6 +122,7 @@ type ODPlayer struct {
 	ItemUses           map[string]int            `json:"item_uses"`
 	AbilityUpgradesArr []int                     `json:"ability_upgrades_arr"`
 	DamageTargets      map[string]map[string]int `json:"damage_targets"`
+	Killed             map[string]int            `json:"killed"`
 	DamageTaken        map[string]int            `json:"damage_taken"`
 
 	CampsStacked      *int     `json:"camps_stacked"`

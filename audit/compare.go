@@ -282,13 +282,16 @@ func Compare(ours *Match, od *ODMatch, c Consts) []Check {
 		}
 		evCheck(add, "player.purchase_log", GroupReplay, h, opu, tpu, odTimeTol, -1)
 
+		// Valve's m_iRunePickups (OpenDota's rune_pickups) leaves wisdom runes (type 8) out
 		var oru, tru []ev
 		pickups := 0
 		for _, r := range s.Runes {
 			if r.Action != 1 {
 				continue
 			}
-			pickups++
+			if r.Rune != 8 {
+				pickups++
+			}
 			oru = append(oru, ev{T: fl(r.Time), K: strconv.Itoa(r.Rune)})
 		}
 		for _, r := range o.RunesLog {
@@ -377,7 +380,14 @@ func Compare(ours *Match, od *ODMatch, c Consts) []Check {
 			eq("player.creeps_stacked", GroupReplay, h, s.CreepsStacked, *o.CreepsStacked)
 		}
 		if o.LaneKills != nil {
-			eq("player.lane_kills", GroupReplay, h, s.CreepKills.TotalLaneCreeps, *o.LaneKills)
+			// OpenDota's lane_kills match "creep_goodguys/badguys" and so leave catapults out; ours count them
+			siege := 0
+			for k, v := range o.Killed {
+				if strings.Contains(k, "_siege") {
+					siege += v
+				}
+			}
+			eq("player.lane_kills", GroupReplay, h, s.CreepKills.TotalLaneCreeps, *o.LaneKills+siege)
 		}
 		if o.NeutralKills != nil {
 			eq("player.neutral_kills", GroupReplay, h, s.CreepKills.TotalJungleCreeps, *o.NeutralKills)
