@@ -1577,4 +1577,11 @@ func TestFixed8ParticleBaselineReplay(t *testing.T) {
 	for id := range want {
 		t.Errorf("hero %d missing from players", id)
 	}
+	// Slots 2–9 are empty. Puck's 335s death was a Radiant creep's last hit
+	// and used to land on slot 2 (see TestHeroNameToPlayerIndexEmptySlots).
+	for i, p := range got.Players {
+		if p.HeroID == 0 && p.Kills != 0 {
+			t.Errorf("empty slot %d has %d kills, want 0", i, p.Kills)
+		}
+	}
 }
