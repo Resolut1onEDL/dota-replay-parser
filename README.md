@@ -49,9 +49,10 @@ a reparse of a `.dem` Valve deletes after ~14 days. Additive; no existing
 field changes meaning.
 
 - `damageSeconds` — damage to a real hero per game second: `a` attacker slot
-  (its illusions included) or −1 lane creep / −2 neutral / −3 building /
+  (since 4.10.0 its owner's: the player's illusions, summons and dominated
+  creeps count as the player) or −1 lane creep / −2 neutral / −3 building /
   −4 other, `v` victim slot, `k` damage type (1 physical, 2 magical, 4 pure),
-  `d` sum. Hits on illusions are left out. Not named `combatSeconds`: the web
+  `d` sum. Hits on illusions and Sunder's HP swap are left out. Not named `combatSeconds`: the web
   fight detector reserves that name for a hero→hero-only stream.
 - `controlEvents` — modifiers the combat log gives a stun or a slow duration,
   applied to (`on`) and removed from (`!on`) a real hero.
@@ -74,6 +75,34 @@ take it from Valve's hero datafeed (ResoAI-web `src/lib/ultimates-static.json`).
 is parked on an epoch and moved onto the game clock when
 `m_flGameStartTime` arrives (it subsumes the skill-build-only 4.7.2 fix), and
 hero positions are sampled before the horn too (smoke routes).
+
+### 4.10.0 — counted as Valve counts (the audit, `cmd/audit`)
+
+Fields compared with Valve's numbers and OpenDota's parse of 99 fresh matches;
+what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
+
+- `heroDamage`, `towerDamage` — Valve's own counters (`m_flHeroDamage`,
+  `m_flTowerDamage`); `heroDamageReport`, `damageSeconds`, creep kills, Roshan
+  and building kills and healing credit a summon's, dominated creep's or
+  illusion's part to its owner; damage to illusions is no hero damage.
+- `stunDurationDealt` — Valve's `m_fStuns`. `networth`, final items frozen at
+  the game's end; final items, max health and positions ignore illusions.
+- `killEvents`/`deathEvents` — no illusion deaths; a kill is the unit owner's;
+  an Aegis or Reincarnation death has `reincarnated: true` (no kill, no death on
+  the scoreboard); the killer is not in his own `assistEvents`.
+- `stats.goldPerMinute` — gold earned so far (`m_iTotalEarnedGold`, OpenDota's
+  `gold_t`); per-minute samples are the values at mm:00.
+- `stats.itemPurchases` — starting items (the inventory when the hero is first
+  seen, as OpenDota does — the strategy phase is not in the combat log); no
+  `item_ward_dispenser` combine entries.
+- `stats.skillBuild` — one entry per spent skill point plus talents (7.41
+  talents cost no point), as Valve's ability_upgrades; ability names as the
+  combat log writes them (`luna_lucent_beam`, was `luna_lucentbeam`).
+- `stats.runes` — the game's own pickup announcements (wisdom runes included;
+  a bottled rune at its use).
+- `stats.totalDeadTimeSec` — from the dying state, up to the game's end.
+- `pauses` and every entity-side time — Valve's pause counters; the entity
+  clock no longer runs ahead of the combat log in paused games.
 
 ### Wall-clock alignment (e.g. voice transcripts → game events)
 
