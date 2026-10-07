@@ -67,30 +67,34 @@ func LoadBaseline(path string) (Baseline, error) {
 	return b, json.Unmarshal(raw, &b)
 }
 
-// NewBaseline freezes today's rates: a field at 100 % must stay at 100 %; a field below gets 5 points of slack,
-// so a 20-game weekly sample does not fail on noise. Heuristic fields are never gated.
+// NewBaseline freezes today's rates (rounded down to 0.1 %). Heuristic fields are never gated.
 func NewBaseline(stats []FieldStat) Baseline {
 	b := Baseline{}
 	for _, s := range stats {
 		if s.Group == GroupHeuristic {
 			continue
 		}
-		if s.OK == s.Rows {
-			b[s.Field] = 1
-		} else {
-			b[s.Field] = math.Max(0, math.Floor((s.Rate-0.05)*100)/100)
-		}
+		b[s.Field] = math.Floor(s.Rate*1000) / 1000
 	}
 	return b
 }
 
-// Regressions lists the fields that match worse than the baseline allows.
+// Regressions lists the fields that match worse than the baseline allows. A field at 100 % must stay there; any
+// other may fall by sampling noise — three standard errors of its rate over this run's rows, at least 2 points
+// (a 20-match weekly run has ~180 rows: a 52 % field moves ±11 points by chance).
 func Regressions(stats []FieldStat, b Baseline) []string {
 	var out []string
 	for _, s := range stats {
-		min, ok := b[s.Field]
-		if ok && s.Rate+1e-9 < min {
-			out = append(out, fmt.Sprintf("%s: %.1f%% < %.1f%%", s.Field, s.Rate*100, min*100))
+		base, ok := b[s.Field]
+		if !ok {
+			continue
+		}
+		tol := 0.0
+		if base < 1 {
+			tol = math.Max(0.02, 3*math.Sqrt(base*(1-base)/float64(s.Rows)))
+		}
+		if s.Rate+1e-9 < base-tol {
+			out = append(out, fmt.Sprintf("%s: %.1f%% < %.1f%% (baseline %.1f%% − %.1f)", s.Field, s.Rate*100, (base-tol)*100, base*100, tol*100))
 		}
 	}
 	return out

@@ -120,15 +120,23 @@ func TestAggregateBaselineRegressions(t *testing.T) {
 		t.Fatalf("aggregate order/rates: %+v", stats)
 	}
 	b := NewBaseline(stats)
-	if b["player.kills"] != 1 || b["player.stuns"] != 0.45 {
+	if b["player.kills"] != 1 || b["player.stuns"] != 0.5 {
 		t.Errorf("baseline: %+v", b)
 	}
 	if _, gated := b["player.lane_role"]; gated {
 		t.Errorf("a heuristic field must not be gated")
 	}
-	worse := Aggregate(append(checks, Check{Field: "player.kills", Group: GroupValve, OK: false}))
+	// a 100 % field fails on one miss; a 50 % field over 2 rows may swing by its sampling noise
+	worse := Aggregate(append(checks, Check{Field: "player.kills", Group: GroupValve, OK: false}, Check{Field: "player.stuns", Group: GroupReplay, OK: false}))
 	if r := Regressions(worse, b); len(r) != 1 || !strings.HasPrefix(r[0], "player.kills: 66.7%") {
 		t.Errorf("regressions: %v", r)
+	}
+	many := []Check{}
+	for i := 0; i < 1000; i++ {
+		many = append(many, Check{Field: "player.stuns", Group: GroupReplay, OK: i < 400})
+	}
+	if r := Regressions(Aggregate(many), b); len(r) != 1 || !strings.HasPrefix(r[0], "player.stuns: 40.0%") {
+		t.Errorf("a 10-point drop over 1000 rows is no noise: %v", r)
 	}
 }
 

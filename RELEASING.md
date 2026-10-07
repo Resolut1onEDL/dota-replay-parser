@@ -50,7 +50,9 @@ scripts/release-sync.sh vX.Y.Z
 
 A release must not count anything worse than the last one. `cmd/audit` compares the
 parser with Valve's numbers (exact) and OpenDota's parse of the same replays, field by
-field; `audit/baseline.json` holds the lowest rate each field may have.
+field; `audit/baseline.json` holds each field's rate on the last full audit. A field at
+100 % must stay there; any other may fall only by sampling noise (three standard errors
+of its rate over the run's rows, at least 2 points).
 
 ```bash
 go build -o parser . && go build -o audit-bin ./cmd/audit
