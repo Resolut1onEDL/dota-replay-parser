@@ -3172,6 +3172,11 @@ func respawnTime(level int) int {
 func heroNameToPlayerIndex(combatLogName string, state *ParserState) int {
 	name := strings.TrimPrefix(combatLogName, "npc_dota_hero_")
 	heroID := heroNameStringToID(name)
+	// Not a hero (creep, courier, tower…): heroID 0 would match an empty
+	// slot of a <10-player lobby.
+	if heroID == 0 {
+		return -1
+	}
 
 	for i := 0; i < 10; i++ {
 		if state.Players[i].HeroID == heroID {

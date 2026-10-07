@@ -150,6 +150,37 @@ func TestHeroNameStringToID(t *testing.T) {
 	}
 }
 
+// A unit that is not a hero must not resolve to a player. Live case: match
+// 9032897977, a 1v1 lobby (Luna vs Puck) with slots 2–9 empty (heroId 0). A
+// Radiant creep's last hit on Puck resolved to heroId 0 → slot 2, which came
+// out as Hero_0 with 1 kill, 43 courier casts and 1.6s of stuns.
+func TestHeroNameToPlayerIndexEmptySlots(t *testing.T) {
+	state := &ParserState{}
+	for i := range state.Players {
+		state.Players[i] = &PlayerState{}
+	}
+	state.Players[0].HeroID = 48 // Luna
+	state.Players[1].HeroID = 13 // Puck
+
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"npc_dota_hero_luna", 0},
+		{"npc_dota_hero_puck", 1},
+		{"npc_dota_creep_goodguys_melee", -1},
+		{"npc_dota_courier", -1},
+		{"npc_dota_goodguys_tower1_mid", -1},
+		{"npc_dota_hero_axe", -1}, // a hero nobody picked
+		{"", -1},
+	}
+	for _, c := range cases {
+		if got := heroNameToPlayerIndex(c.in, state); got != c.want {
+			t.Errorf("heroNameToPlayerIndex(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 func TestDecodeSelectedHeroID(t *testing.T) {
 	cases := []struct {
 		raw    interface{}
