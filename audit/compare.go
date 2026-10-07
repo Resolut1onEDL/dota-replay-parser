@@ -64,7 +64,7 @@ func Compare(ours *Match, od *ODMatch, c Consts) []Check {
 	eq("match.duration", GroupValve, 0, ours.DurationSeconds, od.Duration)
 	eq("match.game_mode", GroupValve, 0, ours.GameMode, od.GameMode)
 	eq("match.lobby_type", GroupValve, 0, ours.LobbyType, od.LobbyType)
-	if od.FirstBloodTime != nil {
+	if od.FirstBloodTime != nil && *od.FirstBloodTime > 0 { // 0: OpenDota has none
 		fb := -1
 		for _, p := range ours.Players {
 			if p.Stats == nil {

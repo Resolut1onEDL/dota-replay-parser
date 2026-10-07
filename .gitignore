@@ -16,3 +16,4 @@
 .vscode/
 *.swp
 dist-release/
+/test-replays/*.dem.bz2

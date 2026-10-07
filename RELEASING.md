@@ -45,3 +45,25 @@ scripts/release-sync.sh vX.Y.Z
 - Checking sync state at any moment:
   `curl -s https://resoai-parse.fly.dev/healthz` + `./parser --version` +
   `grep parserVersion ../reso-coach-companion/package.json`.
+
+## Before the tag: the audit
+
+A release must not count anything worse than the last one. `cmd/audit` compares the
+parser with Valve's numbers (exact) and OpenDota's parse of the same replays, field by
+field; `audit/baseline.json` holds the lowest rate each field may have.
+
+```bash
+go build -o parser . && go build -o audit-bin ./cmd/audit
+./audit-bin pick  -dir ~/dota-replays/audit -n 100      # or reuse the last set
+./audit-bin fetch -dir ~/dota-replays/audit
+./audit-bin run   -dir ~/dota-replays/audit -parser ./parser -baseline audit/baseline.json
+```
+
+`run` exits 1 and lists the fields when one matches worse than the baseline. A fix that
+makes fields better is followed by `-write-baseline audit/baseline.json` and a commit of
+the new baseline. The same check runs every Monday on ~20 fresh matches
+(`.github/workflows/audit.yml`); `go test` runs it on the replays kept in `test-replays/`.
+Known differences of the references (OpenDota samples minutes a second early, its starting
+items are its first inventory sighting, Valve's XPM counts past level 30, …) are written in
+`audit/compare.go`, next to the check they affect.
+

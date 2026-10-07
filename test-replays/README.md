@@ -1,6 +1,7 @@
 # test-replays/
 
-Drop `.dem` files here to run the regression test (`go test`). Pair each replay
+Drop `.dem` (or `.dem.bz2`, as Valve serves them) files here to run the regression tests (`go test`:
+team assignment and the audit's exact fields, `TestAuditAgainstOpenDota`). Pair each replay
 with its OpenDota ground-truth JSON named `<match_id>_opendota.json`:
 
 ```
