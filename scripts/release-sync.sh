@@ -112,8 +112,8 @@ step "5/5 осталось руками (авто-апдейт игрокам)"
 cat <<EOF
   companion (Immortal-игроки получают через electron-updater):
     cd $COMPANION_DIR
-    git add -A && git commit -m "chore: parser $V" && npm version patch
-    npm run build && npm run release   # (команды релиза companion)
+    git add package.json && git commit -m "chore: parser $V" && npm version patch
+    git push --follow-tags origin main   # тег vX.Y.Z запускает CI companion: установщики + GitHub Release + latest*.yml
   uploader: рекомендован sunset — если ещё жив, тот же цикл.
 
 Каналы синхронизированы на $V. Проверка одной строкой в любой момент:
