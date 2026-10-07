@@ -24,8 +24,9 @@ const (
 )
 
 // DamageSecond is the damage one source dealt to one real hero within one game
-// second, by damage type. Illusions of the attacker count as the attacker
-// (same rule as heroDamage); damage to illusions is not recorded.
+// second, by damage type. A player's illusions, summons and dominated creeps
+// count as the player (same rule as heroDamage); damage to illusions and
+// Sunder's HP swap are not recorded.
 type DamageSecond struct {
 	T int `json:"t"` // floor of the game second, 0 = horn
 	A int `json:"a"` // attacker slot 0-9, or a src* code
@@ -97,14 +98,20 @@ func damageSource(attackerName string, state *ParserState) int {
 
 // recordDamage keeps one combat-log damage entry whose victim is a real hero.
 func (s *ParserState) recordDamage(m *dota.CMsgDOTACombatLogEntry, t float64, attackerName, targetName string, damage int, damageType uint32) {
-	if damage <= 0 || m.GetIsTargetIllusion() || !strings.HasPrefix(targetName, "npc_dota_hero_") {
+	if damage <= 0 || m.GetIsTargetIllusion() || !strings.HasPrefix(targetName, "npc_dota_hero_") ||
+		s.LookupName(m.GetInflictorName()) == "terrorblade_sunder" {
 		return
 	}
 	v := heroNameToPlayerIndex(targetName, s)
 	if v < 0 || v >= 10 {
 		return
 	}
-	s.DamageHits = append(s.DamageHits, damageHit{T: t, A: damageSource(attackerName, s), V: v, K: int(damageType), D: damage})
+	// a player's summons, dominated creeps and illusions count as the player (heroDamage's rule)
+	a := s.damageOwner(m, attackerName)
+	if a < 0 {
+		a = damageSource(attackerName, s)
+	}
+	s.DamageHits = append(s.DamageHits, damageHit{T: t, A: a, V: v, K: int(damageType), D: damage})
 }
 
 // combatSeconds sums the hits per (second, attacker, victim, type), in time order.

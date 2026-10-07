@@ -112,6 +112,8 @@ type KillEvent struct {
 	TargetName string  `json:"targetName,omitempty"`
 	PositionX  float64 `json:"positionX,omitempty"`
 	PositionY  float64 `json:"positionY,omitempty"`
+	// v4.10.0: the victim came back (Aegis, Wraith King's Reincarnation) — Valve's scoreboard counts no kill
+	Reincarnated bool `json:"reincarnated,omitempty"`
 }
 
 type DeathEvent struct {
@@ -133,6 +135,8 @@ type DeathEvent struct {
 	HadTP           bool    `json:"hadTP,omitempty"`
 	NearbyAllies    []int   `json:"nearbyAllies,omitempty"`
 	NearbyEnemies   []int   `json:"nearbyEnemies,omitempty"`
+	// v4.10.0: the hero came back (Aegis, Wraith King's Reincarnation) — Valve's scoreboard counts no death
+	Reincarnated bool `json:"reincarnated,omitempty"`
 }
 
 type AssistEvent struct {
@@ -920,6 +924,9 @@ type PlayerState struct {
 	
 	// Events
 	ItemPurchases []ItemPurchase
+	StartingItemsDone bool           // v4.10.0: the spawn inventory is recorded as starting purchases
+	StartingT         float64        // when that inventory was read
+	StartingLeft      map[string]int // starting items not yet met by their own combat-log purchase
 	DeathEvents   []DeathEvent
 	KillEvents    []KillEvent
 	AssistEvents  []AssistEvent
@@ -946,6 +953,8 @@ type PlayerState struct {
 	DamageReceivedMagical  int
 	DamageReceivedPure     int
 	StunDurationDealt      float64
+	ValveStuns             float64 // m_fStuns of the team data entity — the source of stunDurationDealt when present
+	HasValveStuns          bool
 
 	// Item usage tracking (item_name → count)
 	ItemUsage  map[string]int
@@ -959,6 +968,13 @@ type PlayerState struct {
 	// Skill build tracking
 	SkillBuild      []SkillLevelUp
 	PrevAbilityLvls map[string]int // ability name → highest recorded level
+	// v4.10.0: skill points spent (m_iTotalAbilityPoints − m_iAbilityPoints, Aghanim's points included) and
+	// the level rises waiting for one (see matchSkills)
+	SpentSeen    bool
+	Spent        int
+	SkillCredits []float64 // when each not-yet-matched point was spent
+	PendingRises []pendingRise
+	SlotLevels   [6]int // levels in ability slots 0-5 at the last hero scan (0-2 basic, 5 ultimate)
 
 	// Talent tracking: ability slot index (m_vecAbilities.NNNN) → talent
 	// info for special_bonus_* abilities. Overwritten on every hero entity
@@ -1059,6 +1075,9 @@ type ParserState struct {
 	// v4.7.1: ability entity index → owning player, filled only from real
 	// heroes' own abilities (see observeHeroAbility).
 	SkillAbilities map[int32]*skillAbility
+	// purchases whose hero had no player yet (exported: rebasePreHorn moves their parked times)
+	PendingPurchases []PendingPurchase
+	SkillHidden    map[int32]bool // ability entity → m_bHidden at its last sighting
 
 	// Ward entity → in-flight ward, для длительности (v4.3.0)
 	ActiveWards map[int32]*activeWard
@@ -1157,6 +1176,96 @@ type ParserState struct {
 	// runs AHEAD of the combat axis by the accumulated pause total — probes
 	// mixing those axes produce phantom mismatches on paused demos.
 	EntityAxisOffset float64
+}
+
+type PendingPurchase struct {
+	Time    float64
+	Hero    string
+	Item    string
+	Counted bool // already subtracted from the starting items when they were read
+}
+
+// flushPendingPurchases hands the waiting purchases to their players and keeps each list in time order.
+func (s *ParserState) flushPendingPurchases() {
+	if len(s.PendingPurchases) == 0 {
+		return
+	}
+	touched := map[int]bool{}
+	kept := s.PendingPurchases[:0]
+	for _, p := range s.PendingPurchases {
+		idx := heroNameToPlayerIndex(p.Hero, s)
+		if idx < 0 || idx >= 10 {
+			kept = append(kept, p)
+			continue
+		}
+		if !p.Counted && p.Time <= s.Players[idx].StartingT && s.Players[idx].StartingLeft[p.Item] > 0 {
+			s.Players[idx].StartingLeft[p.Item]-- // bought before the inventory was read, logged after: in the starting items
+			continue
+		}
+		s.Players[idx].ItemPurchases = append(s.Players[idx].ItemPurchases, ItemPurchase{Time: p.Time, ItemName: p.Item, ItemID: itemNameToID[p.Item]})
+		touched[idx] = true
+	}
+	s.PendingPurchases = kept
+	for idx := range touched {
+		list := s.Players[idx].ItemPurchases
+		sort.SliceStable(list, func(i, j int) bool { return list[i].Time < list[j].Time })
+	}
+}
+
+// abilityEntityName is an ability's own name (luna_lucent_beam, as the combat log and Valve's ability_upgrades
+// name it), or its lower-cased class suffix (luna_lucentbeam) when the replay has no name for the entity.
+func abilityEntityName(s *ParserState, e *manta.Entity, className string) string {
+	if name := s.entityName(e); name != "" {
+		return name
+	}
+	name := strings.TrimPrefix(className, "CDOTA_Ability_")
+	name = strings.TrimPrefix(name, "CDOTA_Item_Ability_")
+	return strings.ToLower(name)
+}
+
+// itemEntityName is the item's own name (item_boots) from the EntityNames string table. The class name does not
+// always carry it — CDOTA_Item_Boots_Of_Speed, CDOTA_Item_DustofAppearance and others had no entry in
+// entityClassToItemName and came out as item id 0, so final items lost boots, dust, gem, travel boots.
+func (s *ParserState) itemEntityName(e *manta.Entity) string {
+	if name := s.entityName(e); strings.HasPrefix(name, "item_") {
+		return name
+	}
+	return ""
+}
+
+// entityName is an entity's own name from the EntityNames string table. The index field was renamed between
+// replay versions — m_nameStringableIndex in replays of 2026-01, m_nameStringTableIndex in newer ones — and a
+// lookup by one name alone silently found nothing in the others (talents, item names, tier-3 towers).
+func (s *ParserState) entityName(e *manta.Entity) string {
+	for _, field := range []string{"m_pEntity.m_nameStringTableIndex", "m_pEntity.m_nameStringableIndex"} {
+		if idx, ok := e.GetInt32(field); ok && idx >= 0 {
+			if name, ok := s.Parser.LookupStringByIndex("EntityNames", idx); ok {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+// damageOwner is the player a combat-log damage or death entry counts for: its damage source (the owner of a
+// summon, a dominated creep or an illusion — also an illusion of an enemy hero that Reflection, Disruption or
+// Wall of Replica made), else the attacker hero. -1 when no player is behind it (creeps, towers, Roshan).
+func (s *ParserState) damageOwner(m *dota.CMsgDOTACombatLogEntry, attackerName string) int {
+	return s.ownerByNames(s.LookupName(m.GetDamageSourceName()), attackerName)
+}
+
+func (s *ParserState) ownerByNames(src, attackerName string) int {
+	if strings.HasPrefix(src, "npc_dota_hero_") {
+		if idx := heroNameToPlayerIndex(src, s); idx >= 0 && idx < 10 {
+			return idx
+		}
+	}
+	if strings.HasPrefix(attackerName, "npc_dota_hero_") {
+		if idx := heroNameToPlayerIndex(attackerName, s); idx >= 0 && idx < 10 {
+			return idx
+		}
+	}
+	return -1
 }
 
 // entityActual returns the entity-tick game time projected onto the
@@ -1346,6 +1455,7 @@ func NewParserState(p *manta.Parser) *ParserState {
 		ItemEntities:       make(map[int32]string),
 		AbilityEntities:    make(map[int32]*AbilityEntityInfo),
 		SkillAbilities:     make(map[int32]*skillAbility),
+		SkillHidden:        make(map[int32]bool),
 		ActiveWards:        make(map[int32]*activeWard),
 		PendingRunes:       make(map[int32]*RuneEntityInfo),
 		HeroEntityToPlayer: make(map[int32]int),
@@ -1841,17 +1951,21 @@ func main() {
 				state.PendingDewards = append(state.PendingDewards, pendingDeward{t: actualTime, wardType: wt})
 			}
 
-			if strings.Contains(targetName, "hero") {
+			// an illusion's death is no death and no kill; a kill counts for the owner of the unit that landed it
+			if strings.Contains(targetName, "hero") && !m.GetIsTargetIllusion() {
 				targetIdx := heroNameToPlayerIndex(targetName, state)
-				attackerIdx := heroNameToPlayerIndex(attackerName, state)
+				attackerIdx := state.damageOwner(m, attackerName)
+				// an Aegis or Reincarnation death: kept as an event, flagged; no assists, no lane counts
+				reincarnated := m.GetWillReincarnate()
 
 				// Extract assist player indices from protobuf
 				var assistIndices []int
 				assistPlayers := m.GetAssistPlayers()
 				if len(assistPlayers) > 0 {
+					// the combat log lists the killer among the assists; his assist count does not grow
 					for _, apIdx := range assistPlayers {
 						idx := int(apIdx)
-						if idx >= 0 && idx < 10 {
+						if idx >= 0 && idx < 10 && idx != attackerIdx {
 							assistIndices = append(assistIndices, idx)
 						}
 					}
@@ -1914,15 +2028,16 @@ func main() {
 						NearbyEnemies:   nearbyEnemies,
 						TimeDead:        respawnTime(state.Players[targetIdx].Level),
 						GoldLost:        goldLost,
+						Reincarnated:    reincarnated,
 					})
-					if actualTime >= 0 && actualTime < 600 {
+					if actualTime >= 0 && actualTime < 600 && !reincarnated {
 						state.Players[targetIdx].LaneDeaths++
 					}
 				}
 
 				// Track assists (total + events + lane)
 				for _, aIdx := range assistIndices {
-					if aIdx >= 0 && aIdx < 10 {
+					if aIdx >= 0 && aIdx < 10 && !reincarnated {
 						state.Players[aIdx].Assists++
 						state.Players[aIdx].AssistEvents = append(state.Players[aIdx].AssistEvents, AssistEvent{
 							Time:   actualTime,
@@ -1937,11 +2052,12 @@ func main() {
 				if attackerIdx >= 0 && attackerIdx < 10 {
 					state.Players[attackerIdx].Kills++
 					state.Players[attackerIdx].KillEvents = append(state.Players[attackerIdx].KillEvents, KillEvent{
-						Time:       actualTime,
-						Target:     targetIdx,
-						TargetName: targetName,
+						Time:         actualTime,
+						Target:       targetIdx,
+						TargetName:   targetName,
+						Reincarnated: reincarnated,
 					})
-					if actualTime >= 0 && actualTime < 600 {
+					if actualTime >= 0 && actualTime < 600 && !reincarnated {
 						state.Players[attackerIdx].LaneKills++
 					}
 				}
@@ -1957,7 +2073,8 @@ func main() {
 					}
 				}
 				if !isDuplicate {
-					killerIdx := heroNameToPlayerIndex(attackerName, state)
+					// a summon's last hit is its owner's (Lycan's wolves took Roshan for radiant, read as dire before)
+					killerIdx := state.damageOwner(m, attackerName)
 					team := "dire"
 					if killerIdx >= 0 && killerIdx < 10 && state.Players[killerIdx].IsRadiant {
 						team = "radiant"
@@ -1974,7 +2091,7 @@ func main() {
 			if strings.Contains(targetName, "tower") || strings.Contains(targetName, "rax") ||
 			   strings.Contains(targetName, "barracks") || strings.Contains(targetName, "fort") {
 				isRadiantBuilding := strings.Contains(targetName, "goodguys")
-				killerPlayerIdx := heroNameToPlayerIndex(attackerName, state)
+				killerPlayerIdx := state.damageOwner(m, attackerName)
 				state.BuildingKills = append(state.BuildingKills, BuildingEvent{
 					Time:         actualTime,
 					Building:     targetName,
@@ -1985,7 +2102,7 @@ func main() {
 			}
 
 			// Track creep kills: lane vs jungle (for coaching pattern P-014)
-			if strings.Contains(attackerName, "hero") {
+			if owner := state.damageOwner(m, attackerName); owner >= 0 {
 				isLaneCreep := strings.Contains(targetName, "npc_dota_creep_goodguys") ||
 					strings.Contains(targetName, "npc_dota_creep_badguys") ||
 					strings.Contains(targetName, "npc_dota_goodguys_siege") ||
@@ -1993,7 +2110,7 @@ func main() {
 				isJungleCreep := strings.Contains(targetName, "npc_dota_neutral_")
 
 				if isLaneCreep || isJungleCreep {
-					atkIdx := heroNameToPlayerIndex(attackerName, state)
+					atkIdx := owner
 					if atkIdx >= 0 && atkIdx < 10 {
 						if isLaneCreep {
 							state.Players[atkIdx].LaneCreepKills++
@@ -2038,12 +2155,23 @@ func main() {
 			valueName := state.LookupName(m.GetValue())
 			playerIdx := heroNameToPlayerIndex(targetName, state)
 
-			if playerIdx >= 0 && playerIdx < 10 {
+			if valueName == "item_ward_dispenser" {
+				// v4.10.0: not a purchase — an observer and a sentry in one slot combine into it, and the combat log
+				// logs the combine next to the ward actually bought (OpenDota's purchase_log leaves it out too)
+			} else if playerIdx >= 0 && playerIdx < 10 && state.GameStartTime == 0 && actualTime <= state.Players[playerIdx].StartingT &&
+				state.Players[playerIdx].StartingLeft[valueName] > 0 {
+				// bought before the inventory was read, logged after it: already in the starting items
+				state.Players[playerIdx].StartingLeft[valueName]--
+			} else if playerIdx >= 0 && playerIdx < 10 {
 				state.Players[playerIdx].ItemPurchases = append(state.Players[playerIdx].ItemPurchases, ItemPurchase{
 					Time:     actualTime,
 					ItemName: valueName,
 					ItemID:   itemNameToID[valueName],
 				})
+			} else if strings.HasPrefix(targetName, "npc_dota_hero_") {
+				// v4.10.0: a starting item bought in the strategy phase, before the hero is mapped to a player —
+				// it was dropped, so no pre-horn purchase ever reached the output; it waits for the mapping
+				state.PendingPurchases = append(state.PendingPurchases, PendingPurchase{Time: actualTime, Hero: targetName, Item: valueName})
 			}
 
 		case dota.DOTA_COMBATLOG_TYPES_DOTA_COMBATLOG_DAMAGE:
@@ -2052,6 +2180,29 @@ func main() {
 			damage := int(m.GetValue())
 			damageType := m.GetDamageType()
 			state.recordDamage(m, actualTime, attackerName, targetName, damage, damageType)
+
+			// hero_damage and the per-target report count as Valve's scoreboard does (checked against
+			// OpenDota's hero_damage on 70 players, exact for 65): damage to a real enemy hero — not to an
+			// illusion — credited to its source (the owner of a summon, a dominated creep or an illusion, even an
+			// enemy-hero illusion of Reflection/Disruption/Wall of Replica); Sunder swaps HP, it is not damage.
+			if owner := state.damageOwner(m, attackerName); owner >= 0 && damage > 0 && !m.GetIsTargetIllusion() &&
+				strings.HasPrefix(targetName, "npc_dota_hero_") && state.LookupName(m.GetInflictorName()) != "terrorblade_sunder" {
+				if victim := heroNameToPlayerIndex(targetName, state); victim >= 0 && victim < 10 &&
+					state.Players[owner].IsRadiant != state.Players[victim].IsRadiant {
+					state.Players[owner].HeroDamage += damage
+					if state.Players[owner].DamageByTarget[victim] == nil {
+						state.Players[owner].DamageByTarget[victim] = &DamageTarget{Target: victim}
+					}
+					switch damageType {
+					case 1:
+						state.Players[owner].DamageByTarget[victim].PhysicalDamage += damage
+					case 2:
+						state.Players[owner].DamageByTarget[victim].MagicalDamage += damage
+					case 4:
+						state.Players[owner].DamageByTarget[victim].PureDamage += damage
+					}
+				}
+			}
 
 			if strings.Contains(targetName, "hero") && strings.Contains(attackerName, "hero") {
 				attackerIdx := heroNameToPlayerIndex(attackerName, state)
@@ -2065,8 +2216,6 @@ func main() {
 					state.Players[attackerIdx].IsRadiant != state.Players[targetIdx].IsRadiant
 
 				if isEnemyHero {
-					state.Players[attackerIdx].HeroDamage += damage
-
 					// Lane damage taken (victim side): enemy-hero damage the target
 					// eats before 5:00 — inverse of LaneHarassCount; surfaces poor
 					// lane standing ("how much you get punished on the lane").
@@ -2074,14 +2223,7 @@ func main() {
 						state.Players[targetIdx].LaneDamageTakenPre5 += damage
 					}
 
-					// Track damage by target
-					if state.Players[attackerIdx].DamageByTarget[targetIdx] == nil {
-						state.Players[attackerIdx].DamageByTarget[targetIdx] = &DamageTarget{Target: targetIdx}
-					}
-					switch damageType {
-					case 1: // Physical
-						state.Players[attackerIdx].DamageByTarget[targetIdx].PhysicalDamage += damage
-
+					if damageType == 1 { // Physical
 						// Харасс: долетевший физурон по герою на линии
 						if actualTime > 60 && actualTime < 600 {
 							state.Players[attackerIdx].LaneHarassCount++
@@ -2097,10 +2239,6 @@ func main() {
 							kept = append(kept, pd)
 						}
 						state.PendingAggro = kept
-					case 2: // Magical
-						state.Players[attackerIdx].DamageByTarget[targetIdx].MagicalDamage += damage
-					case 4: // Pure
-						state.Players[attackerIdx].DamageByTarget[targetIdx].PureDamage += damage
 					}
 				}
 
@@ -2142,8 +2280,9 @@ func main() {
 			// tower_damage = damage by hero to *enemy* buildings only.
 			// OpenDota lumps tower/rax/ancient/fort under tower_damage, but
 			// excludes ally-side damage (e.g. teammate's tower hit by AoE).
-			if isBuildingTarget(targetName) && strings.Contains(attackerName, "hero") {
-				attackerIdx := heroNameToPlayerIndex(attackerName, state)
+			if isBuildingTarget(targetName) {
+				// credited like hero damage: Shadow Shaman's wards and Nature's Prophet's treants are their towers' damage
+				attackerIdx := state.damageOwner(m, attackerName)
 				if attackerIdx >= 0 && attackerIdx < 10 {
 					if isRad, ok := buildingIsRadiant(targetName); ok && isRad != state.Players[attackerIdx].IsRadiant {
 						state.Players[attackerIdx].TowerDamage += damage
@@ -2581,6 +2720,9 @@ func main() {
 						}
 						entityIdx := int32(handle & 0x3FFF)
 						if itemEnt := state.Parser.FindEntity(entityIdx); itemEnt != nil {
+							if name := state.itemEntityName(itemEnt); name != "" {
+								return name
+							}
 							cn := itemEnt.GetClassName()
 							if strings.HasPrefix(cn, "CDOTA_Item_") {
 								return normalizeEntityItemName(strings.TrimPrefix(cn, "CDOTA_Item_"))
@@ -2590,6 +2732,42 @@ func main() {
 					}
 					for i := 0; i < 6; i++ {
 						state.Players[playerIdx].FinalItems[i] = resolveItem(fmt.Sprintf("m_hItems.%04d", i))
+					}
+					// v4.10.0: starting items. What the hero spawns with was bought in the strategy phase, which the
+					// combat log does not record (no pre-horn purchase ever reached the output); like OpenDota, the
+					// first inventory seen before the horn is taken as purchases at that moment — minus the ones the
+					// combat log did catch.
+					if ps := state.Players[playerIdx]; !ps.StartingItemsDone && state.GameStartTime == 0 {
+						var names []string
+						for i := 0; i < 9; i++ {
+							if n := resolveItem(fmt.Sprintf("m_hItems.%04d", i)); n != "" && n != "item_ward_dispenser" {
+								names = append(names, n)
+							}
+						}
+						if len(names) > 0 {
+							ps.StartingItemsDone, ps.StartingT = true, actualGameTime
+							logged := map[string]int{}
+							for _, b := range ps.ItemPurchases {
+								logged[b.ItemName]++
+							}
+							for i, b := range state.PendingPurchases {
+								if heroNameToPlayerIndex(b.Hero, state) == playerIdx {
+									logged[b.Item]++
+									state.PendingPurchases[i].Counted = true
+								}
+							}
+							for _, n := range names {
+								if logged[n] > 0 {
+									logged[n]--
+									continue
+								}
+								ps.ItemPurchases = append(ps.ItemPurchases, ItemPurchase{Time: actualGameTime, ItemName: n, ItemID: itemNameToID[n]})
+								if ps.StartingLeft == nil {
+									ps.StartingLeft = map[string]int{}
+								}
+								ps.StartingLeft[n]++
+							}
+						}
 					}
 					for i := 0; i < 3; i++ {
 						name := resolveItem(fmt.Sprintf("m_hItems.%04d", 6+i))
@@ -2627,6 +2805,9 @@ func main() {
 						isIllusion = true
 					}
 					stolenNames := map[string]bool{}
+					// levels already in the basic and ultimate slots when the hero is first seen (see below)
+					var firstLevels []pendingRise
+					firstSum := 0
 					for ai := 0; ai < 24 && !isIllusion; ai++ {
 						key := fmt.Sprintf("m_vecAbilities.%04d", ai)
 						if handle, ok := e.GetUint32(key); ok && handle > 0 && handle < 16777215 {
@@ -2644,27 +2825,36 @@ func main() {
 							// Runs before the CDOTA_Ability_ class filter
 							// below because talent entities may use a
 							// different class.
-							if nameIdx, okN := abEnt.GetInt32("m_pEntity.m_nameStringTableIndex"); okN && nameIdx >= 0 {
-								if entName, okT := state.Parser.LookupStringByIndex("EntityNames", nameIdx); okT && strings.HasPrefix(entName, "special_bonus_") {
-									talentLvl := 0
-									if l, okL := abEnt.GetInt32("m_iLevel"); okL {
-										talentLvl = int(l)
-									}
-									state.Players[playerIdx].TalentSlots[ai] = AbilityEntityInfo{Name: entName, Level: talentLvl}
+							if entName := state.entityName(abEnt); strings.HasPrefix(entName, "special_bonus_") {
+								talentLvl := 0
+								if l, okL := abEnt.GetInt32("m_iLevel"); okL {
+									talentLvl = int(l)
 								}
+								state.Players[playerIdx].TalentSlots[ai] = AbilityEntityInfo{Name: entName, Level: talentLvl}
+								// v4.10.0: a talent taken is a skill point in Valve's ability_upgrades too
+								state.SkillHidden[entityIdx] = false
+								state.observeHeroAbility(playerIdx, entityIdx, entName, talentLvl, false, actualGameTime)
+								continue
 							}
 
 							abClass := abEnt.GetClassName()
 							if !strings.HasPrefix(abClass, "CDOTA_Ability_") {
 								continue
 							}
-							// Get clean ability name
-							abilityName := strings.TrimPrefix(abClass, "CDOTA_Ability_")
-							abilityName = strings.ToLower(abilityName)
+							abilityName := abilityEntityName(state, abEnt, abClass)
 
 							abilityLevel := 0
 							if lvl, ok2 := abEnt.GetInt32("m_iLevel"); ok2 {
 								abilityLevel = int(lvl)
+							}
+							hidden, _ := abEnt.GetBool("m_bHidden")
+							state.SkillHidden[entityIdx] = hidden
+							if ai <= 5 {
+								state.Players[playerIdx].SlotLevels[ai] = abilityLevel
+							}
+							if (ai <= 2 || ai == 5) && abilityLevel > 0 && !state.Players[playerIdx].SpentSeen {
+								firstLevels = append(firstLevels, pendingRise{Name: abilityName, Level: abilityLevel, T: actualGameTime})
+								firstSum += abilityLevel
 							}
 
 							// Rubick's stolen spells sit in his own slots, flagged m_bStolen.
@@ -2672,8 +2862,8 @@ func main() {
 							state.observeHeroAbility(playerIdx, entityIdx, abilityName, abilityLevel, stolen, actualGameTime)
 							// v4.9.0: the combat log names a cast by the ability's entity name
 							// (lina_laguna_blade), not by its class (lina_lagunablade).
-							if nameIdx, okN := abEnt.GetInt32("m_pEntity.m_nameStringTableIndex"); stolen && okN && nameIdx >= 0 {
-								if entName, okT := state.Parser.LookupStringByIndex("EntityNames", nameIdx); okT {
+							if stolen {
+								if entName := state.entityName(abEnt); entName != "" {
 									stolenNames[entName] = true
 								}
 							}
@@ -2681,6 +2871,29 @@ func main() {
 					}
 					if !isIllusion {
 						state.stolenNow[playerIdx] = stolenNames
+						// skill points spent so far: an ability level is an upgrade only against one of these
+						tot, okT := e.GetInt32("m_iTotalAbilityPoints")
+						cur, okC := e.GetInt32("m_iAbilityPoints")
+						if okT && okC {
+							spent := int(tot - cur)
+							if at, okA := e.GetInt32("m_iTotalAghanimsAbilityPoints"); okA {
+								if ac, okAC := e.GetInt32("m_iAghanimsAbilityPoints"); okAC {
+									spent += int(at - ac)
+								}
+							}
+							// a hero first seen with points already spent (Io and Bristleback took their first
+							// skill the instant they spawned): the levels in the basic and ultimate slots are those
+							// points when they add up — innate and sub-abilities sit in the other slots
+							if ps := state.Players[playerIdx]; !ps.SpentSeen && spent > 0 && firstSum == spent {
+								for _, f := range firstLevels {
+									for lvl := 1; lvl <= f.Level; lvl++ {
+										state.appendSkillUp(playerIdx, f.Name, lvl, f.T)
+									}
+								}
+								ps.Spent, ps.SpentSeen = spent, true
+							}
+							state.skillSpent(playerIdx, spent, actualGameTime)
+						}
 					}
 				}
 			}
@@ -2749,8 +2962,8 @@ func main() {
 		// v4.6.0: tier-3 tower cells → enemy-base plateau thresholds. Six
 		// towers total; captured once each, before any of them can die.
 		if className == "CDOTA_BaseNPC_Tower" && len(state.HgTowerCells) < 6 {
-			if nameIdx, okN := e.GetInt32("m_pEntity.m_nameStringTableIndex"); okN && nameIdx >= 0 {
-				if name, okT := state.Parser.LookupStringByIndex("EntityNames", nameIdx); okT && strings.Contains(name, "tower3") {
+			{
+				if name := state.entityName(e); strings.Contains(name, "tower3") {
 					if _, have := state.HgTowerCells[name]; !have {
 						if cx, ok := e.GetUint64("CBodyComponent.m_cellX"); ok {
 							if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
@@ -2834,13 +3047,20 @@ func main() {
 				if paused && !state.PauseActive {
 					state.PauseActive = true
 					state.PauseStartTick = p.NetTick
+					// v4.10.0: the pause began at Valve's own m_nPauseStartTick; the flag reached us up to 9 s
+					// later (9013821098: tick 2610 vs 2873), and every pause came out that much short — the
+					// entity clock then ran ahead of the combat log by the sum (wards, runes, minute samples).
+					if st, okST := e.GetInt32("m_pGameRules.m_nPauseStartTick"); okST && st > 0 && uint32(st) <= p.NetTick {
+						state.PauseStartTick = uint32(st)
+					}
 					// v4.8.0: identical to the old formula once the horn is
 					// known; before it, the stamp parks on the epoch and is
 					// rebased with everything else (a pregame pause used to
 					// be filed at game-time 0 — match 8989163978 had a 14s
-					// one 30s before the horn).
+					// one 30s before the horn). v4.10.0: minus the pauses
+					// before it, like GameTime().
 					if state.TickInterval > 0 {
-						state.PauseStartGameSec = state.ActualGameSeconds(float64(p.NetTick) * float64(state.TickInterval))
+						state.PauseStartGameSec = state.ActualGameSeconds(float64(state.PauseStartTick-state.PausedTicksTotal) * float64(state.TickInterval))
 					} else {
 						state.PauseStartGameSec = 0
 					}
@@ -2863,6 +3083,10 @@ func main() {
 					})
 					state.PauseStartTicks = append(state.PauseStartTicks, state.PauseStartTick)
 					state.PausedTicksTotal += ticks
+					// Valve's running total is the truth when the replay carries it
+					if tp, okTP := e.GetInt32("m_pGameRules.m_nTotalPausedTicks"); okTP && tp >= 0 {
+						state.PausedTicksTotal = uint32(tp)
+					}
 				}
 			}
 		}
@@ -2920,35 +3144,20 @@ func main() {
 					continue
 				}
 				ps := state.Players[playerIdx]
-
-				if lh, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iLastHitCount", i)); ok {
-					ps.LastHits = int(lh)
-				}
-				if denies, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iDenyCount", i)); ok {
-					ps.Denies = int(denies)
-				}
-				if nw, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iNetWorth", i)); ok {
-					ps.NetWorth = int(nw)
-				}
-				// Try to read entity-based XP (more accurate than combat log)
-				if xp, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iTotalEarnedXP", i)); ok && xp > 0 {
-					ps.XP = int(xp) // Override combat log XP with entity value
-				}
 				gameOver := state.GameEndTime > 0 && state.GameTime() > state.GameEndTime
-				// v4.7.4: the source of Valve's gold_per_min. Frozen at the game's end:
-				// the replay's post-game tail keeps adding income to some players
-				// (+1000 gold for five of them in match 9023007039).
-				if g, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iTotalEarnedGold", i)); ok && g > 0 && !gameOver {
-					ps.TotalEarnedGold = int(g)
-				}
 
 				// Record per-minute snapshot (only after GameStartTime is known
 				// and before game-end). LastMinute starts at -1 so the first
 				// snapshot fires at gameMinute=0 (horn), aligning ours[i] with
-				// OpenDota's *_t[i] at minute i.
+				// OpenDota's *_t[i] at minute i. v4.10.0: taken BEFORE this update is
+				// read — the values as they stood at the minute boundary; the first
+				// update past it came up to a few seconds late (a last hit at 1:03
+				// counted at minute 1, unlike OpenDota's lh_t).
 				if gameMinute > ps.LastMinute && state.GameStartTime > 0 && !gameOver {
+					// the per-minute gold is the gold earned so far (Valve's m_iTotalEarnedGold, OpenDota's gold_t),
+					// not the combat log's running sum of income and spending it was before v4.10.0
 					ps.MinuteSnapshots = append(ps.MinuteSnapshots, MinuteSnapshot{
-						Gold:   ps.Gold,
+						Gold:   ps.TotalEarnedGold,
 						XP:     ps.XP,
 						LH:     ps.LastHits,
 						Denies: ps.Denies,
@@ -2959,12 +3168,39 @@ func main() {
 					
 					// Save 10-minute snapshot
 					if gameMinute == 10 {
-						ps.GoldAt10 = ps.Gold
+						ps.GoldAt10 = ps.TotalEarnedGold
 						ps.XPAt10 = ps.XP
 						ps.NWAt10 = ps.NetWorth
 						ps.LevelAt10 = ps.Level
 						ps.EntityXPAt10 = ps.XP // Will be entity XP if m_iTotalEarnedXP was found
 					}
+				}
+
+				if lh, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iLastHitCount", i)); ok {
+					ps.LastHits = int(lh)
+				}
+				if denies, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iDenyCount", i)); ok {
+					ps.Denies = int(denies)
+				}
+				// frozen at the game's end like the earned gold below: the post-game tail added 1000-1400 to the
+				// net worth of several players (8990977035, 8987265771), past Valve's final number
+				if nw, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iNetWorth", i)); ok && !gameOver {
+					ps.NetWorth = int(nw)
+				}
+				// Try to read entity-based XP (more accurate than combat log)
+				if xp, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iTotalEarnedXP", i)); ok && xp > 0 {
+					ps.XP = int(xp) // Override combat log XP with entity value
+				}
+				// v4.7.4: the source of Valve's gold_per_min. Frozen at the game's end:
+				// the replay's post-game tail keeps adding income to some players
+				// (+1000 gold for five of them in match 9023007039).
+				if g, ok := e.GetInt32(fmt.Sprintf("m_vecDataTeam.%04d.m_iTotalEarnedGold", i)); ok && g > 0 && !gameOver {
+					ps.TotalEarnedGold = int(g)
+				}
+				// v4.10.0: Valve's own stun total (the post-game "stuns"); the combat-log sum also counted stuns
+				// on illusions, allies and self
+				if st, ok := e.GetFloat32(fmt.Sprintf("m_vecDataTeam.%04d.m_fStuns", i)); ok && !gameOver {
+					ps.ValveStuns, ps.HasValveStuns = float64(st), true
 				}
 			}
 
@@ -3093,18 +3329,22 @@ func main() {
 		// Track item entities for final items lookup (normalize to standard item_ names)
 		if strings.HasPrefix(className, "CDOTA_Item_") && !strings.Contains(className, "Rune") {
 			idx := e.GetIndex()
-			rawName := strings.TrimPrefix(className, "CDOTA_Item_")
-			state.ItemEntities[idx] = normalizeEntityItemName(rawName)
+			if name := state.itemEntityName(e); name != "" {
+				state.ItemEntities[idx] = name
+			} else {
+				state.ItemEntities[idx] = normalizeEntityItemName(strings.TrimPrefix(className, "CDOTA_Item_"))
+			}
 		}
 
 		// Track ability entities for skill build detection
-		if strings.HasPrefix(className, "CDOTA_Ability_") || strings.HasPrefix(className, "CDOTA_Item_Ability_") {
+		// v4.10.0: talents too, whatever their class — their level shows here before the hero's next update
+		if strings.HasPrefix(className, "CDOTA_Ability_") || strings.HasPrefix(className, "CDOTA_Item_Ability_") ||
+			strings.HasPrefix(state.entityName(e), "special_bonus_") {
 			idx := e.GetIndex()
-			abilityName := className
-			// Strip prefixes to get clean ability name
-			abilityName = strings.TrimPrefix(abilityName, "CDOTA_Ability_")
-			abilityName = strings.TrimPrefix(abilityName, "CDOTA_Item_Ability_")
-			abilityName = strings.ToLower(abilityName)
+			abilityName := abilityEntityName(state, e, className)
+			if hidden, okH := e.GetBool("m_bHidden"); okH {
+				state.SkillHidden[idx] = hidden
+			}
 
 			abilityLevel := 0
 			if lvl, ok := e.GetInt32("m_iLevel"); ok {
@@ -3153,7 +3393,7 @@ func main() {
 	// current values, or append one if we never reached the final minute.
 	finalMinute := int(duration / 60)
 	finalSnap := func(ps *PlayerState) MinuteSnapshot {
-		return MinuteSnapshot{Gold: ps.Gold, XP: ps.XP, LH: ps.LastHits, Denies: ps.Denies, NW: ps.NetWorth, Level: ps.Level}
+		return MinuteSnapshot{Gold: ps.TotalEarnedGold, XP: ps.XP, LH: ps.LastHits, Denies: ps.Denies, NW: ps.NetWorth, Level: ps.Level}
 	}
 	for i := 0; i < 10; i++ {
 		ps := state.Players[i]
@@ -3165,6 +3405,10 @@ func main() {
 		}
 	}
 
+	for i := 0; i < 10; i++ {
+		state.matchSkills(i, math.Inf(1)) // the last level rises of the replay
+	}
+	state.flushPendingPurchases()
 	match := buildMatchOutput(state, duration)
 
 	jsonData, err := json.MarshalIndent(match, "", "  ")
@@ -3714,7 +3958,7 @@ func (s *ParserState) observeHeroAbility(player int, idx int32, name string, lev
 	}
 	if level > sa.Level {
 		sa.Level = level
-		s.recordSkillUp(player, name, level, t)
+		s.recordSkillUp(player, name, level, t, s.SkillHidden[idx])
 	}
 }
 
@@ -3727,10 +3971,130 @@ func (s *ParserState) observeAbilityLevel(idx int32, name string, level int, t f
 		return
 	}
 	sa.Level = level
-	s.recordSkillUp(sa.Player, name, level, t)
+	s.recordSkillUp(sa.Player, name, level, t, s.SkillHidden[idx])
 }
 
-func (s *ParserState) recordSkillUp(player int, name string, level int, t float64) {
+// recordSkillUp takes one ability (or talent) level rise. Where the hero's spent skill points are known
+// (v4.10.0) the rise waits for a point spent within skillMatchWindow — matchSkills; otherwise (older replays
+// without the counters) it is recorded at once, as before.
+func (s *ParserState) recordSkillUp(player int, name string, level int, t float64, hidden bool) {
+	ps := s.Players[player]
+	if level <= ps.PrevAbilityLvls[name] {
+		return
+	}
+	if ps.SpentSeen {
+		// talents cost no skill point (7.41: a separate pick at 10/15/20/25) yet Valve lists them; the attribute
+		// bonus costs one like an ability
+		if strings.HasPrefix(name, "special_bonus_") && name != "special_bonus_attributes" {
+			s.appendSkillUp(player, name, level, t)
+			return
+		}
+		ps.PendingRises = append(ps.PendingRises, pendingRise{Name: name, Level: level, T: t, Hidden: hidden})
+		s.matchSkills(player, t)
+		return
+	}
+	s.appendSkillUp(player, name, level, t)
+}
+
+type pendingRise struct {
+	Name   string
+	Level  int
+	T      float64
+	Hidden bool
+}
+
+// skillMatchWindow: a level rise and its spent point arrive on two entities (ability, hero) — a talent's rise
+// was seen up to a few seconds after its point; skillSettle: rises of one tick are matched together, so a visible
+// ability can win over its hidden twin.
+const (
+	skillMatchWindow = 3.0
+	skillSettle      = 0.1
+)
+
+// skillSpent takes the hero's spent skill points; each new one waits for its level rise.
+func (s *ParserState) skillSpent(player, spent int, t float64) {
+	ps := s.Players[player]
+	for n := ps.Spent; n < spent; n++ {
+		ps.SkillCredits = append(ps.SkillCredits, t)
+	}
+	if spent > ps.Spent {
+		ps.Spent = spent
+	}
+	ps.SpentSeen = true
+	s.matchSkills(player, t)
+}
+
+// matchSkills turns level rises into skill-build entries, one per spent point, as Valve's ability_upgrades
+// count them: of the rises near a spent point the visible one wins (Snowball over Launch Snowball, Tether over
+// Tether Break, Spirits over Spirits In/Out), then the nearest in time; a rise no point paid for — an Aghanim's
+// grant, Invoke, a linked sub-ability — is dropped. now = +Inf flushes at the end of the replay.
+func (s *ParserState) matchSkills(player int, now float64) {
+	ps := s.Players[player]
+	keptCredits := ps.SkillCredits[:0]
+	for _, c := range ps.SkillCredits {
+		best := -1
+		for i, r := range ps.PendingRises {
+			if now-r.T < skillSettle || math.Abs(r.T-c) > skillMatchWindow {
+				continue
+			}
+			if best < 0 {
+				best = i
+				continue
+			}
+			b := ps.PendingRises[best]
+			if (b.Hidden && !r.Hidden) || (b.Hidden == r.Hidden && math.Abs(r.T-c) < math.Abs(b.T-c)) {
+				best = i
+			}
+		}
+		if best >= 0 {
+			r := ps.PendingRises[best]
+			ps.PendingRises = append(ps.PendingRises[:best], ps.PendingRises[best+1:]...)
+			if r.Name == "special_bonus_attributes" && abilitiesMaxed(ps) {
+				ps.PrevAbilityLvls[r.Name] = r.Level // forced: nowhere else to put the point, Valve does not list it
+			} else {
+				s.appendSkillUp(player, r.Name, r.Level, r.T)
+			}
+			continue
+		}
+		if now-c <= skillMatchWindow {
+			keptCredits = append(keptCredits, c) // its rise may still come
+		}
+	}
+	ps.SkillCredits = keptCredits
+	kept := ps.PendingRises[:0]
+	for _, r := range ps.PendingRises {
+		if now-r.T <= skillMatchWindow {
+			kept = append(kept, r)
+		}
+	}
+	ps.PendingRises = kept
+}
+
+// abilitiesMaxed: no basic ability and not the ultimate can take a point at the hero's level — basics at their
+// maximum (4; 7 for a hero whose basics go past 4, Invoker's orbs), the ultimate at 1/2/3 by levels 6/12/18. A
+// point then goes to the attribute bonus by force, and Valve's ability_upgrades leave it out (Naga Siren's
+// eight from level 15 on, 9013916315), while an attribute bonus chosen over an open ability is listed (Magnus
+// with Shockwave at 1).
+func abilitiesMaxed(ps *PlayerState) bool {
+	basicMax := 4
+	for _, l := range ps.SlotLevels[:3] {
+		if l > 4 {
+			basicMax = 7
+		}
+	}
+	for _, l := range ps.SlotLevels[:3] {
+		if l < basicMax {
+			return false
+		}
+	}
+	ult := ps.Level / 6
+	if ult > 3 {
+		ult = 3
+	}
+	return ps.SlotLevels[5] >= ult
+}
+
+func (s *ParserState) appendSkillUp(player int, name string, level int, t float64) {
 	ps := s.Players[player]
 	if level <= ps.PrevAbilityLvls[name] {
 		return
@@ -4177,7 +4541,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			AbilityCastReport:    abilityCasts,
 			HeroDamageReport:     damageReport,
 			DamageReceivedReport: damageReceivedReport,
-			StunDurationDealt:    ps.StunDurationDealt,
+			StunDurationDealt:    stunsOut(ps),
 			SkillBuild:           filterSkillBuild(ps.SkillBuild),
 			ItemUsed:             itemUsed,
 			CampStacks:           ps.CampStacks,
@@ -5407,4 +5771,12 @@ func detectHgEntries(state *ParserState) [10][]HgEntry {
 		}
 	}
 	return out
+}
+
+// stunsOut is Valve's stun total when the replay carries it, the combat-log sum otherwise (older replays).
+func stunsOut(ps *PlayerState) float64 {
+	if ps.HasValveStuns {
+		return math.Round(ps.ValveStuns*100) / 100
+	}
+	return ps.StunDurationDealt
 }

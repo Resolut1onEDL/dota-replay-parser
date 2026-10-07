@@ -10,6 +10,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1604,3 +1605,94 @@ func TestEntityIntReadsAnyIntegerWidth(t *testing.T) {
 	}
 }
 
+// v4.10.0: damage, kills and creep kills count for the unit's owner, as Valve's scoreboard does — Lycan's wolves
+// for Lycan, a Reflection illusion of Medusa (damage source Terrorblade) for Terrorblade — and for no player when
+// no hero is behind them.
+func TestOwnerByNames(t *testing.T) {
+	s := NewParserState(nil)
+	for i, h := range []int{77, 109, 94, 1, 2, 3, 4, 5, 6, 7} { // Lycan, Terrorblade, Medusa, …
+		s.Players[i].HeroID = h
+	}
+	for _, c := range []struct {
+		src, attacker string
+		want          int
+	}{
+		{"npc_dota_hero_lycan", "npc_dota_lycan_wolf4", 0},
+		{"npc_dota_hero_terrorblade", "npc_dota_hero_medusa", 1},
+		{"npc_dota_hero_medusa", "npc_dota_hero_medusa", 2},
+		{"", "npc_dota_hero_medusa", 2},
+		{"npc_dota_creep_badguys_melee", "npc_dota_creep_badguys_melee", -1},
+		{"npc_dota_roshan", "npc_dota_roshan", -1},
+	} {
+		if got := s.ownerByNames(c.src, c.attacker); got != c.want {
+			t.Errorf("%s / %s: got %d, want %d", c.src, c.attacker, got, c.want)
+		}
+	}
+}
+
+// v4.10.0: with the hero's spent skill points known, a level rise is a skill-build entry only against a point —
+// the visible ability over its hidden twin, nothing for an Aghanim's grant; talents cost no point (7.41) and are
+// entries; an attribute bonus is an entry when chosen over an open ability, not when forced.
+func TestSkillPointsMatch(t *testing.T) {
+	build := func(s *ParserState) string {
+		var out []string
+		for _, su := range filterSkillBuild(s.Players[0].SkillBuild) { // the output's order: by time
+			out = append(out, fmt.Sprintf("%s:%d", su.AbilityName, su.Level))
+		}
+		return strings.Join(out, " ")
+	}
+	s := NewParserState(nil)
+	s.skillSpent(0, 0, 0)
+	s.recordSkillUp(0, "tusk_launch_snowball", 1, 10, true)
+	s.recordSkillUp(0, "tusk_snowball", 1, 10, false)
+	s.skillSpent(0, 1, 10.03)
+	s.recordSkillUp(0, "special_bonus_unique_tusk_7", 1, 20, false)
+	s.recordSkillUp(0, "pangolier_rollup", 1, 30, false) // granted by the shard: no point spent
+	s.matchSkills(0, 40)
+	if got := build(s); got != "tusk_snowball:1 special_bonus_unique_tusk_7:1" {
+		t.Errorf("got %q", got)
+	}
+
+	attr := func(slots [6]int) string {
+		s := NewParserState(nil)
+		s.Players[0].Level, s.Players[0].SlotLevels = 15, slots
+		s.skillSpent(0, 14, 0)
+		s.recordSkillUp(0, "special_bonus_attributes", 1, 100, false)
+		s.skillSpent(0, 15, 100)
+		s.matchSkills(0, math.Inf(1))
+		return build(s)
+	}
+	if got := attr([6]int{4, 4, 4, 0, 0, 2}); got != "" {
+		t.Errorf("forced attribute bonus (all maxed) listed: %q", got)
+	}
+	if got := attr([6]int{1, 4, 4, 0, 0, 2}); got != "special_bonus_attributes:1" {
+		t.Errorf("chosen attribute bonus (an ability at 1) missing: %q", got)
+	}
+}
+
+// v4.10.0: a starting item is in the spawn inventory; its own combat-log purchase, when it arrives after the
+// inventory was read, is the same item — a purchase made after that moment is a new one.
+func TestPendingPurchasesAgainstStartingItems(t *testing.T) {
+	s := NewParserState(nil)
+	s.Players[0].HeroID = 9 // Mirana
+	s.Players[0].StartingT = -80
+	s.Players[0].StartingLeft = map[string]int{"item_smoke_of_deceit": 1}
+	s.PendingPurchases = []PendingPurchase{
+		{Time: -85, Hero: "npc_dota_hero_mirana", Item: "item_smoke_of_deceit"},
+		{Time: -60, Hero: "npc_dota_hero_mirana", Item: "item_smoke_of_deceit"},
+	}
+	s.flushPendingPurchases()
+	if got := s.Players[0].ItemPurchases; len(got) != 1 || got[0].Time != -60 {
+		t.Errorf("want only the later smoke, got %+v", got)
+	}
+}
+
+// v4.10.0: stunDurationDealt is Valve's m_fStuns when the replay has it.
+func TestStunsOut(t *testing.T) {
+	if got := stunsOut(&PlayerState{StunDurationDealt: 46, ValveStuns: 12.6349, HasValveStuns: true}); got != 12.63 {
+		t.Errorf("valve stuns: got %v", got)
+	}
+	if got := stunsOut(&PlayerState{StunDurationDealt: 46}); got != 46 {
+		t.Errorf("no valve field: got %v", got)
+	}
+}
