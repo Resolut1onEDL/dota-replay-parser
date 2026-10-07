@@ -4,7 +4,8 @@ Standalone Go binary that parses Dota 2 `.dem` replays into a single JSON
 document — match metadata, per-player stats, item purchases, ward placements,
 roshan/buyback events, teamfight aggregates, position samples.
 
-Built on [`dotabuff/manta`](https://github.com/dotabuff/manta).
+Built on [`dotabuff/manta`](https://github.com/dotabuff/manta) v1.4.7, used
+through a patched copy in `third_party/manta` (see its `PATCHES.md`).
 
 Used by:
 - [`gamerjournal-replay-uploader`](https://github.com/Resolut1onEDL/gamerjournal-replay-uploader) — Electron client that watches the local Dota 2 replay folder and uploads parsed JSON to GamerJournal.

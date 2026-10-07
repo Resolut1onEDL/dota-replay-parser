@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/dotabuff/manta/dota"
@@ -1492,5 +1493,57 @@ func TestCampTiersTieIsUnknown(t *testing.T) {
 		if tiers[0] != "" || tiers[1] != "medium" {
 			t.Fatalf("run %d: tiers %q, want [\"\" \"medium\"]", run, tiers)
 		}
+	}
+}
+
+// Match 9032897977 (league 20335 practice lobby, Luna vs Puck): the first
+// CParticleSystem baseline holds m_iServerControlPointAssignments = 255, a
+// fixed8 uint8 that manta v1.4.7 read as a varint, so the parse died at tick
+// 2200 with "nextByte: insufficient buffer (380 of 379)". Fixed by the
+// third_party/manta patch. Replay (zstd under the .dem.bz2 name):
+// http://replay151.valve.net/570/9032897977_1496998234.dem.bz2
+func TestFixed8ParticleBaselineReplay(t *testing.T) {
+	demPath := filepath.Join("test-replays", "9032897977.dem.bz2")
+	if _, err := os.Stat(demPath); err != nil {
+		t.Skipf("no replay: %v", err)
+	}
+
+	bin := filepath.Join(t.TempDir(), "parser")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+	cmd := exec.Command(bin, demPath)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("parser run: %v\n%s", err, stderr.String())
+	}
+	var got Match
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("parser stdout not JSON: %v", err)
+	}
+
+	// Ground truth: OpenDota /api/matches/9032897977.
+	if got.ID != 9032897977 || got.DurationSeconds != 588 || !got.DidRadiantWin {
+		t.Errorf("match: id=%d duration=%d radiantWin=%v, want 9032897977/588/true",
+			got.ID, got.DurationSeconds, got.DidRadiantWin)
+	}
+	want := map[int][5]int{ // heroId → kills, deaths, assists, last hits, level
+		48: {5, 0, 0, 79, 10}, // Luna
+		13: {0, 6, 0, 1, 3},   // Puck
+	}
+	for _, p := range got.Players {
+		w, ok := want[p.HeroID]
+		if !ok {
+			continue
+		}
+		delete(want, p.HeroID)
+		if g := [5]int{p.Kills, p.Deaths, p.Assists, p.NumLastHits, p.Level}; g != w {
+			t.Errorf("hero %d K/D/A/LH/level = %v, want %v", p.HeroID, g, w)
+		}
+	}
+	for id := range want {
+		t.Errorf("hero %d missing from players", id)
 	}
 }

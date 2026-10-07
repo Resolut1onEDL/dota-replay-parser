@@ -203,7 +203,33 @@ func componentDecoder(r *reader) interface{} {
 	return r.readBits(1)
 }
 
+// fixed8Decoder reads a field the server writes as 8 raw bits (var encoder
+// "fixed8": uint8, int8, enums, attachment handles), as clarity does. The
+// varint decoders picked by type name only agree while the value is below 128:
+// the 255 "unset" default swallows the next bytes and shifts every later
+// field. Values keep the Go type the varint decoders gave them: int32 for
+// int8, uint64 for uint8, uint32 for the rest (defaultDecoder).
+func fixed8Decoder(baseType string) fieldDecoder {
+	switch baseType {
+	case "int8":
+		return func(r *reader) interface{} {
+			return int32(int8(r.readBits(8)))
+		}
+	case "uint8":
+		return func(r *reader) interface{} {
+			return uint64(r.readBits(8))
+		}
+	}
+	return func(r *reader) interface{} {
+		return r.readBits(8)
+	}
+}
+
 func findDecoder(f *field) fieldDecoder {
+	if f.encoder == "fixed8" {
+		return fixed8Decoder(f.fieldType.baseType)
+	}
+
 	if v, ok := fieldTypeFactories[f.fieldType.baseType]; ok {
 		return v(f)
 	}
