@@ -15,7 +15,7 @@ const (
 	// GroupReplay: OpenDota's parse of the same replay — a second opinion; present only when OpenDota parsed it.
 	GroupReplay = "replay"
 	// GroupHeuristic: information only, never a gate — both sides are heuristics (lanes, teamfights), or the
-	// two sides count by different rules on purpose (damage taken, Valve's own exclusions, assist lists).
+	// two sides count by different rules on purpose (damage taken, Valve's own exclusions).
 	GroupHeuristic = "heuristic"
 	// GroupConsistency: the parser against itself (events vs totals) — no public source needed.
 	GroupConsistency = "consistency"
@@ -228,8 +228,8 @@ func Compare(ours *Match, od *ODMatch, c Consts) []Check {
 		}
 		eq("consistency.kill_events", GroupConsistency, h, kills, p.Kills)
 		eq("consistency.death_events", GroupConsistency, h, deaths, p.Deaths)
-		// information: the combat log lists fewer assists than Valve's scoreboard (cause unknown)
-		eq("consistency.assist_events", GroupHeuristic, h, len(s.AssistEvents), p.Assists)
+		// assist events follow Valve's assist counter (the combat log lists only the heroes that damaged the victim)
+		eq("consistency.assist_events", GroupConsistency, h, len(s.AssistEvents), p.Assists)
 		if n := len(s.LastHitsPerMinute); n > 0 {
 			eq("consistency.lh_timeline_end", GroupConsistency, h, s.LastHitsPerMinute[n-1], p.NumLastHits)
 		}

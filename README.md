@@ -119,6 +119,19 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   heroes' (OpenDota's damage_targets lists the bear apart); `heroDamage` is
   Valve's counter, its combat-log fallback now counts the bear too.
 
+### 4.10.2 — assists as Valve's scoreboard counts them
+
+- `assistEvents` — one per rise of Valve's assist counter (`m_iAssists`), so
+  their number is the scoreboard's `assists` (the audit: 52.4% → 100% of 990
+  players). The combat log's assist list holds only the heroes that damaged the
+  victim; the scoreboard also credits a disable without damage (Hex, Orchid,
+  X Marks the Spot) and more (8664300772: Shadow Shaman 23 → 29). An event's
+  `target` is the enemy who died at that tick; `-1` when no single enemy death
+  fits (0.46% of events: two enemies died and neither lists the player, or only
+  an ally died that tick).
+- `deathEvents[].assist` — the players Valve credited for that death (an
+  Aegis death lists none). `laneStats.assistsPreTen` follows the events.
+
 ### Wall-clock alignment (e.g. voice transcripts → game events)
 
 `startDateTime` points to the demo's first packet (pick/strategy). For aligning

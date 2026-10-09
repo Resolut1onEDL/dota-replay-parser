@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1758,6 +1759,116 @@ func TestDamageVictim(t *testing.T) {
 	} {
 		if got := s.damageVictim(c.target, c.source); got != c.want {
 			t.Errorf("%s / %s: got %d, want %d", c.target, c.source, got, c.want)
+		}
+	}
+}
+
+// Valve's scoreboard credits assists the combat log does not list: assist_players holds the heroes that damaged
+// the victim, while the scoreboard also counts a disable without damage (Hex, Orchid, X Marks the Spot) and more.
+// Assist events follow the scoreboard: each rise of m_iAssists is one assist, put on the enemy death of that tick.
+func TestAssistEventsFromScoreboard(t *testing.T) {
+	s := &ParserState{ValveAssistsSeen: true}
+	for i := range s.Players {
+		s.Players[i] = &PlayerState{IsRadiant: i < 5}
+	}
+	// 7 dies at 100: the log lists 0 and 4; the scoreboard credits 0 and 1 (no damage), not 4
+	s.Players[7].DeathEvents = []DeathEvent{{Time: 100, Killer: 2, Assists: []int{0, 4}}}
+	// 8 and 9 die in the same tick at 200
+	s.Players[8].DeathEvents = []DeathEvent{{Time: 200, Killer: 2, Assists: []int{0}}}
+	s.Players[9].DeathEvents = []DeathEvent{{Time: 200, Killer: 2, Assists: []int{1}}}
+	s.Players[0].ValveAssistTimes = []float64{100.03, 200.03}
+	// 1: unlisted on 7; listed on 9; a second assist that tick can only be 8's; one with no death near it
+	s.Players[1].ValveAssistTimes = []float64{100.03, 200.03, 200.03, 650}
+	// 3: listed on neither death of a two-death tick — the victim is unknown
+	s.Players[3].ValveAssistTimes = []float64{200.03}
+	// 5 (Dire) has no assist; its combat-log event must go
+	s.Players[5].AssistEvents = []AssistEvent{{Time: 50, Target: 0}}
+	// 2 is listed on 7's death at 300 and 8's at 300.4, Valve credits only 8's: the rise goes to 8, not to 7
+	s.Players[7].DeathEvents = append(s.Players[7].DeathEvents, DeathEvent{Time: 300, Killer: 0, Assists: []int{2}})
+	s.Players[8].DeathEvents = append(s.Players[8].DeathEvents, DeathEvent{Time: 300.4, Killer: 0, Assists: []int{2}})
+	s.Players[2].ValveAssistTimes = []float64{300.43}
+
+	assistEventsFromScoreboard(s)
+
+	want := map[int][]AssistEvent{
+		0: {{100, 7}, {200, 8}},
+		1: {{100, 7}, {200, 8}, {200, 9}, {650, -1}},
+		2: {{300.4, 8}},
+		3: {{200.03, -1}},
+	}
+	for p := 0; p < 10; p++ {
+		if got := s.Players[p].AssistEvents; !reflect.DeepEqual(got, want[p]) {
+			t.Errorf("player %d assist events = %v, want %v", p, got, want[p])
+		}
+		if got, w := s.Players[p].LaneAssists, len(want[p]); p != 1 && got != w {
+			t.Errorf("player %d lane assists = %d, want %d", p, got, w)
+		}
+	}
+	if got := s.Players[1].LaneAssists; got != 3 {
+		t.Errorf("player 1 lane assists = %d, want 3 (650s is past the lane)", got)
+	}
+	for v, w := range map[int][]int{7: {0, 1}, 8: {0, 1}, 9: {1}} {
+		if got := s.Players[v].DeathEvents[0].Assists; !reflect.DeepEqual(got, w) {
+			t.Errorf("death of %d assists = %v, want %v", v, got, w)
+		}
+	}
+	if got := s.Players[7].DeathEvents[1].Assists; got != nil {
+		t.Errorf("uncredited death of 7 at 300 assists = %v, want none", got)
+	}
+	if got := s.Players[8].DeathEvents[1].Assists; !reflect.DeepEqual(got, []int{2}) {
+		t.Errorf("death of 8 at 300.4 assists = %v, want [2]", got)
+	}
+
+	// a replay without the scoreboard counter keeps the combat log's events
+	old := &ParserState{}
+	for i := range old.Players {
+		old.Players[i] = &PlayerState{}
+	}
+	old.Players[0].AssistEvents = []AssistEvent{{Time: 10, Target: 7}}
+	assistEventsFromScoreboard(old)
+	if got := old.Players[0].AssistEvents; len(got) != 1 {
+		t.Errorf("no scoreboard: assist events = %v, want the combat log's one", got)
+	}
+}
+
+// Match 8664300772: the combat log listed 23 of Shadow Shaman's 29 assists and 23 of Spirit Breaker's 26.
+func TestAssistEventsMatchScoreboardReplay(t *testing.T) {
+	demPath := filepath.Join("test-replays", "8664300772.dem")
+	if _, err := os.Stat(demPath); err != nil {
+		t.Skipf("no replay: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), "parser")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin, demPath).Output()
+	if err != nil {
+		t.Fatalf("parser run: %v", err)
+	}
+	var got Match
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("parser stdout not JSON: %v", err)
+	}
+	for i, p := range got.Players {
+		if p.Stats == nil {
+			t.Fatalf("player %d has no stats", i)
+		}
+		if n := len(p.Stats.AssistEvents); n != p.Assists {
+			t.Errorf("player %d (%s): %d assist events, scoreboard %d", i, p.HeroName, n, p.Assists)
+		}
+		for _, a := range p.Stats.AssistEvents {
+			if a.Target < 0 {
+				continue
+			}
+			listed := false
+			for _, d := range got.Players[a.Target].Stats.DeathEvents {
+				if d.Time == a.Time && slices.Contains(d.Assists, i) {
+					listed = true
+				}
+			}
+			if !listed {
+				t.Errorf("player %d: assist on %d at %.2f is missing from that death's assists", i, a.Target, a.Time)
+			}
 		}
 	}
 }

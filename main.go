@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
@@ -930,6 +931,9 @@ type PlayerState struct {
 	DeathEvents   []DeathEvent
 	KillEvents    []KillEvent
 	AssistEvents  []AssistEvent
+	// v4.10.2: Valve's assist counter as last read, and the combat-log time of each rise
+	ValveAssists     int
+	ValveAssistTimes []float64
 	Wards         []WardEvent
 	Runes         []RuneEvent
 
@@ -1183,6 +1187,9 @@ type ParserState struct {
 	// runs AHEAD of the combat axis by the accumulated pause total — probes
 	// mixing those axes produce phantom mismatches on paused demos.
 	EntityAxisOffset float64
+
+	// v4.10.2: the replay carries Valve's assist counter (m_iAssists); assist events follow it
+	ValveAssistsSeen bool
 }
 
 type PendingPurchase struct {
@@ -1279,6 +1286,126 @@ func dropSelfDeaths(evs []DeathEvent, t float64, player int) (kept, dropped []De
 		n--
 	}
 	return evs[:n], evs[n:]
+}
+
+// assistEventsFromScoreboard rebuilds the assist events from Valve's assist counter. The combat log's
+// assist_players holds the heroes that damaged the victim; the scoreboard also credits a disable without
+// damage (Hex, Orchid, X Marks the Spot) and more — match 8664300772 listed 23 of Shadow Shaman's 29 assists.
+// Each rise of the counter is one assist, put on an enemy death: first the deaths whose log lists the player,
+// then the only death left in the nearest tick; with two or more left the victim is unknown (-1). A death's
+// assist list follows the events. Without the counter the combat log's events stay.
+func assistEventsFromScoreboard(s *ParserState) {
+	if !s.ValveAssistsSeen {
+		return
+	}
+	// the counter rises in the death's tick or the next one (0–0.04s on 8664300772 and 8882707088)
+	const lag = 0.5
+	type ref struct{ v, i int }
+	credited := map[ref][]int{}
+	for p := 0; p < 10; p++ {
+		ps := s.Players[p]
+		if ps == nil {
+			continue
+		}
+		var deaths []ref
+		for v := 0; v < 10; v++ {
+			if v != p && s.Players[v] != nil && s.Players[v].IsRadiant != ps.IsRadiant {
+				for i := range s.Players[v].DeathEvents {
+					deaths = append(deaths, ref{v, i})
+				}
+			}
+		}
+		at := func(d ref) float64 { return s.Players[d.v].DeathEvents[d.i].Time }
+		times := ps.ValveAssistTimes
+		got := make([]*ref, len(times))
+		taken := map[ref]bool{}
+		// a death that lists the player takes a rise; the closest pairs first, so a rise is never taken by a
+		// listed death of a neighbouring tick that Valve did not credit
+		type pair struct {
+			d  ref
+			k  int
+			dt float64
+		}
+		var pairs []pair
+		for _, d := range deaths {
+			if slices.Contains(s.Players[d.v].DeathEvents[d.i].Assists, p) {
+				for k, t := range times {
+					if dt := math.Abs(at(d) - t); dt <= lag {
+						pairs = append(pairs, pair{d, k, dt})
+					}
+				}
+			}
+		}
+		sort.SliceStable(pairs, func(a, b int) bool { return pairs[a].dt < pairs[b].dt })
+		for _, pr := range pairs {
+			if got[pr.k] == nil && !taken[pr.d] {
+				d := pr.d
+				got[pr.k], taken[d] = &d, true
+			}
+		}
+		for k, t := range times {
+			if got[k] != nil {
+				continue
+			}
+			var tick []ref
+			for _, d := range deaths {
+				if taken[d] || math.Abs(at(d)-t) > lag {
+					continue
+				}
+				if len(tick) > 0 && math.Abs(at(d)-t) < math.Abs(at(tick[0])-t) {
+					tick = tick[:0]
+				}
+				if len(tick) == 0 || at(d) == at(tick[0]) {
+					tick = append(tick, d)
+				}
+			}
+			if len(tick) == 1 {
+				got[k], taken[tick[0]] = &tick[0], true
+			}
+		}
+		var evs []AssistEvent
+		lane := 0
+		for k, t := range times {
+			ev := AssistEvent{Time: t, Target: -1}
+			if d := got[k]; d != nil {
+				ev = AssistEvent{Time: at(*d), Target: d.v}
+				credited[*d] = append(credited[*d], p)
+			}
+			evs = append(evs, ev)
+			if ev.Time >= 0 && ev.Time < 600 {
+				lane++
+			}
+		}
+		sort.SliceStable(evs, func(a, b int) bool {
+			if evs[a].Time != evs[b].Time {
+				return evs[a].Time < evs[b].Time
+			}
+			return evs[a].Target < evs[b].Target
+		})
+		ps.AssistEvents, ps.LaneAssists = evs, lane
+	}
+	// a death lists whom the scoreboard credited: the log's order, an uncredited name out, the rest after
+	for v := 0; v < 10; v++ {
+		if s.Players[v] == nil {
+			continue
+		}
+		for i := range s.Players[v].DeathEvents {
+			d := &s.Players[v].DeathEvents[i]
+			who := credited[ref{v, i}]
+			var list []int
+			for _, a := range d.Assists {
+				if slices.Contains(who, a) {
+					list = append(list, a)
+				}
+			}
+			for _, a := range who {
+				if !slices.Contains(list, a) {
+					list = append(list, a)
+				}
+			}
+			d.Assists = list
+		}
+	}
 }
 
 func (s *ParserState) ownerByNames(src, attackerName string) int {
@@ -3221,6 +3348,11 @@ func main() {
 				}
 				if assists, ok := e.GetInt32(fmt.Sprintf("m_vecPlayerTeamData.%04d.m_iAssists", i)); ok {
 					state.Players[i].Assists = int(assists)
+					state.ValveAssistsSeen = true
+					for ps := state.Players[i]; ps.ValveAssists < int(assists); ps.ValveAssists++ {
+						ps.ValveAssistTimes = append(ps.ValveAssistTimes, state.entityActual())
+					}
+					state.Players[i].ValveAssists = int(assists)
 				}
 				if level, ok := e.GetInt32(fmt.Sprintf("m_vecPlayerTeamData.%04d.m_iLevel", i)); ok {
 					state.Players[i].Level = int(level)
@@ -4458,6 +4590,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 	if state.GameStartTime <= 0 {
 		state.rebasePreHorn(0)
 	}
+	assistEventsFromScoreboard(state)
 
 	players := make([]Player, 10)
 
