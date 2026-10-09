@@ -647,8 +647,12 @@ func timeline(add addFn, field string, hero int, ours, theirs []int, back, slack
 	bad, first := 0, -1
 	for m := 0; m+1 < n; m++ {
 		lo := theirs[m]
-		if m-back >= 0 {
-			lo = theirs[m-back]
+		if back > 0 {
+			// before its first minute a cumulative series is 0
+			lo = 0
+			if m-back >= 0 {
+				lo = theirs[m-back]
+			}
 		}
 		if ours[m] < lo-slack || ours[m] > theirs[m+1]+slack {
 			bad++

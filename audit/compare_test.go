@@ -103,6 +103,13 @@ func TestTimelineBracket(t *testing.T) {
 	if !rows[0].OK || rows[1].OK || rows[2].OK {
 		t.Errorf("want ahead-within-a-minute OK, behind and past-next-minute failing (the last minute is not compared): %+v", rows)
 	}
+	// with a minute of slack back, minute 0 may lag OpenDota's (a rune fight at 0:00 that it rounds into minute 0)
+	rows = nil
+	timeline(add, "dmg", 1, []int{65, 700, 1500}, []int{104, 638, 1545}, 1, 0)
+	timeline(add, "dmg", 1, []int{65, 700, 1500}, []int{104, 638, 1545}, 0, 0)
+	if !rows[0].OK || rows[1].OK {
+		t.Errorf("minute 0 behind OpenDota's: want OK with back=1, failing with back=0: %+v", rows)
+	}
 }
 
 func TestEventPairingTolerance(t *testing.T) {

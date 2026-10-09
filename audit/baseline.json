@@ -28,7 +28,7 @@
  "player.gold_per_min": 1,
  "player.gold_t": 0.98,
  "player.hero_damage": 1,
- "player.hero_damage_t": 0.875,
+ "player.hero_damage_t": 0.935,
  "player.hero_healing": 0.85,
  "player.item_uses": 0.957,
  "player.items": 1,
