@@ -52,7 +52,8 @@ field changes meaning.
   (since 4.10.0 its owner's: the player's illusions, summons and dominated
   creeps count as the player) or −1 lane creep / −2 neutral / −3 building /
   −4 other, `v` victim slot, `k` damage type (1 physical, 2 magical, 4 pure),
-  `d` sum. Hits on illusions and Sunder's HP swap are left out. Not named `combatSeconds`: the web
+  `d` sum, `u: 1` (4.10.1) when the hits landed on the victim's Spirit Bear.
+  Hits on illusions and Sunder's HP swap are left out. Not named `combatSeconds`: the web
   fight detector reserves that name for a hero→hero-only stream.
 - `controlEvents` — modifiers the combat log gives a stun or a slow duration,
   applied to (`on`) and removed from (`!on`) a real hero.
@@ -103,6 +104,20 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
 - `stats.totalDeadTimeSec` — from the dying state, up to the game's end.
 - `pauses` and every entity-side time — Valve's pause counters; the entity
   clock no longer runs ahead of the combat log in paused games.
+
+### 4.10.1 — Meepo and the Spirit Bear (the weekly audit, 2026-10-09)
+
+- `killEvents`/`deathEvents`/`assistEvents` — when one Meepo dies the others
+  die at the same tick, each logged with Meepo as the attacker. A player now
+  dies once per tick (the death kept is the first not credited to himself, with
+  the gold it lost); a death credited to the dying player is no kill and has no
+  assists (9032885465: Meepo's 25 death and 16 kill events → 10 and 1, as the
+  scoreboard). Lane kill/death/assist counts follow.
+- `damageSeconds` — a hit on Lone Druid's Spirit Bear is a hit on its owner,
+  as Valve's hero damage counts it (its death is still no kill), marked `u: 1`
+  so damage to the hero itself can leave it out. `heroDamageReport` stays the
+  heroes' (OpenDota's damage_targets lists the bear apart); `heroDamage` is
+  Valve's counter, its combat-log fallback now counts the bear too.
 
 ### Wall-clock alignment (e.g. voice transcripts → game events)
 

@@ -26,13 +26,15 @@ const (
 // DamageSecond is the damage one source dealt to one real hero within one game
 // second, by damage type. A player's illusions, summons and dominated creeps
 // count as the player (same rule as heroDamage); damage to illusions and
-// Sunder's HP swap are not recorded.
+// Sunder's HP swap are not recorded. Hits on a Spirit Bear are its owner's,
+// marked U (heroDamage counts them; damage taken by the hero itself does not).
 type DamageSecond struct {
-	T int `json:"t"` // floor of the game second, 0 = horn
-	A int `json:"a"` // attacker slot 0-9, or a src* code
-	V int `json:"v"` // victim slot 0-9
-	K int `json:"k"` // damage type: 1 physical, 2 magical, 4 pure
-	D int `json:"d"` // damage summed over the second
+	T int `json:"t"`           // floor of the game second, 0 = horn
+	A int `json:"a"`           // attacker slot 0-9, or a src* code
+	V int `json:"v"`           // victim slot 0-9
+	K int `json:"k"`           // damage type: 1 physical, 2 magical, 4 pure
+	D int `json:"d"`           // damage summed over the second
+	U int `json:"u,omitempty"` // 1: the hits landed on the victim's Spirit Bear
 }
 
 // ControlEvent is a control modifier (the combat log gives it a stun or a
@@ -70,6 +72,7 @@ type ItemGain struct {
 type damageHit struct {
 	T          float64
 	A, V, K, D int
+	U          bool // on the victim's Spirit Bear
 }
 
 type wideTrack struct {
@@ -96,13 +99,27 @@ func damageSource(attackerName string, state *ParserState) int {
 	return srcOther
 }
 
-// recordDamage keeps one combat-log damage entry whose victim is a real hero.
+func isSpiritBear(name string) bool { return strings.HasPrefix(name, "npc_dota_lone_druid_bear") }
+
+// damageVictim is the player a damage entry hits: a real hero's, or the owner of a Spirit Bear — Valve's hero
+// damage counts the hits on the bear, though its death is no kill (OpenDota's hero_damage_t counts them too).
+// The owner is the target's source hero, else the hero whose name the bear's starts with; -1 for anything else.
+func (s *ParserState) damageVictim(targetName, targetSource string) int {
+	if strings.HasPrefix(targetName, "npc_dota_hero_") {
+		return heroNameToPlayerIndex(targetName, s)
+	}
+	if isSpiritBear(targetName) {
+		return s.ownerByNames(targetSource, targetName)
+	}
+	return -1
+}
+
+// recordDamage keeps one combat-log damage entry whose victim is a real hero or a Spirit Bear.
 func (s *ParserState) recordDamage(m *dota.CMsgDOTACombatLogEntry, t float64, attackerName, targetName string, damage int, damageType uint32) {
-	if damage <= 0 || m.GetIsTargetIllusion() || !strings.HasPrefix(targetName, "npc_dota_hero_") ||
-		s.LookupName(m.GetInflictorName()) == "terrorblade_sunder" {
+	if damage <= 0 || m.GetIsTargetIllusion() || s.LookupName(m.GetInflictorName()) == "terrorblade_sunder" {
 		return
 	}
-	v := heroNameToPlayerIndex(targetName, s)
+	v := s.damageVictim(targetName, s.LookupName(m.GetTargetSourceName()))
 	if v < 0 || v >= 10 {
 		return
 	}
@@ -111,23 +128,30 @@ func (s *ParserState) recordDamage(m *dota.CMsgDOTACombatLogEntry, t float64, at
 	if a < 0 {
 		a = damageSource(attackerName, s)
 	}
-	s.DamageHits = append(s.DamageHits, damageHit{T: t, A: a, V: v, K: int(damageType), D: damage})
+	s.DamageHits = append(s.DamageHits, damageHit{T: t, A: a, V: v, K: int(damageType), D: damage, U: isSpiritBear(targetName)})
 }
 
 // combatSeconds sums the hits per (second, attacker, victim, type), in time order.
 func damageSeconds(hits []damageHit) []DamageSecond {
-	type key struct{ t, a, v, k int }
+	type key struct {
+		t, a, v, k int
+		u          bool
+	}
 	sums := make(map[key]int)
 	for _, h := range hits {
 		t := int(h.T)
 		if h.T < 0 && float64(t) != h.T {
 			t-- // floor, not truncation, for pregame seconds
 		}
-		sums[key{t, h.A, h.V, h.K}] += h.D
+		sums[key{t, h.A, h.V, h.K, h.U}] += h.D
 	}
 	out := make([]DamageSecond, 0, len(sums))
 	for k, d := range sums {
-		out = append(out, DamageSecond{T: k.t, A: k.a, V: k.v, K: k.k, D: d})
+		u := 0
+		if k.u {
+			u = 1
+		}
+		out = append(out, DamageSecond{T: k.t, A: k.a, V: k.v, K: k.k, D: d, U: u})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
@@ -140,7 +164,10 @@ func damageSeconds(hits []damageHit) []DamageSecond {
 		if a.A != b.A {
 			return a.A < b.A
 		}
-		return a.K < b.K
+		if a.K != b.K {
+			return a.K < b.K
+		}
+		return a.U < b.U
 	})
 	return out
 }

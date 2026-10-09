@@ -26,6 +26,18 @@ func TestDamageSecondsSumsPerSecondAndFloorsPregame(t *testing.T) {
 	}
 }
 
+// v4.10.1: a hit on the victim's Spirit Bear keeps its own row, marked u=1.
+func TestDamageSecondsKeepsBearHitsApart(t *testing.T) {
+	got := damageSeconds([]damageHit{
+		{T: 30.1, A: 3, V: 7, K: 1, D: 40},
+		{T: 30.6, A: 3, V: 7, K: 1, D: 60, U: true},
+	})
+	want := []DamageSecond{{T: 30, A: 3, V: 7, K: 1, D: 40}, {T: 30, A: 3, V: 7, K: 1, D: 60, U: 1}}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
 func TestDamageSourceClassifiesNonHeroAttackers(t *testing.T) {
 	s := &ParserState{}
 	for name, want := range map[string]int{

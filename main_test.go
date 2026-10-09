@@ -1707,3 +1707,57 @@ func TestValveOr(t *testing.T) {
 		t.Error("valveOr picks the wrong source")
 	}
 }
+
+// v4.10.1: when one Meepo dies the others die at the same tick, each logged with Meepo as the attacker, and Valve
+// counts one death (9032885465: 10 deaths, 25 death entries, 15 of them kills of himself). A player dies once per
+// tick: the death kept is the first one not credited to himself; one credited to himself alone (a suicide) stays.
+func TestLinkedDeath(t *testing.T) {
+	const meepo, sniper = 8, 0
+	real := DeathEvent{Time: 469.6, Killer: sniper}
+	clone := DeathEvent{Time: 469.6, Killer: meepo}
+	for _, c := range []struct {
+		name   string
+		evs    []DeathEvent
+		killer int
+		want   bool
+	}{
+		{"first death", nil, sniper, false},
+		{"suicide", []DeathEvent{{Time: 100, Killer: sniper}}, meepo, false},
+		{"clone after the real death", []DeathEvent{real}, meepo, true},
+		{"clone after a clone", []DeathEvent{clone}, meepo, true},
+		{"real death after a clone", []DeathEvent{clone}, sniper, false},
+		{"second real death in the tick", []DeathEvent{real}, 2, true},
+	} {
+		if got := linkedDeath(c.evs, 469.6, meepo, c.killer); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+	kept, dropped := dropSelfDeaths([]DeathEvent{{Time: 300, Killer: sniper}, clone, clone}, 469.6, meepo)
+	if len(kept) != 1 || kept[0].Time != 300 || len(dropped) != 2 {
+		t.Errorf("a real death drops the clones logged before it: kept %+v, dropped %+v", kept, dropped)
+	}
+}
+
+// v4.10.1: Valve's hero damage counts the hits on Lone Druid's Spirit Bear (whose death is no kill): they count
+// for the bear's owner — the target's source hero (any hero in Ability Draft), else the hero its name starts with.
+func TestDamageVictim(t *testing.T) {
+	s := NewParserState(nil)
+	for i, h := range []int{80, 2, 77, 4, 5, 6, 7, 8, 9, 10} { // Lone Druid, Axe, Lycan, …
+		s.Players[i].HeroID = h
+	}
+	for _, c := range []struct {
+		target, source string
+		want           int
+	}{
+		{"npc_dota_hero_axe", "npc_dota_hero_axe", 1},
+		{"npc_dota_lone_druid_bear3", "npc_dota_hero_lone_druid", 0},
+		{"npc_dota_lone_druid_bear1", "", 0},
+		{"npc_dota_lone_druid_bear2", "npc_dota_hero_axe", 1},
+		{"npc_dota_lycan_wolf1", "npc_dota_hero_lycan", -1}, // other summons are no heroes
+		{"npc_dota_creep_badguys_melee", "", -1},
+	} {
+		if got := s.damageVictim(c.target, c.source); got != c.want {
+			t.Errorf("%s / %s: got %d, want %d", c.target, c.source, got, c.want)
+		}
+	}
+}

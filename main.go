@@ -19,7 +19,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.10.0"
+const parserVersion = "4.10.1"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -1261,6 +1261,26 @@ func (s *ParserState) damageOwner(m *dota.CMsgDOTACombatLogEntry, attackerName s
 	return s.ownerByNames(s.LookupName(m.GetDamageSourceName()), attackerName)
 }
 
+// linkedDeath reports a death entry for a player who already died at this tick, the death kept being the first one
+// not credited to the player himself: when one Meepo dies the others die with him, each logged with Meepo as the
+// attacker, and Valve counts one death.
+func linkedDeath(evs []DeathEvent, t float64, player, killer int) bool {
+	if len(evs) == 0 || evs[len(evs)-1].Time != t {
+		return false
+	}
+	return killer == player || evs[len(evs)-1].Killer != player
+}
+
+// dropSelfDeaths takes off the deaths at tick t credited to the player himself: Meepo's clones, logged before the
+// Meepo whose death is real.
+func dropSelfDeaths(evs []DeathEvent, t float64, player int) (kept, dropped []DeathEvent) {
+	n := len(evs)
+	for n > 0 && evs[n-1].Time == t && evs[n-1].Killer == player {
+		n--
+	}
+	return evs[:n], evs[n:]
+}
+
 func (s *ParserState) ownerByNames(src, attackerName string) int {
 	if strings.HasPrefix(src, "npc_dota_hero_") {
 		if idx := heroNameToPlayerIndex(src, s); idx >= 0 && idx < 10 {
@@ -1994,6 +2014,14 @@ func main() {
 			if strings.Contains(targetName, "hero") && !m.GetIsTargetIllusion() {
 				targetIdx := heroNameToPlayerIndex(targetName, state)
 				attackerIdx := state.damageOwner(m, attackerName)
+				// v4.10.1: a player dies once per tick — when one Meepo dies the others die with him, each logged
+				// with Meepo as the attacker (nothing below the hero block applies to a hero target)
+				if targetIdx >= 0 && targetIdx < 10 && linkedDeath(state.Players[targetIdx].DeathEvents, actualTime, targetIdx, attackerIdx) {
+					break
+				}
+				// a death credited to the dying player himself is no kill and has no assists (a Meepo clone's
+				// entry lists the enemies near it); alone it is a suicide and stays a death
+				selfDeath := attackerIdx >= 0 && attackerIdx == targetIdx
 				// an Aegis or Reincarnation death: kept as an event, flagged; no assists, no lane counts
 				reincarnated := m.GetWillReincarnate()
 
@@ -2016,8 +2044,21 @@ func main() {
 						}
 					}
 				}
+				if selfDeath {
+					assistIndices = nil
+				}
 
 				if targetIdx >= 0 && targetIdx < 10 {
+					// a real death replaces the clones' logged before it in the same tick, with what they took
+					var dropped []DeathEvent
+					if !selfDeath {
+						state.Players[targetIdx].DeathEvents, dropped = dropSelfDeaths(state.Players[targetIdx].DeathEvents, actualTime, targetIdx)
+						for _, d := range dropped {
+							if d.Time >= 0 && d.Time < 600 && !d.Reincarnated {
+								state.Players[targetIdx].LaneDeaths--
+							}
+						}
+					}
 					state.Players[targetIdx].Deaths++
 
 					// Compute nearby heroes at death for coaching patterns
@@ -2052,6 +2093,11 @@ func main() {
 					if pending.GoldLost > 0 && actualTime-pending.Time < 2.0 && actualTime-pending.Time >= -0.5 {
 						goldLost = pending.GoldLost
 						state.PendingGoldLost[targetIdx] = PendingGoldLoss{} // clear
+					}
+					for _, d := range dropped {
+						if goldLost == 0 {
+							goldLost = d.GoldLost
+						}
 					}
 
 					state.Players[targetIdx].DeathEvents = append(state.Players[targetIdx].DeathEvents, DeathEvent{
@@ -2088,7 +2134,7 @@ func main() {
 					}
 				}
 
-				if attackerIdx >= 0 && attackerIdx < 10 {
+				if attackerIdx >= 0 && attackerIdx < 10 && !selfDeath {
 					state.Players[attackerIdx].Kills++
 					state.Players[attackerIdx].KillEvents = append(state.Players[attackerIdx].KillEvents, KillEvent{
 						Time:         actualTime,
@@ -2240,6 +2286,14 @@ func main() {
 					case 4:
 						state.Players[owner].DamageByTarget[victim].PureDamage += damage
 					}
+				}
+			}
+			// v4.10.1: Valve's hero damage counts the hits on a Spirit Bear too (its death is no kill); the per-target
+			// report stays the heroes' — damage to the bear is not damage to Lone Druid
+			if owner := state.damageOwner(m, attackerName); owner >= 0 && damage > 0 && !m.GetIsTargetIllusion() && isSpiritBear(targetName) {
+				if victim := state.damageVictim(targetName, state.LookupName(m.GetTargetSourceName())); victim >= 0 && victim < 10 &&
+					state.Players[owner].IsRadiant != state.Players[victim].IsRadiant {
+					state.Players[owner].HeroDamage += damage
 				}
 			}
 
