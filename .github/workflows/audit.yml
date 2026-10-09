@@ -1,4 +1,4 @@
-# The parser against the public statistics of ~20 fresh matches, every Monday (cmd/audit, audit/).
+# The parser against the public statistics of ~30 fresh matches, every Monday (cmd/audit, audit/).
 # Valve's numbers must stay exact and no field may match worse than audit/baseline.json allows: a new hero,
 # item or mechanic the parser miscounts fails this run, and GitHub mails the failure. The report is the
 # run's summary and an artifact. Read-only: it downloads replays from Valve and asks OpenDota, nothing else.
@@ -25,8 +25,9 @@ jobs:
         run: |
           go build -o parser .
           go build -o audit-bin ./cmd/audit
-      - name: pick 20 fresh matches
-        run: ./audit-bin pick -dir work -n 20
+      - name: pick 30 fresh matches
+        # 30, not 20: a third or more of the downloads from Valve can fail on a GitHub runner
+        run: ./audit-bin pick -dir work -n 30
       - name: fetch OpenDota answers and replays
         run: ./audit-bin fetch -dir work -wait 20m
       - name: compare

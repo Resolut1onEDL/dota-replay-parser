@@ -104,7 +104,7 @@ var groupTitle = map[string]string{
 	GroupValve:       "Valve's numbers (scoreboard, items, score) — must be exact",
 	GroupReplay:      "OpenDota's parse of the same replay — a second opinion",
 	GroupConsistency: "The parser against itself",
-	GroupHeuristic:   "Heuristics on both sides — information only",
+	GroupHeuristic:   "Information only — heuristics, or different counting rules on purpose",
 }
 
 // Markdown renders the report: one table per group, then the mismatch examples of every field below 100 %.

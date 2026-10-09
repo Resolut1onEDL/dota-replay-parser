@@ -63,7 +63,7 @@ go build -o parser . && go build -o audit-bin ./cmd/audit
 
 `run` exits 1 and lists the fields when one matches worse than the baseline. A fix that
 makes fields better is followed by `-write-baseline audit/baseline.json` and a commit of
-the new baseline. The same check runs every Monday on ~20 fresh matches
+the new baseline. The same check runs every Monday on ~30 fresh matches
 (`.github/workflows/audit.yml`); `go test` runs it on the replays kept in `test-replays/`.
 Known differences of the references (OpenDota samples minutes a second early, its starting
 items are its first inventory sighting, Valve's XPM counts past level 30, …) are written in

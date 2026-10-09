@@ -73,7 +73,7 @@ func TestCompareUnparsedMatchHasValveChecksOnly(t *testing.T) {
 	decode(t, oursJSON, &ours)
 	decode(t, strings.Replace(odJSON, `"version":22,`, `"version":null,`, 1), &od)
 	for _, c := range Compare(&ours, &od, Consts{}) {
-		if c.Group == GroupReplay || c.Group == GroupHeuristic {
+		if c.Group == GroupReplay || c.Field == "match.teamfights" || c.Field == "player.lane_role" {
 			t.Errorf("%s compared although OpenDota has not parsed the replay", c.Field)
 		}
 	}

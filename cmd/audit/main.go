@@ -317,7 +317,13 @@ func fetch(args []string) error {
 		go func() {
 			defer wg.Done()
 			for m := range jobs {
-				if err := download(*dir, m.MatchID); err != nil {
+				err := download(*dir, m.MatchID)
+				if err != nil {
+					// Valve's CDN drops a download now and then (a cut body, a timeout); one more try
+					time.Sleep(10 * time.Second)
+					err = download(*dir, m.MatchID)
+				}
+				if err != nil {
 					mu.Lock()
 					failed++
 					mu.Unlock()
