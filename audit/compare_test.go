@@ -67,6 +67,18 @@ func TestCompareScoreboardItemsAndLogs(t *testing.T) {
 	}
 }
 
+// Valve's scoreboard does not count a Spirit Bear kill; OpenDota's kills_log does (match 9034607477: Viper 11 kills, 16 logged).
+func TestKillsLogSkipsSpiritBear(t *testing.T) {
+	var ours Match
+	var od ODMatch
+	decode(t, oursJSON, &ours)
+	decode(t, strings.Replace(odJSON, `{"time":900,"key":"npc_dota_hero_witch_doctor"}`,
+		`{"time":900,"key":"npc_dota_hero_witch_doctor"},{"time":1000,"key":"npc_dota_lone_druid_bear1"}`, 1), &od)
+	if c := byField(Compare(&ours, &od, Consts{}))["player.kills_log"]; len(c) != 1 || !c[0].OK {
+		t.Errorf("kills_log with a Spirit Bear death: want one passing check, got %+v", c)
+	}
+}
+
 func TestCompareUnparsedMatchHasValveChecksOnly(t *testing.T) {
 	var ours Match
 	var od ODMatch

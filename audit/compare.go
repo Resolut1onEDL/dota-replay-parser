@@ -278,6 +278,11 @@ func Compare(ours *Match, od *ODMatch, c Consts) []Check {
 			}
 		}
 		for _, k := range o.KillsLog {
+			// the combat log flags Lone Druid's Spirit Bear as a hero and OpenDota logs its deaths; Valve's
+			// scoreboard kills, which our kill events match, do not count them
+			if strings.HasPrefix(string(k.Key), "npc_dota_lone_druid_bear") {
+				continue
+			}
 			tk = append(tk, ev{T: k.Time, K: string(k.Key)})
 		}
 		evCheck(add, "player.kills_log", GroupReplay, h, ok, tk, odTimeTol, -1)
