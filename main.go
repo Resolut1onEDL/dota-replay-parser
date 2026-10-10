@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.10.2"
+const parserVersion = "4.11.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -74,6 +74,31 @@ type AegisEvent struct {
 	Time      float64 `json:"time"`
 	PlayerIdx int     `json:"playerIdx"`
 	Event     string  `json:"event"` // "taken" | "stolen" | "denied"
+}
+
+// v4.11.0: a Tormentor killed — Valve's own announcement (CHAT_MESSAGE_MINIBOSS_KILL), as the aegis and the runes:
+// the killing team in its value (2 radiant, 3 dire), the hero behind the last hit in playerid_1. No omitempty on
+// Killer: slot 0 is real, -1 = no hero.
+type TormentorEvent struct {
+	Time   float64 `json:"time"`
+	Team   string  `json:"team"` // "radiant" | "dire"
+	Killer int     `json:"killer"`
+}
+
+// tormentorKill reads one CHAT_MESSAGE_MINIBOSS_KILL; team is "" when the value is neither team.
+func tormentorKill(t float64, value, playerID int32) TormentorEvent {
+	team := ""
+	switch value {
+	case 2:
+		team = "radiant"
+	case 3:
+		team = "dire"
+	}
+	killer := -1
+	if playerID >= 0 && playerID < 10 {
+		killer = int(playerID)
+	}
+	return TormentorEvent{Time: t, Team: team, Killer: killer}
 }
 
 type BuildingEvent struct {
@@ -564,6 +589,8 @@ type Match struct {
 	// Match events
 	RoshanKills   []RoshanEvent   `json:"roshanKills,omitempty"`
 	AegisEvents   []AegisEvent    `json:"aegisEvents,omitempty"`
+	// v4.11.0: absent when no Tormentor was killed
+	TormentorKills []TormentorEvent `json:"tormentorKills,omitempty"`
 	Buybacks      []BuybackEvent  `json:"buybacks,omitempty"`
 	RuneSpawns    []RuneEvent     `json:"runeSpawns,omitempty"`
 	BuildingKills []BuildingEvent `json:"buildingKills,omitempty"`
@@ -1070,6 +1097,7 @@ type ParserState struct {
 	// Match events
 	RoshanKills   []RoshanEvent
 	AegisEvents   []AegisEvent
+	TormentorKills []TormentorEvent
 	Buybacks      []BuybackEvent
 	RuneSpawns    []RuneEvent
 	BuildingKills []BuildingEvent
@@ -2047,6 +2075,20 @@ func main() {
 			if pid := int(m.GetPlayerid_1()); pid >= 0 && pid < 10 {
 				state.ChatRunes[pid] = append(state.ChatRunes[pid], RuneEvent{Time: state.entityActual(), RuneType: int(m.GetValue()), Action: 1})
 				state.HasChatRunes = true
+			}
+			return nil
+		}
+		// v4.11.0: a Tormentor killed. A team the value does not name falls back to the killer's side.
+		if m.GetType() == dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_MINIBOSS_KILL {
+			ev := tormentorKill(state.ActualGameSeconds(state.GameTime()), int32(m.GetValue()), m.GetPlayerid_1())
+			if ev.Team == "" && ev.Killer >= 0 && state.Players[ev.Killer] != nil {
+				ev.Team = "dire"
+				if state.Players[ev.Killer].IsRadiant {
+					ev.Team = "radiant"
+				}
+			}
+			if ev.Team != "" {
+				state.TormentorKills = append(state.TormentorKills, ev)
 			}
 			return nil
 		}
@@ -4965,6 +5007,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		RadiantExperienceLeads: xpLeads,
 		RoshanKills:            state.RoshanKills,
 		AegisEvents:            state.AegisEvents,
+		TormentorKills:         state.TormentorKills,
 		Buybacks:               state.Buybacks,
 		RuneSpawns:             state.RuneSpawns,
 		BuildingKills:          state.BuildingKills,

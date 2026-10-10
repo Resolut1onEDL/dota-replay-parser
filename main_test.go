@@ -953,6 +953,23 @@ func TestFinalGPM(t *testing.T) {
 	}
 }
 
+// v4.11.0: a Tormentor kill from Valve's CHAT_MESSAGE_MINIBOSS_KILL. Match 9013821098: value 3, playerid_1 5 at
+// 20:58 — OpenDota's objectives say team 3, slot 5, 1259 s.
+func TestTormentorKill(t *testing.T) {
+	if got := tormentorKill(1258.2, 3, 5); got != (TormentorEvent{Time: 1258.2, Team: "dire", Killer: 5}) {
+		t.Errorf("dire kill: got %+v", got)
+	}
+	if got := tormentorKill(1500, 2, 0); got != (TormentorEvent{Time: 1500, Team: "radiant", Killer: 0}) {
+		t.Errorf("slot 0 is a real killer: got %+v", got)
+	}
+	if got := tormentorKill(1500, 2, -1); got.Killer != -1 || got.Team != "radiant" {
+		t.Errorf("no hero behind the last hit: got %+v", got)
+	}
+	if got := tormentorKill(1500, 0, 12); got.Team != "" || got.Killer != -1 {
+		t.Errorf("neither team, no player: got %+v", got)
+	}
+}
+
 // v4.6.0: measured dead time replaces guessing — a span is matched to its
 // death event, aegis-style instant revives keep their true short span, and
 // spans without a death event (illusion noise) still count in the total.

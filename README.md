@@ -132,6 +132,18 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
 - `deathEvents[].assist` — the players Valve credited for that death (an
   Aegis death lists none). `laneStats.assistsPreTen` follows the events.
 
+### 4.11.0 — Tormentor kills
+
+- `tormentorKills` (match) — every Tormentor killed, `[{time, team, killer}]`, from
+  Valve's own announcement (CHAT_MESSAGE_MINIBOSS_KILL), as the aegis pickups: the
+  killing team (its value: 2 radiant, 3 dire) and the hero behind the last hit
+  (`killer`, `-1` when none; no omitempty — slot 0 is real). Absent when no
+  Tormentor died. Until now the parse had no trace of a Tormentor at all: the
+  coaching students' objectives tab took it from OpenDota, which parses few pubs.
+  Checked on the audit set (99 matches of 2026-10-07): all 49 Tormentor kills
+  OpenDota lists, each within 3 s, with the same team and the same killer; no
+  audit field matches worse than the baseline.
+
 ### Wall-clock alignment (e.g. voice transcripts → game events)
 
 `startDateTime` points to the demo's first packet (pick/strategy). For aligning
