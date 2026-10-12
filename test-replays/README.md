@@ -29,3 +29,11 @@ the expected numbers are in the test):
 ```sh
 curl -o test-replays/9032897977.dem.bz2 http://replay151.valve.net/570/9032897977_1496998234.dem.bz2
 ```
+
+`TestSupportExportsReplay` (4.13.0: `positionTrack`, stack outcomes, `dewardEvents`) needs
+`9020064111.dem.bz2` (sieg klas's Lion, 2026-09-28; Valve deletes pub replays after ~14 days — a copy is
+in `~/dota-replays/1550818411/` on the founder's Mac):
+
+```sh
+cp ~/dota-replays/1550818411/9020064111.dem.bz2 test-replays/
+```

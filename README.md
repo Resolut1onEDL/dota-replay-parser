@@ -35,6 +35,7 @@ Stdout is the JSON output. Stderr carries progress logs. Exit code 0 = success.
   "teamfights":      [...]
   "roshanKills":     [...]
   ...
+  "positionTrack":   [ { t, p } ]            // 4.13.0: 1 Hz hero positions, see below
   "damageSeconds":   [ { t, a, v, k, d } ]   // 4.9.0 wide export, see below
   "controlEvents":   [ { t, p, a, m, ab, stun, slow, on } ]
   "parserVersion":   "<semver>"
@@ -170,6 +171,83 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   4.11.0 in all 99, no audit field worse than the baseline; 23 bans a game
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
+
+### 4.13.0 — support exports: 1 Hz positions, stack outcomes, deward bounties
+
+- `positionTrack` (match) — the ten heroes' positions once per game second, the
+  whole game: `[{t, p}]`, `t` the game second (0 = horn, the combat-log axis of
+  every event time), each second from 0 to `durationSeconds`; `p` =
+  `[x0,y0,x1,y1,…,x9,y9]` in the cells of `positionSamples` (the real hero's
+  `CBodyComponent.m_cellX/Y`, integers), `-1,-1` while the hero is dead (from the
+  dying state on, as `totalDeadTimeSec`) or not seen yet. A row is the heroes as
+  they stood at the first tick of its second. `positionSamples` (one row a
+  minute) are unchanged; they are read up to a second later, keep a dead hero's
+  last cell, and run on past the end.
+- `players[].stats.stackEvents[]` — who cleared each stack: `clearedBy` (slot;
+  no omitempty), `clearedAt` (his first kill of its creeps), `clearedCreeps`,
+  `clearedGold` (the last three absent when `clearedBy` is `-1`). A stack's
+  creeps are its camp's creeps (the camp from `m_hNeutralSpawner`, tracked since
+  4.12.0) awake at the stack and alive then; a creep belongs to the earliest stack
+  of its camp, so a camp stacked at 5:00 and 8:00 and cleared at 9:53 gives the
+  5:00 stack the camp and its first stacked wave and the 8:00 stack the wave it
+  added — no creep counts twice. Each creep's death (its `m_lifeState`, 1–3 ticks
+  after the combat log) is joined to the combat log's neutral death, the killer's
+  hero nearest the creep when two camps lose creeps in one tick; the killer is
+  the owner of the unit that landed it (illusions, treants, skeletons count as
+  their owner, as creep kills have since 4.10.0) and the gold is the neutral-kill
+  gold Valve paid him in that tick (GOLD, reason 14), shared by the neutrals he
+  killed in it. A creep a camp creep summoned (the dark troll warlord's
+  skeletons) is not the camp's. The clearer killed the most of them (gold, the
+  earlier first kill, the lower slot break a tie); `-1` when no player's unit
+  killed any, or lane creeps of a pull killed more of them than he did.
+  `clearedAt − time` can be long: a stacked camp nobody farms keeps its creeps.
+- `stackEvents[]` camp (fix) — a stack goes to the nearest camp within reach
+  (25 cells, as before) that shows a stack at that mark: a wave spawned with the
+  minute while creeps it spawned earlier were alive, out of the box; one stack
+  per camp and mark. Before, a counter rising by two at once — two camps side by
+  side stacked in one pull, a medium and the ancients — put both stacks on the
+  nearest camp, and some stacks landed on a nearer camp that did not spawn then.
+- `players[].stats.dewardEvents` — `[{time, wardType, gold, goldTo, denied}]`,
+  one per `visionStats.wardsDewarded` (the same combat-log ward deaths, so the
+  counts are equal). `gold`: the bounty in Valve's announcement of that kill
+  (`CHAT_MESSAGE_OBSERVER_WARD_KILLED` / `_SENTRY_WARD_KILLED`: playerid_1 the
+  killer, playerid_2 the hero paid, value the gold; without one, the ward-kill
+  GOLD, reason 20, of that tick). This patch pays for observers only (100 gold
+  plus ~4 a minute of the game); a sentry is 0. `goldTo`: the slot paid — a
+  quarter of the time not the killer: Valve seems to pay whoever revealed the
+  ward (on the audit set the payee had a live sentry within 10 cells of the
+  killer in 84 % of paid kills; dust and gems are not tracked), so a support's
+  sentries earn him bounties for wards his team kills — sum the team's events
+  whose `goldTo` is him. `-1` when nobody was paid (Valve named no one, or no
+  announcement). `denied: true` — a ward of his own team (the combat log's
+  attacker and target teams match): `wardsDewarded` counts these too; no bounty.
+- Checked on sieg klas (1550818411, a position-4 Immortal), four games:
+  Lion (won, 29:54), Rubick (lost, 45:27), Tusk (lost, 32:17), Skywrath Mage
+  (won, 46:27). The track agrees with `positionSamples` at mm:00 to the cell in
+  1,207 of 1,306 pairs, the rest a cell or two (a blink or a teleport inside the
+  second); a hero is `-1` three seconds after every death but four, all
+  buybacks. His 21 stacks: 17 cleared by his cores (2,879 gold; Lion's 6 of 6 by
+  Sven, 0:09–4:53 after the stack), 2 by himself, 2 by the enemy offlaner
+  (Timbersaw farmed two of Skywrath Mage's stacks at 18:12); a Rubick stack of
+  the ancients at 10:00 sat until 24:09. Before the camp fix 9 of the 21 sat on
+  another camp: 6 in the 6 double pulls (medium + ancients) counted on one camp,
+  3 on a camp that did not spawn then.
+  His 33 dewards: 20 sentries (0 gold), 13 observers (2,354 gold, 726 of it paid
+  to a teammate); teammates' kills on his sentries paid him 481 more.
+  Audit set (99 matches of 2026-10-07): no audit field worse than the baseline;
+  every other field byte-identical to 4.12.0 but the stack camps — 547 of
+  1,764 stacks moved: 257 that shared a camp and minute with another stack of
+  the same player (253 repeats before, none now) and 290 that sat on a camp
+  that did not spawn at that mark; the new camp is a median 5.7 cells from the
+  stacker (the old 4.0) — and `spawnBlocks` ties (32 bans in 25 matches: two units at the same
+  distance, which 4.12.0 itself picks either way run to run). Stacks: 45 %
+  cleared by the stacker, 42 % by an ally, 11 % by an enemy, 2 % by no player;
+  73 % within 2 minutes, 7 % after 5. Dewards: 2,724 events, equal to
+  `wardsDewarded` for all 990 players; all 980 observer kills paid, no sentry;
+  26 % paid to someone other than the killer, 35 denied, 5 with no payee.
+  `positionTrack`: a row for every second in 99 of 99; +31 KB gzipped a game
+  (median, max 101), the whole parse +24 % gzipped (141 KB median before).
+  Parse time +~3 %.
 
 ### Wall-clock alignment (e.g. voice transcripts → game events)
 
