@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.11.0"
+const parserVersion = "4.12.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -83,6 +83,21 @@ type TormentorEvent struct {
 	Time   float64 `json:"time"`
 	Team   string  `json:"team"` // "radiant" | "dire"
 	Killer int     `json:"killer"`
+}
+
+// v4.12.0: a camp ban — an empty neutral camp that did not spawn at a minute mark (the game skips a spawn while a unit
+// stands in the camp's box). Read from the camps themselves: no neutral alive there at the mark and none appearing
+// with it. The blocker is the player's unit nearest to the spawner then — his hero, an illusion, a summon (Nature's
+// Prophet's treants, Lone Druid's bear, a dominated creep), a courier or a ward; Player -1 / By "" when no player's
+// unit stood within reach. Dist: cells from the spawner to that unit.
+type SpawnBlock struct {
+	Time     float64 `json:"time"`
+	CampX    float64 `json:"campX"`
+	CampY    float64 `json:"campY"`
+	CampTier string  `json:"campTier,omitempty"`
+	Player   int     `json:"player"`
+	By       string  `json:"by"`
+	Dist     float64 `json:"dist"`
 }
 
 // tormentorKill reads one CHAT_MESSAGE_MINIBOSS_KILL; team is "" when the value is neither team.
@@ -598,6 +613,7 @@ type Match struct {
 	PositionSamples []PositionSample `json:"positionSamples,omitempty"`
 	SmokeEvents     []SmokeEvent     `json:"smokeEvents,omitempty"` // v4: group smoke detection
 	CampBlocks      []CampBlock      `json:"campBlocks,omitempty"`  // v4.6.0: laning camp-block war
+	SpawnBlocks     []SpawnBlock     `json:"spawnBlocks,omitempty"` // v4.12.0: camp bans, the whole game
 	// v4.9.0 wide export (wide.go): damage to heroes per second, control modifiers on heroes.
 	DamageSeconds  []DamageSecond  `json:"damageSeconds,omitempty"`
 	ControlEvents  []ControlEvent  `json:"controlEvents,omitempty"`
@@ -1195,6 +1211,16 @@ type ParserState struct {
 	NeutCampIdx    map[int32]int       // neutral entityIdx -> campIdx (≤8 cells at first sight)
 	CampSeenTimes  [][]float64         // campIdx -> neutral first-seen times ≤13 min
 	CampDelTimes   [][]float64         // campIdx -> neutral deletion times ≤13 min
+	// v4.12.0: camp bans over the whole game — neutral occupancy per camp (apart from the laning maps above, which
+	// stop at 13 min) and the players' units at each minute mark
+	SpawnNeutCamp map[int32]int   // neutral entityIdx -> index in SpawnLives (-1: not a camp's creep)
+	SpawnLives    []spawnLife     // every neutral of a camp: camp, species, first sight, waiting to spawn
+	SpawnerCamp   map[int32]int   // CDOTA_NeutralSpawner entityIdx -> campIdx
+	SpawnWakes    [][]float64     // campIdx -> moments its creeps stopped waiting to spawn (the camp spawned)
+	SpawnHits     []map[string]int // campIdx -> species heroes hit there, the whole game (camp kind and tier when the
+	// replay's creeps carry no species: builds before ~2026-10-10 name them by an index the replay does not resolve)
+	SpawnSnaps    []spawnSnap     // the players' units at each minute mark
+	SpawnLastMin  int             // the last minute mark snapped
 	StackIncrs     []stackIncr         // m_iCampsStacked increments (time+player)
 	PrevCampsStacked [10]int
 	// v4.6.0 dead-time: m_lifeState==2 spans per player (whole game).
@@ -1670,6 +1696,8 @@ func NewParserState(p *manta.Parser) *ParserState {
 		HgTowerCells:       make(map[string][2]float64),
 		CampWaveRuns:       make(map[int]*campRuns),
 		NeutCampIdx:        make(map[int32]int),
+		SpawnNeutCamp:      make(map[int32]int),
+		SpawnerCamp:        make(map[int32]int),
 	}
 	for i := 0; i < 10; i++ {
 		state.Players[i] = &PlayerState{
@@ -2556,6 +2584,21 @@ func main() {
 				}
 			}
 
+			// v4.12.0: the whole game's hero hits on neutrals, by camp — the camp kind and tier for camp bans
+			if strings.HasPrefix(attackerName, "npc_dota_hero_") && isNeutralCreepName(targetName) && !m.GetIsAttackerIllusion() {
+				if idx := heroNameToPlayerIndex(attackerName, state); idx >= 0 && idx < 10 {
+					if ci := nearestCampIdx(state, state.RealPos[idx][0], state.RealPos[idx][1], 4); ci >= 0 {
+						for len(state.SpawnHits) < len(state.CampSpawners) {
+							state.SpawnHits = append(state.SpawnHits, nil)
+						}
+						if state.SpawnHits[ci] == nil {
+							state.SpawnHits[ci] = map[string]int{}
+						}
+						state.SpawnHits[ci][strings.TrimPrefix(targetName, "npc_dota_neutral_")]++
+					}
+				}
+			}
+
 			// v4.6.0: hero->neutral pokes — the pull aggro signal ("первая
 			// тычка") and the camp-tier vote source. Real heroes only.
 			if actualTime >= -30 && actualTime <= 780 &&
@@ -2850,11 +2893,29 @@ func main() {
 					}
 					delete(state.NeutCampIdx, e.GetIndex())
 				}
+				// v4.12.0: the whole-game occupancy for camp bans
+				if li, tracked := state.SpawnNeutCamp[e.GetIndex()]; tracked {
+					if li >= 0 && state.SpawnLives[li].died == 0 {
+						state.SpawnLives[li].died = state.entityActual() - neutralCorpseLag
+					}
+					delete(state.SpawnNeutCamp, e.GetIndex())
+				}
 			}
 		}
 
 		if op == manta.EntityOpDeleted {
 			return nil
+		}
+
+		// v4.12.0: camp bans — the players' units at each minute mark, and every neutral's camp and first sight
+		if state.GameStartTime > 0 && len(state.CampSpawners) > 0 {
+			if t := state.entityActual(); t >= float64((state.SpawnLastMin+1)*60) {
+				state.SpawnLastMin = int(t / 60)
+				state.SpawnSnaps = append(state.SpawnSnaps, snapUnits(state, p, float64(state.SpawnLastMin*60)))
+			}
+			if op&manta.EntityOpDeleted == 0 && e.GetClassName() == "CDOTA_BaseNPC_Creep_Neutral" {
+				trackSpawnNeutral(state, p, e)
+			}
 		}
 
 		className := e.GetClassName()
@@ -3192,6 +3253,7 @@ func main() {
 		if className == "CDOTA_NeutralSpawner" && op&manta.EntityOpCreated != 0 {
 			if cx, ok := e.GetUint64("CBodyComponent.m_cellX"); ok {
 				if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
+					state.SpawnerCamp[e.GetIndex()] = len(state.CampSpawners)
 					state.CampSpawners = append(state.CampSpawners, [2]float64{float64(cx), float64(cy)})
 				}
 			}
@@ -4691,6 +4753,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 	tiers := campTiers(state)
 	stackEvents := detectStacks(state, tiers)
 	campBlocks := detectCampBlocks(state)
+	spawnBlocks := detectSpawnBlocks(state, tiers)
 
 	// Close dead spans still open at game end (died into the end screen).
 	for i := 0; i < 10; i++ {
@@ -5015,6 +5078,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		PositionSamples:        state.PositionSamples,
 		SmokeEvents:            detectSmokeEvents(state),
 		CampBlocks:             campBlocks,
+		SpawnBlocks:            spawnBlocks,
 		DamageSeconds:          damageSeconds(state.DamageHits),
 		ControlEvents:          state.ModEvents,
 		Players:                players,
@@ -5774,6 +5838,344 @@ func detectCampBlocks(state *ParserState) []CampBlock {
 	sort.Slice(out, func(a, b int) bool { return out[a].From < out[b].From })
 	return out
 }
+
+// v4.12.0 camp bans.
+type spawnUnit struct {
+	player int
+	by     string // "hero" | "illusion" | "summon" | "courier"
+	x, y   float64
+}
+
+type spawnSnap struct {
+	t        float64
+	units    []spawnUnit
+	neutrals []spawnUnit // the camps' own creeps alive at the mark: player = their camp
+}
+
+// unitOwner is the player whose unit e is: the hero that owns it (m_hOwnerNPC, a handle whose low 14 bits are the
+// entity index), else a summon's owning player id; -1 for lane creeps, buildings and the like.
+func unitOwner(state *ParserState, e *manta.Entity) int {
+	if h, ok := e.GetUint32("m_hOwnerNPC"); ok && h != 16777215 {
+		if pi, okP := state.HeroEntityToPlayer[int32(h&0x3FFF)]; okP {
+			return pi
+		}
+	}
+	if sm, ok := e.GetBool("m_bIsSummoned"); ok && sm {
+		if pid, okP := e.GetUint32("m_nPlayerOwnerID"); okP && pid < 20 {
+			return replayPlayerToIndex(pid)
+		}
+	}
+	return -1
+}
+
+// snapUnits lists every living unit a player controls at the minute mark t: heroes, illusions (hero entities that
+// replicate another hero, Monkey King's soldiers too), summons and couriers. Wards come from their lifecycle.
+func snapUnits(state *ParserState, p *manta.Parser, t float64) spawnSnap {
+	snap := spawnSnap{t: t}
+	for _, u := range p.FilterEntity(func(x *manta.Entity) bool { return x != nil }) {
+		team, ok := u.GetUint64("m_iTeamNum")
+		if !ok || (team != 2 && team != 3 && team != 4) {
+			continue
+		}
+		if ls, okL := u.GetUint64("m_lifeState"); okL && ls != 0 {
+			continue
+		}
+		cx, ok1 := u.GetUint64("CBodyComponent.m_cellX")
+		cy, ok2 := u.GetUint64("CBodyComponent.m_cellY")
+		if !ok1 || !ok2 || cx == 0 || cy == 0 {
+			continue
+		}
+		cn := u.GetClassName()
+		if team == 4 {
+			if li, okN := state.SpawnNeutCamp[u.GetIndex()]; okN && li >= 0 && cn == "CDOTA_BaseNPC_Creep_Neutral" {
+				by := "active"
+				if w, okW := u.GetBool("m_bIsWaitingToSpawn"); okW && w {
+					by = "waiting"
+				}
+				snap.neutrals = append(snap.neutrals, spawnUnit{player: state.SpawnLives[li].camp, by: by, x: float64(cx), y: float64(cy)})
+			}
+			continue
+		}
+		owner, by := -1, "summon"
+		switch {
+		case strings.HasPrefix(cn, "CDOTA_Unit_Hero_"):
+			pid, okP := u.GetUint32("m_iPlayerID")
+			if !okP {
+				continue
+			}
+			owner, by = replayPlayerToIndex(pid), "hero"
+			if repl, okR := u.GetUint32("m_hReplicatingOtherHeroModel"); okR && repl != 16777215 {
+				by = "illusion"
+			}
+		case strings.HasPrefix(cn, "CDOTA_NPC_Observer_Ward"):
+			continue
+		case strings.HasPrefix(cn, "CDOTA_BaseNPC_Creep_Lane") || strings.HasPrefix(cn, "CDOTA_BaseNPC_Creep_Siege"):
+			// a lane creep pulled into a camp blocks it too — nobody's ban
+			snap.neutrals = append(snap.neutrals, spawnUnit{player: -1, by: "creep", x: float64(cx), y: float64(cy)})
+			continue
+		case cn == "CDOTA_Unit_Courier":
+			owner, by = unitOwner(state, u), "courier"
+			if owner < 0 {
+				if pid, okP := u.GetUint32("m_nPlayerOwnerID"); okP && pid < 20 {
+					owner = replayPlayerToIndex(pid)
+				}
+			}
+		default:
+			owner = unitOwner(state, u)
+		}
+		if owner < 0 || owner > 9 {
+			continue
+		}
+		snap.units = append(snap.units, spawnUnit{player: owner, by: by, x: float64(cx), y: float64(cy)})
+	}
+	return snap
+}
+
+// spawnLife is one neutral creep of a camp: its species (UnitNames), first sight, death (0: alive at the end) and
+// whether it still waits to spawn. The game creates a camp's next creeps ahead, parked at the spawner waiting to spawn
+// (m_bIsWaitingToSpawn); at a minute mark they wake up — unless something stands in the camp's box.
+type spawnLife struct {
+	camp    int
+	species string // "" until known: the UnitNames table can fill in after the creep appears
+	nameIdx int32  // its UnitNames index, for a species resolved at the end
+	seen    float64
+	died    float64
+	waiting bool
+}
+
+// trackSpawnNeutral follows a neutral creep: its camp (m_hNeutralSpawner, else the nearest spawner at first sight)
+// and species at first sight, the moment it stops waiting to spawn (the camp spawned), and its leaving the camp for
+// good when it is dominated (it turns to a team).
+func trackSpawnNeutral(state *ParserState, p *manta.Parser, e *manta.Entity) {
+	idx := e.GetIndex()
+	team, _ := e.GetUint64("m_iTeamNum")
+	waiting, _ := e.GetBool("m_bIsWaitingToSpawn")
+	li, seen := state.SpawnNeutCamp[idx]
+	if !seen {
+		if team != 4 {
+			return
+		}
+		ci := -1
+		if h, ok := e.GetUint32("m_hNeutralSpawner"); ok && h != 16777215 {
+			if c, okC := state.SpawnerCamp[int32(h&0x3FFF)]; okC {
+				ci = c
+			}
+		}
+		if ci < 0 {
+			cx, ok1 := e.GetUint64("CBodyComponent.m_cellX")
+			cy, ok2 := e.GetUint64("CBodyComponent.m_cellY")
+			if ok1 && ok2 {
+				ci = nearestCampIdx(state, float64(cx), float64(cy), 8)
+			}
+		}
+		if ci < 0 {
+			state.SpawnNeutCamp[idx] = -1
+			return
+		}
+		ni, _ := e.GetInt32("m_iUnitNameStringTableIndex")
+		species := ""
+		if name, okS := p.LookupStringByIndex("UnitNames", ni); okS {
+			species = strings.TrimPrefix(name, "npc_dota_neutral_")
+		}
+		for len(state.SpawnWakes) < len(state.CampSpawners) {
+			state.SpawnWakes = append(state.SpawnWakes, nil)
+		}
+		state.SpawnNeutCamp[idx] = len(state.SpawnLives)
+		state.SpawnLives = append(state.SpawnLives, spawnLife{camp: ci, species: species, nameIdx: ni, seen: state.entityActual(), waiting: waiting})
+		if !waiting {
+			state.SpawnWakes[ci] = append(state.SpawnWakes[ci], state.entityActual())
+		}
+		return
+	}
+	if li < 0 {
+		return
+	}
+	l := &state.SpawnLives[li]
+	if l.species == "" {
+		// a creep waiting to spawn may get its name only when it wakes up
+		if ni, okN := e.GetInt32("m_iUnitNameStringTableIndex"); okN {
+			if name, okS := p.LookupStringByIndex("UnitNames", ni); okS {
+				l.species, l.nameIdx = strings.TrimPrefix(name, "npc_dota_neutral_"), ni
+			}
+		}
+	}
+	if l.waiting && !waiting {
+		l.waiting = false
+		state.SpawnWakes[l.camp] = append(state.SpawnWakes[l.camp], state.entityActual())
+	}
+	if team == 2 || team == 3 {
+		// dominated: no longer the camp's from now on
+		if l.died == 0 {
+			l.died = state.entityActual()
+		}
+		state.SpawnNeutCamp[idx] = -1
+	}
+}
+
+// isRiverSpecies: the river's frog camps (tadpoles, froglets, frogs, ancient frogs) release their creeps one by one
+// through the minute — not a minute-mark camp.
+func isRiverSpecies(species string) bool {
+	return strings.Contains(species, "frog") || strings.Contains(species, "tadpole")
+}
+
+// spawnSpeciesTier: species seen in camps of one tier only (7.41), voting beside campLeaderTier's leaders — a camp
+// whose spawns brought no leader still gets its tier.
+var spawnSpeciesTier = map[string]string{
+	"fel_beast": "small", "kobold": "small", "kobold_tunneler": "small", "harpy_scout": "small", "forest_troll_berserker": "small",
+	"giant_wolf": "medium", "ogre_mauler": "medium", "mud_golem_split": "medium",
+	"dark_troll": "large", "polar_furbolg_champion": "large", "wildkin": "large",
+	"ice_shaman": "ancient", "black_drake": "ancient", "small_thunder_lizard": "ancient", "prowler_acolyte": "ancient",
+}
+
+// neutralCorpseLag: a neutral's entity is deleted ~7.5 s after its combat-log death (corpse decay, measured in v4.6.0).
+const neutralCorpseLag = 7.5
+
+// detectSpawnBlocks finds the camp bans. At a minute mark a jungle camp whose next creeps wait at the spawner either
+// spawns (they wake up with the mark) or not — something stood in its box. Not a ban when its own living creeps stood
+// there (the camp was full); a ban when a player's unit (or ward) did — the nearest to the spawner gets it when it is
+// within spawnReach and closer than any creep; Player -1 when not, or when a lane creep or another camp's creep stood
+// in the box. River frog camps (creeps released one by one
+// through the minute) are left out; a camp's tier is its leader species' (campLeaderTier), else the combat-log vote.
+func detectSpawnBlocks(state *ParserState, tiers []string) []SpawnBlock {
+	n := len(state.CampSpawners)
+	if n == 0 || len(state.SpawnLives) == 0 {
+		return nil
+	}
+	river, total := make([]int, n), make([]int, n)
+	votes := make([]map[string]int, n)
+	vote := func(ci int, species string, k int) {
+		tier, ok := campLeaderTier[species]
+		if !ok {
+			tier, ok = spawnSpeciesTier[species]
+		}
+		if ok {
+			if votes[ci] == nil {
+				votes[ci] = map[string]int{}
+			}
+			votes[ci][tier] += k
+		}
+	}
+	names := map[int32]string{}
+	for _, l := range state.SpawnLives {
+		species := l.species
+		if species == "" && state.Parser != nil {
+			if known, okN := names[l.nameIdx]; okN {
+				species = known
+			} else {
+				if name, ok := state.Parser.LookupStringByIndex("UnitNames", l.nameIdx); ok {
+					species = strings.TrimPrefix(name, "npc_dota_neutral_")
+				}
+				names[l.nameIdx] = species
+			}
+		}
+		if species == "" {
+			continue
+		}
+		total[l.camp]++
+		if isRiverSpecies(species) {
+			river[l.camp]++
+		}
+		vote(l.camp, species, 1)
+	}
+	// a replay whose creeps carry no species: the camp's kind and tier from what heroes hit there
+	for ci := 0; ci < n && ci < len(state.SpawnHits); ci++ {
+		if total[ci] > 0 {
+			continue
+		}
+		for species, k := range state.SpawnHits[ci] {
+			total[ci] += k
+			if isRiverSpecies(species) {
+				river[ci] += k
+			}
+			vote(ci, species, k)
+		}
+	}
+	tierOf := func(ci int) string {
+		best, bestN := "", 0
+		for tier, k := range votes[ci] {
+			if k > bestN || (k == bestN && tier < best) {
+				best, bestN = tier, k
+			}
+		}
+		if best == "" && ci < len(tiers) {
+			best = tiers[ci]
+		}
+		return best
+	}
+	var out []SpawnBlock
+	for _, snap := range state.SpawnSnaps {
+		t := snap.t
+		for ci, sp := range state.CampSpawners {
+			if total[ci] > 0 && river[ci]*2 >= total[ci] {
+				continue
+			}
+			pending := false
+			dOwn, dOther := 99.0, 99.0
+			for _, c := range snap.neutrals {
+				d := math.Hypot(sp[0]-c.x, sp[1]-c.y)
+				switch {
+				case c.player == ci && c.by == "waiting":
+					pending = true
+				case c.player == ci:
+					dOwn = math.Min(dOwn, d)
+				case c.by != "waiting":
+					dOther = math.Min(dOther, d) // a lane creep or another camp's creep
+				}
+			}
+			if !pending {
+				continue // no creeps waiting: nothing to spawn at this mark
+			}
+			woke := false
+			if ci < len(state.SpawnWakes) {
+				for _, wt := range state.SpawnWakes[ci] {
+					if wt >= t-1 && wt <= t+3 {
+						woke = true
+						break
+					}
+				}
+			}
+			who, by, best := -1, "", 99.0
+			for _, u := range snap.units {
+				if d := math.Hypot(sp[0]-u.x, sp[1]-u.y); d < best {
+					who, by, best = u.player, u.by, d
+				}
+			}
+			for pi := 0; pi < 10; pi++ {
+				ps := state.Players[pi]
+				if ps == nil {
+					continue
+				}
+				for _, w := range ps.Wards {
+					if w.Time > t || (w.EndTime != 0 && w.EndTime >= w.Time && w.EndTime < t) || (w.PositionX == 0 && w.PositionY == 0) {
+						continue
+					}
+					if d := math.Hypot(sp[0]-w.PositionX, sp[1]-w.PositionY); d < best {
+						who, by, best = pi, "ward", d
+					}
+				}
+			}
+			if woke || dOwn <= spawnBox {
+				continue
+			}
+			sb := SpawnBlock{Time: t, CampX: sp[0], CampY: sp[1], CampTier: tierOf(ci), Player: -1}
+			if best <= spawnReach && dOther > spawnBox && best < dOwn && best < dOther {
+				sb.Player, sb.By, sb.Dist = who, by, math.Round(best*10)/10
+			}
+			out = append(out, sb)
+		}
+	}
+	return out
+}
+
+// spawnBox: the camp's own living creeps this close to its spawner (cells) hold its box — measured on 9040460429:
+// within 2.8 cells the camp never spawned, from 4 cells it always did.
+const spawnBox = 3.5
+
+// spawnReach: a player's unit this close to the spawner (cells) of a camp that did not spawn — and closer than any
+// creep — is the blocker. Boxes differ by camp: on 9040460429 a unit within 2.8 cells blocked 73-100 % of the marks,
+// at 4-5.5 cells 4-20 %, from 6 cells never; on pubs heroes at 5.7-6.3 cells kept ancient and large camps empty. Only
+// marks that did not spawn are counted, so the wider reach costs no false bans.
+const spawnReach = 6.5
 
 // applyDeadSpans stamps measured dead spans onto death events (a span that
 // starts within [death-2, death+8] belongs to that death) and returns the

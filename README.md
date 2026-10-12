@@ -144,6 +144,33 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   OpenDota lists, each within 3 s, with the same team and the same killer; no
   audit field matches worse than the baseline.
 
+### 4.12.0 — camp bans
+
+- `spawnBlocks` (match) — every jungle camp that did not spawn at a minute mark
+  with a player's unit in its box, the whole game: `[{time, campX, campY,
+  campTier, player, by, dist}]`. Read from the camps themselves: the game creates
+  a camp's next creeps ahead, parked at the spawner waiting to spawn
+  (`m_bIsWaitingToSpawn`), and wakes them at the mark unless something stands in
+  the box. A mark that did not wake them, with none of the camp's own creeps in
+  the box (3.5 cells), is a ban; it goes to the player whose unit stood nearest
+  the spawner — his hero, an illusion (Monkey King's soldiers too), a summon
+  (Nature's Prophet's treants, a dominated creep), a courier or a ward — within
+  6.5 cells and closer than any creep; `player: -1` when nobody's unit explains
+  it or a lane creep / another camp's creep stood in the box. River frog camps
+  (released one by one through the minute) are left out. `campTier` comes from
+  the camp's species (the `UnitNames` table; replays before ~2026-10-10 lack it,
+  then from the species heroes hit there). `campBlocks` (the laning block war,
+  first 12 minutes) is unchanged.
+  Checked on 9040460429 (BLAST SLAM VIII, Watson's Nature's Prophet: 19 of the
+  enemy's ancient and medium camps banned with treants between 13 and 27 min)
+  and on four replays' 5,690 camp-marks: with the camp's own creep in the box it
+  woke 0.2 % of the time, with nobody within 6.5 cells 98.2 %, with a player's
+  unit within 2.8 cells 29.5 % — a ban counts only a mark that did not wake.
+  Audit set (99 matches of 2026-10-07): every other field byte-identical to
+  4.11.0 in all 99, no audit field worse than the baseline; 23 bans a game
+  (median), 21 % of them `player: -1` (a mark that did not wake with no
+  player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
+
 ### Wall-clock alignment (e.g. voice transcripts → game events)
 
 `startDateTime` points to the demo's first packet (pick/strategy). For aligning
