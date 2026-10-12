@@ -953,6 +953,40 @@ func TestFinalGPM(t *testing.T) {
 	}
 }
 
+// v4.12.0: camp bans. Camps 0 and 1 are jungle (ancient, medium), camp 2 a river frog camp; at 20:00 each has its next
+// creeps waiting at the spawner. Camp 0 does not wake: no creep of its own in the box, Nature's Prophet's treant
+// (player 5) on the spawner → his ban. Camp 1 woke → no ban. At 21:00 camp 0 has its own creep 1 cell from the spawner
+// (full) → no ban; camp 1 does not wake with a ward (player 8) 1 cell away and a hero 3 cells away → the ward's ban;
+// at 22:00 camp 1 does not wake and nobody stands within reach → kept with Player -1. The frog camp never counts.
+func TestDetectSpawnBlocks(t *testing.T) {
+	s := &ParserState{CampSpawners: [][2]float64{{88, 126}, {154, 116}, {120, 166}}}
+	for ci, sp := range []string{"prowler_shaman", "alpha_wolf", "froglet"} {
+		s.SpawnLives = append(s.SpawnLives, spawnLife{camp: ci, species: sp, seen: 10})
+	}
+	s.SpawnWakes = [][]float64{nil, {1201}, {1201, 1262, 1321}}
+	waiting := func(ci int) spawnUnit { return spawnUnit{player: ci, by: "waiting", x: s.CampSpawners[ci][0], y: s.CampSpawners[ci][1]} }
+	s.SpawnSnaps = []spawnSnap{
+		{t: 1200, units: []spawnUnit{{player: 5, by: "summon", x: 88, y: 126}}, neutrals: []spawnUnit{waiting(0), waiting(1), waiting(2), {player: 0, by: "active", x: 80, y: 126}}},
+		{t: 1260, units: []spawnUnit{{player: 2, by: "hero", x: 157, y: 116}}, neutrals: []spawnUnit{waiting(0), waiting(1), waiting(2), {player: 0, by: "active", x: 89, y: 126}}},
+		{t: 1320, units: []spawnUnit{{player: 2, by: "hero", x: 170, y: 116}}, neutrals: []spawnUnit{waiting(1), waiting(2)}},
+	}
+	s.Players[8] = &PlayerState{Wards: []WardEvent{{Time: 1230, Type: 0, PositionX: 155, PositionY: 116, EndTime: 1290}}}
+	got := detectSpawnBlocks(s, nil)
+	want := []SpawnBlock{
+		{Time: 1200, CampX: 88, CampY: 126, CampTier: "ancient", Player: 5, By: "summon", Dist: 0},
+		{Time: 1260, CampX: 154, CampY: 116, CampTier: "medium", Player: 8, By: "ward", Dist: 1},
+		{Time: 1320, CampX: 154, CampY: 116, CampTier: "medium", Player: -1},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d bans %+v, want %d", len(got), got, len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("ban %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
 // v4.11.0: a Tormentor kill from Valve's CHAT_MESSAGE_MINIBOSS_KILL. Match 9013821098: value 3, playerid_1 5 at
 // 20:58 — OpenDota's objectives say team 3, slot 5, 1259 s.
 func TestTormentorKill(t *testing.T) {
