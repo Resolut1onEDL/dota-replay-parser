@@ -1923,3 +1923,191 @@ func TestAssistEventsMatchScoreboardReplay(t *testing.T) {
 		}
 	}
 }
+
+// v4.13.0: the 1 Hz track. A row holds the ten heroes' cells; a dying or dead hero and one not seen yet are -1,-1.
+// The rows past the game's last second (the replay's post-game tail) are cut.
+func TestPositionTrack(t *testing.T) {
+	s := &ParserState{}
+	s.RealPos[0] = [2]float64{120, 130}
+	s.RealPos[1] = [2]float64{90, 160}
+	s.LifePrev[1] = 1 // dying
+	s.RealPos[3] = [2]float64{176, 88}
+	s.LifePrev[3] = 2 // dead
+	row := trackRow(s, 42)
+	want := []int{120, 130, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1}
+	if row.T != 42 || !slices.Equal(row.P, want) {
+		t.Errorf("row %+v, want t 42 p %v", row, want)
+	}
+	rows := []PositionTrackRow{{T: 0}, {T: 1}, {T: 2}, {T: 3}}
+	if got := trackUntil(rows, 2); len(got) != 3 || got[2].T != 2 {
+		t.Errorf("trackUntil: %+v", got)
+	}
+}
+
+// v4.13.0: a counter rising by two at once is two camps stacked in one pull — the second stack goes to the other camp
+// that spawned at that mark with its earlier creeps out, not to the nearest camp again; a single stack goes to the
+// nearest camp that shows a stack, past a nearer one that did not spawn then.
+func TestDetectStacksCampsOfOnePull(t *testing.T) {
+	s := &ParserState{CampSpawners: [][2]float64{{154, 116}, {162, 128}, {150, 108}}}
+	for i := 0; i < 10; i++ {
+		s.Players[i] = &PlayerState{}
+	}
+	for tt := 1300.0; tt <= 1321; tt++ {
+		s.PosHistory[8] = append(s.PosHistory[8], posSample{T: tt, X: 155, Y: 118})
+	}
+	// camps 0 and 1: creeps from 19:00 still alive at 22:00 and a wave spawned at 22:00; camp 2 did not spawn then
+	for _, ci := range []int{0, 1} {
+		s.SpawnLives = append(s.SpawnLives, spawnLife{camp: ci, woke: 1140.1}, spawnLife{camp: ci, woke: 1320.1})
+	}
+	s.SpawnLives = append(s.SpawnLives, spawnLife{camp: 2, woke: 1140.1})
+	s.StackIncrs = []stackIncr{{T: 1320.1, Player: 8}, {T: 1320.1, Player: 8}}
+	ev := detectStacks(s, campTiers(s))[8]
+	if len(ev) != 2 || ev[0].CampX != 154 || ev[1].CampX != 162 {
+		t.Fatalf("two camps of one pull: %+v", ev)
+	}
+	// the stacker nearest camp 2, which did not spawn at 22:00: the stack is camp 0's
+	s.PosHistory[8] = nil
+	for tt := 1300.0; tt <= 1321; tt++ {
+		s.PosHistory[8] = append(s.PosHistory[8], posSample{T: tt, X: 151, Y: 110})
+	}
+	s.StackIncrs = []stackIncr{{T: 1320.1, Player: 8}}
+	if ev := detectStacks(s, campTiers(s))[8]; len(ev) != 1 || ev[0].CampX != 154 {
+		t.Errorf("stack on a camp that did not spawn: %+v", ev)
+	}
+}
+
+// v4.13.0: who cleared a stack. Camp 0 (spawner 154,116): a wave from 4:00 (A1, A2), the wave stacked at 5:00 (B1, B2)
+// and the one stacked at 8:00 (C1). Player 8 stacks at 5:00 and 8:00; his carry (slot 5) and an illusion of the carry
+// clear A1, A2, B1 at 9:53, the mid (slot 7) takes C1 — the 5:00 stack holds A and B, the 8:00 stack only C. The 5:00
+// stack's B2 died to a lane creep. Camp 1 (162,128), stacked by slot 9 at 2:00: lane creeps of a pull kill two of its
+// three creeps, a hero the third — nobody's. Camp 2 (150,108), stacked at 3:00, was never cleared. A skeleton a camp
+// creep summoned is no creep of the stack, and its death steals no hero's.
+func TestStackOutcomes(t *testing.T) {
+	s := &ParserState{CampSpawners: [][2]float64{{154, 116}, {162, 128}, {150, 108}}}
+	life := func(camp int, woke, killed float64) spawnLife {
+		sp := s.CampSpawners[camp]
+		return spawnLife{camp: camp, woke: woke, killed: killed, kx: sp[0], ky: sp[1]}
+	}
+	s.SpawnLives = []spawnLife{
+		life(0, 240.1, 593.73), life(0, 240.1, 593.73), // A1, A2
+		life(0, 300.1, 594.8), life(0, 300.1, 310.2), // B1, B2 (B2: a lane creep)
+		life(0, 480.1, 598.2),                        // C1
+		life(1, 60.1, 130.3), life(1, 120.1, 131.4), life(1, 120.1, 133.0),
+		life(2, 120.1, 0), life(2, 180.1, 0),
+		{camp: 0, woke: 590.0, killed: 593.65, kx: 154, ky: 116, summoned: true}, // nearer that tick than A1, A2
+	}
+	hx, hy := 155.0, 118.0 // the carry's cell
+	s.NeutDeaths = []neutDeath{
+		{t: 130.2, owner: -1}, {t: 131.3, owner: -1}, {t: 132.9, owner: 9, hx: 163, hy: 127},
+		{t: 310.1, owner: -1},
+		{t: 593.63, owner: 5, hx: hx, hy: hy}, {t: 593.63, owner: 5, hx: hx, hy: hy}, // the carry's cleave: two at once
+		{t: 594.73, owner: 5, hx: hx, hy: hy}, // his illusion's last hit, owned by him
+		{t: 598.17, owner: 7, hx: 153, hy: 117},
+	}
+	s.NeutGold = []goldTick{{t: 593.63, player: 5, gold: 41}, {t: 594.73, player: 5, gold: 21}, {t: 598.17, player: 7, gold: 20}, {t: 132.9, player: 9, gold: 15}}
+	events := [10][]StackEvent{}
+	events[8] = []StackEvent{{Time: 300.1, CampX: 154, CampY: 116}, {Time: 480.1, CampX: 154, CampY: 116}}
+	events[9] = []StackEvent{{Time: 120.1, CampX: 162, CampY: 128}, {Time: 180.1, CampX: 150, CampY: 108}}
+	stackOutcomes(s, &events)
+	want := map[int][]StackEvent{
+		8: {
+			{Time: 300.1, CampX: 154, CampY: 116, ClearedBy: 5, ClearedAt: 593.6, ClearedCreeps: 3, ClearedGold: 62},
+			{Time: 480.1, CampX: 154, CampY: 116, ClearedBy: 7, ClearedAt: 598.2, ClearedCreeps: 1, ClearedGold: 20},
+		},
+		9: {
+			{Time: 120.1, CampX: 162, CampY: 128, ClearedBy: -1},
+			{Time: 180.1, CampX: 150, CampY: 108, ClearedBy: -1},
+		},
+	}
+	for p, w := range want {
+		if !slices.Equal(events[p], w) {
+			t.Errorf("player %d:\n got %+v\nwant %+v", p, events[p], w)
+		}
+	}
+}
+
+// v4.13.0: a deward's bounty. Valve's announcement names the killer, the hero paid and the gold: an observer the
+// student (slot 8) killed paid to the mid (7), a sentry paid nothing. Without an announcement the ward-kill gold of
+// that tick to a hero of his team stands in; a ward of his own team (denied) has no bounty; nothing found leaves -1.
+func TestDewardBounties(t *testing.T) {
+	s := &ParserState{}
+	for i := 0; i < 10; i++ {
+		s.Players[i] = &PlayerState{IsRadiant: i < 5}
+	}
+	s.Players[8].Dewards = []DewardEvent{
+		{Time: 231.7, WardType: "observer", GoldTo: -1},
+		{Time: 449.2, WardType: "sentry", GoldTo: -1},
+		{Time: 600.0, WardType: "observer", GoldTo: -1},
+		{Time: 700.0, WardType: "sentry", GoldTo: -1, Denied: true},
+		{Time: 800.0, WardType: "observer", GoldTo: -1},
+	}
+	s.WardChats = []wardChat{
+		{t: 231.73, killer: 8, to: 7, value: 115},
+		{t: 449.2, sentry: true, killer: 8, to: 8, value: 0},
+		{t: 700.0, sentry: true, killer: 3, to: 3, value: 0}, // another player's kill at the deny's tick
+	}
+	s.WardGold = []goldTick{{t: 600.0, player: 2, gold: 150}, {t: 600.0, player: 6, gold: 140}}
+	dewardBounties(s)
+	want := []DewardEvent{
+		{Time: 231.7, WardType: "observer", Gold: 115, GoldTo: 7},
+		{Time: 449.2, WardType: "sentry", Gold: 0, GoldTo: 8},
+		{Time: 600.0, WardType: "observer", Gold: 140, GoldTo: 6},
+		{Time: 700.0, WardType: "sentry", GoldTo: -1, Denied: true},
+		{Time: 800.0, WardType: "observer", GoldTo: -1},
+	}
+	if !slices.Equal(s.Players[8].Dewards, want) {
+		t.Errorf("\n got %+v\nwant %+v", s.Players[8].Dewards, want)
+	}
+}
+
+// v4.13.0 on a real replay (9020064111, sieg klas's Lion, 2026-09-28; a copy is in the founder's
+// ~/dota-replays/1550818411/): one deward event per wardsDewarded, a track row for every second of the game, every
+// stack with a clearer slot or -1.
+func TestSupportExportsReplay(t *testing.T) {
+	demPath := filepath.Join("test-replays", "9020064111.dem.bz2")
+	if _, err := os.Stat(demPath); err != nil {
+		t.Skipf("no replay: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), "parser")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin, demPath).Output()
+	if err != nil {
+		t.Fatalf("parser run: %v", err)
+	}
+	var got Match
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("parser stdout not JSON: %v", err)
+	}
+	if n := len(got.PositionTrack); n != got.DurationSeconds+1 {
+		t.Errorf("%d track rows, want %d", n, got.DurationSeconds+1)
+	}
+	for i, r := range got.PositionTrack {
+		if r.T != i || len(r.P) != 20 {
+			t.Fatalf("row %d: t %d, %d values", i, r.T, len(r.P))
+		}
+	}
+	stacks, cleared := 0, 0
+	for i, p := range got.Players {
+		if n := len(p.Stats.DewardEvents); n != p.Stats.VisionStats.WardsDewarded {
+			t.Errorf("player %d: %d deward events, wardsDewarded %d", i, n, p.Stats.VisionStats.WardsDewarded)
+		}
+		for _, e := range p.Stats.StackEvents {
+			stacks++
+			if e.ClearedBy < -1 || e.ClearedBy > 9 {
+				t.Errorf("player %d: stack %+v", i, e)
+			}
+			if e.ClearedBy >= 0 {
+				cleared++
+			}
+		}
+	}
+	// the student (slot 8): six stacks, all cleared by his carry Sven (slot 5)
+	if s := got.Players[8].Stats.StackEvents; len(s) != 6 || s[0].ClearedBy != 5 {
+		t.Errorf("Lion's stacks: %+v", s)
+	}
+	if stacks == 0 || cleared*10 < stacks*9 {
+		t.Errorf("%d of %d stacks cleared", cleared, stacks)
+	}
+}

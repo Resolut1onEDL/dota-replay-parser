@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.12.0"
+const parserVersion = "4.13.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -214,6 +214,15 @@ type PositionSample struct {
 	Players []PositionSamplePlayer `json:"players"`
 }
 
+// v4.13.0: the ten heroes' positions once per game second, the whole game (positionSamples keep their minute rows).
+// T: the game second on the combat-log axis (0 = horn), every second from 0 to the end. P: x,y of slots 0-9 in turn,
+// in positionSamples' cells (CBodyComponent.m_cellX/Y, real heroes only); -1,-1 while the hero is dead (from the dying
+// state on) or not seen yet.
+type PositionTrackRow struct {
+	T int   `json:"t"`
+	P []int `json:"p"`
+}
+
 // Creep kill breakdown by phase and source
 type CreepKillPhases struct {
 	LaneCreepsPre10    int `json:"laneCreepsPre10"`
@@ -396,6 +405,29 @@ type StackEvent struct {
 	CampX    float64 `json:"campX"`
 	CampY    float64 `json:"campY"`
 	CampTier string  `json:"campTier,omitempty"`
+	// v4.13.0: who cleared the stack (stackOutcomes). Its creeps: the camp's creeps awake at the stack and still
+	// alive, less those an earlier stack of the same camp already holds. ClearedBy: the player whose units (hero,
+	// illusions, summons) killed the most of them; -1 when no player's unit killed any (never cleared, dominated) or
+	// units of no player (lane creeps of a pull) killed more of them than he did — no omitempty, slot 0 is real.
+	// ClearedAt: his first kill of them; ClearedCreeps, ClearedGold: how many he killed and the gold Valve paid him
+	// for them (the neutral-kill gold of those ticks). All three absent when ClearedBy is -1.
+	ClearedBy     int     `json:"clearedBy"`
+	ClearedAt     float64 `json:"clearedAt,omitempty"`
+	ClearedCreeps int     `json:"clearedCreeps,omitempty"`
+	ClearedGold   int     `json:"clearedGold,omitempty"`
+}
+
+// v4.13.0: a ward this player destroyed — one per visionStats.wardsDewarded, the same combat-log deaths. Gold: the
+// bounty Valve announced for it (CHAT_MESSAGE_OBSERVER_WARD_KILLED / _SENTRY_WARD_KILLED; the patch of 2026-10 pays
+// for observers only, a sentry is 0); GoldTo: the slot it was paid to — Valve pays some to another hero of the
+// killer's team — and -1 when no announcement or bounty gold was found (no omitempty, slot 0 is real). Denied: a ward
+// of his own team (the combat log's attacker and target teams match) — wardsDewarded counts it too; no bounty.
+type DewardEvent struct {
+	Time     float64 `json:"time"`
+	WardType string  `json:"wardType"` // "observer" | "sentry"
+	Gold     int     `json:"gold"`
+	GoldTo   int     `json:"goldTo"`
+	Denied   bool    `json:"denied,omitempty"`
 }
 
 // v4.6.0: laning camp-block war entry (0:00-12:00). Method "ward" — an
@@ -520,6 +552,9 @@ type PlayerStats struct {
 	StackEvents      []StackEvent `json:"stackEvents,omitempty"`
 	TotalDeadTimeSec float64      `json:"totalDeadTimeSec"`
 
+	// v4.13.0: the wards this player destroyed, one per visionStats.wardsDewarded (see DewardEvent).
+	DewardEvents []DewardEvent `json:"dewardEvents,omitempty"`
+
 	// v4.9.0 wide export (wide.go): HP/mana per second and items arriving on the hero.
 	Vitals    *Vitals    `json:"vitals,omitempty"`
 	ItemGains []ItemGain `json:"itemGains,omitempty"`
@@ -611,6 +646,7 @@ type Match struct {
 	BuildingKills []BuildingEvent `json:"buildingKills,omitempty"`
 	Teamfights      []Teamfight      `json:"teamfights,omitempty"`
 	PositionSamples []PositionSample `json:"positionSamples,omitempty"`
+	PositionTrack   []PositionTrackRow `json:"positionTrack,omitempty"` // v4.13.0: 1 Hz hero positions
 	SmokeEvents     []SmokeEvent     `json:"smokeEvents,omitempty"` // v4: group smoke detection
 	CampBlocks      []CampBlock      `json:"campBlocks,omitempty"`  // v4.6.0: laning camp-block war
 	SpawnBlocks     []SpawnBlock     `json:"spawnBlocks,omitempty"` // v4.12.0: camp bans, the whole game
@@ -1047,6 +1083,8 @@ type PlayerState struct {
 
 	// Vision: enemy wards destroyed by this player (deward), v4.3.0
 	WardsDewarded int
+	// v4.13.0: one event per WardsDewarded increment; the bounty is filled in by dewardBounties
+	Dewards []DewardEvent
 
 	// Харасс на линии: долетевший физурон по вражеским героям в 1-10 мин.
 	// До v4.4.4 это значение выдавалось как reaggroCount («aggro proxy»).
@@ -1179,6 +1217,9 @@ type ParserState struct {
 	// Position sampling (every minute)
 	PositionSamples   []PositionSample
 	LastSampledMinute int
+	// v4.13.0: the 1 Hz track and the next game second it takes
+	PositionTrack []PositionTrackRow
+	TrackNext     int
 
 	// Gold lost tracking (GOLD event fires BEFORE DEATH event, so we buffer)
 	PendingGoldLost [10]PendingGoldLoss
@@ -1221,6 +1262,12 @@ type ParserState struct {
 	// replay's creeps carry no species: builds before ~2026-10-10 name them by an index the replay does not resolve)
 	SpawnSnaps    []spawnSnap     // the players' units at each minute mark
 	SpawnLastMin  int             // the last minute mark snapped
+	// v4.13.0: stack outcomes and deward bounties — the combat log's neutral deaths and the gold Valve paid for
+	// neutrals and wards, joined to the camps' creeps (SpawnLives) and the dewards at the end
+	NeutDeaths []neutDeath
+	NeutGold   []goldTick // GOLD, reason 14 (neutral kill)
+	WardGold   []goldTick // GOLD, reason 20 (ward kill)
+	WardChats  []wardChat // CHAT_MESSAGE_OBSERVER_WARD_KILLED / _SENTRY_WARD_KILLED
 	StackIncrs     []stackIncr         // m_iCampsStacked increments (time+player)
 	PrevCampsStacked [10]int
 	// v4.6.0 dead-time: m_lifeState==2 spans per player (whole game).
@@ -1792,7 +1839,7 @@ func (s *ParserState) ActualGameSeconds(rawTime float64) float64 {
 func (s *ParserState) rebasePreHorn(gameStart float64) int {
 	delta := preHornEpoch - gameStart
 	n := rebaseBand(reflect.ValueOf(s).Elem(), delta, 0)
-	// Unexported fields are invisible to reflection; the two that can carry a
+	// Unexported fields are invisible to reflection; the ones that can carry a
 	// pregame stamp are handled by hand.
 	for _, w := range s.ActiveWards {
 		if w != nil && w.start <= preHornBand {
@@ -1803,6 +1850,13 @@ func (s *ParserState) rebasePreHorn(gameStart float64) int {
 	for i := range s.PendingDewards {
 		if s.PendingDewards[i].t <= preHornBand {
 			s.PendingDewards[i].t += delta
+			n++
+		}
+	}
+	// v4.13.0: a ward killed before the horn is announced then too
+	for i := range s.WardChats {
+		if s.WardChats[i].t <= preHornBand {
+			s.WardChats[i].t += delta
 			n++
 		}
 	}
@@ -2106,6 +2160,13 @@ func main() {
 			}
 			return nil
 		}
+		// v4.13.0: a ward destroyed — the killer (playerid_1), the hero paid (playerid_2) and the bounty (value)
+		if m.GetType() == dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_OBSERVER_WARD_KILLED || m.GetType() == dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_SENTRY_WARD_KILLED {
+			state.WardChats = append(state.WardChats, wardChat{
+				t: state.entityActual(), sentry: m.GetType() == dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_SENTRY_WARD_KILLED,
+				killer: int(m.GetPlayerid_1()), to: int(m.GetPlayerid_2()), value: int(m.GetValue())})
+			return nil
+		}
 		// v4.11.0: a Tormentor killed. A team the value does not name falls back to the killer's side.
 		if m.GetType() == dota.DOTA_CHAT_MESSAGE_CHAT_MESSAGE_MINIBOSS_KILL {
 			ev := tormentorKill(state.ActualGameSeconds(state.GameTime()), int32(m.GetValue()), m.GetPlayerid_1())
@@ -2197,6 +2258,13 @@ func main() {
 				killerIdx := heroNameToPlayerIndex(attackerName, state)
 				if killerIdx >= 0 && killerIdx < 10 {
 					state.Players[killerIdx].WardsDewarded++
+					// v4.13.0: the event behind the count; its bounty comes from Valve's announcement (dewardBounties)
+					wardType := "observer"
+					if targetName == "npc_dota_sentry_wards" {
+						wardType = "sentry"
+					}
+					denied := m.GetAttackerTeam() >= 2 && m.GetAttackerTeam() == m.GetTargetTeam()
+					state.Players[killerIdx].Dewards = append(state.Players[killerIdx].Dewards, DewardEvent{Time: actualTime, WardType: wardType, GoldTo: -1, Denied: denied})
 				}
 				// v4.7.0: remember the kill so finalizeWard can stamp
 				// Killed=true on the ward whose entity deletion follows.
@@ -2205,6 +2273,18 @@ func main() {
 					wt = 1
 				}
 				state.PendingDewards = append(state.PendingDewards, pendingDeward{t: actualTime, wardType: wt})
+			}
+
+			// v4.13.0: a neutral's death and whose unit landed it (an illusion's or a summon's owner), for the stack
+			// outcomes; the killer's hero cell tells two camps' deaths in one tick apart
+			if isNeutralCreepName(targetName) && state.GameStartTime > 0 {
+				nd := neutDeath{t: actualTime, species: strings.TrimPrefix(targetName, "npc_dota_neutral_"), owner: state.damageOwner(m, attackerName)}
+				if nd.owner >= 0 && nd.owner < 10 {
+					nd.hx, nd.hy = state.RealPos[nd.owner][0], state.RealPos[nd.owner][1]
+				} else {
+					nd.owner = -1
+				}
+				state.NeutDeaths = append(state.NeutDeaths, nd)
 			}
 
 			// an illusion's death is no death and no kill; a kill counts for the owner of the unit that landed it
@@ -2767,6 +2847,15 @@ func main() {
 			if playerIdx >= 0 && playerIdx < 10 {
 				state.Players[playerIdx].Gold += gold
 			}
+			// v4.13.0: the gold of a neutral kill (14) and of a ward kill (20)
+			if (goldReason == 14 || goldReason == 20) && playerIdx >= 0 && playerIdx < 10 && state.GameStartTime > 0 {
+				g := goldTick{t: actualTime, player: playerIdx, gold: gold}
+				if goldReason == 14 {
+					state.NeutGold = append(state.NeutGold, g)
+				} else {
+					state.WardGold = append(state.WardGold, g)
+				}
+			}
 			// Track bounty rune gold (gold_reason=17) for pickup confirmation
 			if goldReason == 17 && playerIdx >= 0 && playerIdx < 10 {
 				state.BountyGoldEvents = append(state.BountyGoldEvents, BountyGoldEvent{
@@ -2905,6 +2994,13 @@ func main() {
 
 		if op == manta.EntityOpDeleted {
 			return nil
+		}
+
+		// v4.13.0: the 1 Hz position track — every game second from the horn, as the heroes stood at its first tick
+		if state.GameStartTime > 0 {
+			for t := state.entityActual(); float64(state.TrackNext) <= t; state.TrackNext++ {
+				state.PositionTrack = append(state.PositionTrack, trackRow(state, state.TrackNext))
+			}
 		}
 
 		// v4.12.0: camp bans — the players' units at each minute mark, and every neutral's camp and first sight
@@ -4752,6 +4848,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 	hgEntries := detectHgEntries(state)
 	tiers := campTiers(state)
 	stackEvents := detectStacks(state, tiers)
+	stackOutcomes(state, &stackEvents) // v4.13.0
+	dewardBounties(state)              // v4.13.0
 	campBlocks := detectCampBlocks(state)
 	spawnBlocks := detectSpawnBlocks(state, tiers)
 
@@ -4947,6 +5045,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			HgEntries:      hgEntries[i],
 			HgEntriesCount: len(hgEntries[i]),
 			StackEvents:    stackEvents[i],
+			DewardEvents:   ps.Dewards,
 			Vitals:         ps.Wide.vitals(int(duration)),
 			ItemGains:      ps.Wide.ItemGains,
 			CreepKills: CreepKillPhases{
@@ -5076,6 +5175,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		BuildingKills:          state.BuildingKills,
 		Teamfights:             detectTeamfights(state),
 		PositionSamples:        state.PositionSamples,
+		PositionTrack:          trackUntil(state.PositionTrack, int(duration)),
 		SmokeEvents:            detectSmokeEvents(state),
 		CampBlocks:             campBlocks,
 		SpawnBlocks:            spawnBlocks,
@@ -5704,6 +5804,10 @@ func campTiers(state *ParserState) []string {
 // already in campsStacked).
 func detectStacks(state *ParserState, tiers []string) [10][]StackEvent {
 	var out [10][]StackEvent
+	// v4.13.0: a stack goes to the nearest camp that shows a stack at that mark (stackedNear), one stack per camp and
+	// mark. The nearest camp alone put the second camp of a pull that stacks two side by side (the counter rising by
+	// two at once) on the first one again, and some stacks on a camp that did not spawn at that mark at all.
+	taken := map[float64][]int{}
 	for _, si := range state.StackIncrs {
 		bestCi, bestD := -1, math.MaxFloat64
 		// Sample the stacker's position over the aggro-to-credit window.
@@ -5720,6 +5824,12 @@ func detectStacks(state *ParserState, tiers []string) [10][]StackEvent {
 		if bestCi < 0 {
 			continue
 		}
+		mark := math.Round(si.T / 60)
+		// none such leaves the nearest camp (the reading before 4.13.0)
+		if ci := stackedNear(state, si, taken[mark]); ci >= 0 {
+			bestCi = ci
+		}
+		taken[mark] = append(taken[mark], bestCi)
 		ev := StackEvent{
 			Time:  math.Round(si.T*10) / 10,
 			CampX: state.CampSpawners[bestCi][0],
@@ -5731,6 +5841,313 @@ func detectStacks(state *ParserState, tiers []string) [10][]StackEvent {
 		out[si.Player] = append(out[si.Player], ev)
 	}
 	return out
+}
+
+// stackedNear is the camp nearest the stacker over the aggro-to-credit window (within 25 cells), not in skip, that
+// shows a stack at the increment's mark (campStackedAt); -1 when none.
+func stackedNear(state *ParserState, si stackIncr, skip []int) int {
+	best, bestD := -1, 25.0
+	for dt := -9.0; dt <= -3.0; dt += 1.0 {
+		x, y, ok := posAtFresh(state.PosHistory[si.Player], si.T+dt, 3)
+		if !ok {
+			continue
+		}
+		for ci, sp := range state.CampSpawners {
+			d := math.Hypot(sp[0]-x, sp[1]-y)
+			if d > bestD || slices.Contains(skip, ci) || !campStackedAt(state, ci, si.T) {
+				continue
+			}
+			best, bestD = ci, d
+		}
+	}
+	return best
+}
+
+// campStackedAt: camp ci spawned at the mark t (a creep woke within [t-1, t+3]) while a creep it spawned before was
+// alive — the old creeps were out of the box, pulled away.
+func campStackedAt(state *ParserState, ci int, t float64) bool {
+	woke, old := false, false
+	for _, l := range state.SpawnLives {
+		if l.camp != ci || l.woke == 0 || l.summoned {
+			continue
+		}
+		switch {
+		case l.woke >= t-1 && l.woke <= t+3:
+			woke = true
+		case l.woke < t-1:
+			end := l.killed
+			if end == 0 {
+				end = l.died
+			}
+			if end == 0 || end > t {
+				old = true
+			}
+		}
+	}
+	return woke && old
+}
+
+// trackRow is the ten heroes' cells at game second sec: -1,-1 for a hero dead (dying or dead) or not seen yet.
+func trackRow(state *ParserState, sec int) PositionTrackRow {
+	row := PositionTrackRow{T: sec, P: make([]int, 20)}
+	for i := 0; i < 10; i++ {
+		x, y := -1, -1
+		if pos := state.RealPos[i]; state.LifePrev[i] == 0 && pos[0] > 0 && pos[1] > 0 {
+			x, y = int(pos[0]), int(pos[1])
+		}
+		row.P[2*i], row.P[2*i+1] = x, y
+	}
+	return row
+}
+
+// trackUntil keeps the track's rows up to the game's last second (the replay runs on past the end).
+func trackUntil(rows []PositionTrackRow, last int) []PositionTrackRow {
+	n := len(rows)
+	for n > 0 && rows[n-1].T > last {
+		n--
+	}
+	return rows[:n]
+}
+
+// v4.13.0 internal records: a neutral's combat-log death (owner -1 when no player's unit landed it; hx, hy: the
+// owner's hero cell then), the gold Valve paid one player in one tick, a ward-kill announcement.
+type neutDeath struct {
+	t       float64
+	species string
+	owner   int
+	hx, hy  float64
+}
+
+type goldTick struct {
+	t      float64
+	player int
+	gold   int
+}
+
+type wardChat struct {
+	t                 float64
+	sentry            bool
+	killer, to, value int
+	used              bool
+}
+
+// sameTick: two stamps of one server tick on the combat-log axis. entityDeathLag: a neutral's m_lifeState leaves alive
+// 1-3 ticks after its combat-log death (0.03-0.10 s on 9020064111).
+const (
+	sameTick       = 0.05
+	entityDeathLag = 0.3
+)
+
+// campKill is a camp creep's death as the combat log tells it: the owner of the unit that landed it (-1 no player's
+// unit, -2 the creep was not seen dying or no death of that tick matched), the tick, the gold Valve paid for it.
+type campKill struct {
+	owner int
+	t     float64
+	gold  int
+}
+
+// campKills joins each camp creep's death (SpawnLives.killed) to the combat log's neutral death just before it: the
+// same species first (when the replay names it), then the killer's hero nearest the creep's cell — two camps' creeps
+// can die in one tick. A creep's gold is the neutral-kill gold Valve paid its killer in that tick, shared evenly by the
+// neutrals he killed in it (the remainder to the first). Index = SpawnLives index.
+func campKills(state *ParserState) []campKill {
+	out := make([]campKill, len(state.SpawnLives))
+	for li := range out {
+		out[li].owner = -2
+	}
+	// every (creep, death) pair close enough in time, the best pairs taken first: a death goes to the creep its
+	// killer stood nearest, not to whichever creep of the tick came first
+	type pair struct {
+		li, j int
+		score float64
+	}
+	var pairs []pair
+	for li, l := range state.SpawnLives {
+		if l.killed <= 0 || l.summoned {
+			continue
+		}
+		sp := l.species
+		if sp == "" && state.Parser != nil {
+			if name, ok := state.Parser.LookupStringByIndex("UnitNames", l.nameIdx); ok {
+				sp = strings.TrimPrefix(name, "npc_dota_neutral_")
+			}
+		}
+		lo := sort.Search(len(state.NeutDeaths), func(j int) bool { return state.NeutDeaths[j].t >= l.killed-entityDeathLag })
+		for j := lo; j < len(state.NeutDeaths) && state.NeutDeaths[j].t <= l.killed+sameTick; j++ {
+			d := state.NeutDeaths[j]
+			score := 50.0 // no cells to compare: after any death whose killer stood near
+			if d.owner >= 0 && (d.hx > 0 || d.hy > 0) && (l.kx > 0 || l.ky > 0) {
+				score = math.Hypot(d.hx-l.kx, d.hy-l.ky)
+			}
+			if sp != "" && d.species != sp {
+				score += 1000
+			}
+			pairs = append(pairs, pair{li, j, score + 10*math.Abs(l.killed-d.t)})
+		}
+	}
+	sort.SliceStable(pairs, func(a, b int) bool { return pairs[a].score < pairs[b].score })
+	used := make([]bool, len(state.NeutDeaths))
+	for _, pr := range pairs {
+		if used[pr.j] || out[pr.li].owner != -2 {
+			continue
+		}
+		used[pr.j] = true
+		out[pr.li] = campKill{owner: state.NeutDeaths[pr.j].owner, t: state.NeutDeaths[pr.j].t}
+	}
+	type key struct {
+		player int
+		t      float64
+	}
+	paid, deaths := map[key]int{}, map[key]int{}
+	for _, g := range state.NeutGold {
+		paid[key{g.player, g.t}] += g.gold
+	}
+	for _, d := range state.NeutDeaths {
+		if d.owner >= 0 {
+			deaths[key{d.owner, d.t}]++
+		}
+	}
+	first := map[key]bool{}
+	for li := range out {
+		if out[li].owner < 0 {
+			continue
+		}
+		k := key{out[li].owner, out[li].t}
+		if n := deaths[k]; n > 0 {
+			out[li].gold = paid[k] / n
+			if !first[k] {
+				first[k] = true
+				out[li].gold += paid[k] % n
+			}
+		}
+	}
+	return out
+}
+
+// stackOutcomes fills in who cleared each stack. A stack holds the camp's creeps awake at its moment (spawned up to 3 s
+// after it: the stacked wave wakes with the minute mark) and still alive then; a creep is held by the earliest stack of
+// its camp, so a camp stacked twice before the clear splits its creeps (the second stack holds the wave it added) and no
+// creep is counted twice. The clearer is the player whose units killed the most of them (more gold, then the earlier
+// first kill, then the lower slot, breaks a tie); -1 when no player's unit killed any, or units of no player (lane creeps of a pull) killed
+// more of them than he did.
+func stackOutcomes(state *ParserState, events *[10][]StackEvent) {
+	kills := campKills(state)
+	type ref struct{ p, i int }
+	byCamp := map[int][]ref{}
+	for p := range events {
+		for i := range events[p] {
+			ev := &events[p][i]
+			ev.ClearedBy = -1
+			if ci := nearestCampIdx(state, ev.CampX, ev.CampY, 0.5); ci >= 0 {
+				byCamp[ci] = append(byCamp[ci], ref{p, i})
+			}
+		}
+	}
+	held := make([]bool, len(state.SpawnLives))
+	for ci, refs := range byCamp {
+		sort.SliceStable(refs, func(a, b int) bool { return events[refs[a].p][refs[a].i].Time < events[refs[b].p][refs[b].i].Time })
+		for _, r := range refs {
+			ev := &events[r.p][r.i]
+			type tally struct {
+				n, gold int
+				first   float64
+			}
+			by := map[int]*tally{}
+			nobody := 0 // killed by no player's unit: lane creeps (a pull), neutrals, buildings
+			for li, l := range state.SpawnLives {
+				if l.camp != ci || held[li] || l.summoned || l.woke == 0 || l.woke > ev.Time+3 {
+					continue
+				}
+				end := l.killed
+				if end == 0 {
+					end = l.died
+				}
+				if end != 0 && end <= ev.Time {
+					continue
+				}
+				held[li] = true
+				k := kills[li]
+				if k.owner == -1 {
+					nobody++
+				}
+				if k.owner < 0 {
+					continue
+				}
+				tl := by[k.owner]
+				if tl == nil {
+					tl = &tally{first: k.t}
+					by[k.owner] = tl
+				}
+				tl.n++
+				tl.gold += k.gold
+				if k.t < tl.first {
+					tl.first = k.t
+				}
+			}
+			best := -1
+			for p, tl := range by {
+				if best < 0 {
+					best = p
+					continue
+				}
+				b := by[best]
+				if tl.n > b.n || (tl.n == b.n && (tl.gold > b.gold || (tl.gold == b.gold && (tl.first < b.first || (tl.first == b.first && p < best))))) {
+					best = p
+				}
+			}
+			if best >= 0 && by[best].n >= nobody {
+				tl := by[best]
+				ev.ClearedBy, ev.ClearedAt, ev.ClearedCreeps, ev.ClearedGold = best, math.Round(tl.first*10)/10, tl.n, tl.gold
+			}
+		}
+	}
+}
+
+// dewardBounties gives each deward its bounty: Valve's announcement of that kill (same ward type, the same killer,
+// within a second), else the ward-kill gold paid in that tick to a hero of the killer's team; GoldTo stays -1 when
+// neither is found, and for a denied ward.
+func dewardBounties(state *ParserState) {
+	usedGold := make([]bool, len(state.WardGold))
+	for p := 0; p < 10; p++ {
+		ps := state.Players[p]
+		if ps == nil {
+			continue
+		}
+		for i := range ps.Dewards {
+			ev := &ps.Dewards[i]
+			if ev.Denied {
+				continue // no bounty for a ward of his own team
+			}
+			sentry := ev.WardType == "sentry"
+			best, bestDt := -1, 1.0
+			for j := range state.WardChats {
+				c := &state.WardChats[j]
+				if c.used || c.sentry != sentry || c.killer != p {
+					continue
+				}
+				if dt := math.Abs(c.t - ev.Time); dt <= bestDt {
+					best, bestDt = j, dt
+				}
+			}
+			if best >= 0 {
+				c := &state.WardChats[best]
+				c.used = true
+				ev.Gold, ev.GoldTo = c.value, -1
+				if c.to >= 0 && c.to < 10 {
+					ev.GoldTo = c.to
+				}
+				continue
+			}
+			for j, g := range state.WardGold {
+				if usedGold[j] || math.Abs(g.t-ev.Time) > sameTick || state.Players[g.player] == nil || state.Players[g.player].IsRadiant != ps.IsRadiant {
+					continue
+				}
+				usedGold[j] = true
+				ev.Gold, ev.GoldTo = g.gold, g.player
+				break
+			}
+		}
+	}
 }
 
 // detectCampBlocks builds the laning camp-block war (0:00-12:00): wards
@@ -5941,6 +6358,13 @@ type spawnLife struct {
 	seen    float64
 	died    float64
 	waiting bool
+	// v4.13.0: when it spawned (stopped waiting, or first seen awake; 0 = never), the tick it died (m_lifeState left
+	// alive; 0 = not seen dying) and its cell then — the stack outcomes join it to the combat log's death; summoned:
+	// a unit a camp creep summoned (the dark troll warlord's skeletons), not one of the camp's creeps
+	woke     float64
+	killed   float64
+	kx, ky   float64
+	summoned bool
 }
 
 // trackSpawnNeutral follows a neutral creep: its camp (m_hNeutralSpawner, else the nearest spawner at first sight)
@@ -5982,8 +6406,12 @@ func trackSpawnNeutral(state *ParserState, p *manta.Parser, e *manta.Entity) {
 		}
 		state.SpawnNeutCamp[idx] = len(state.SpawnLives)
 		state.SpawnLives = append(state.SpawnLives, spawnLife{camp: ci, species: species, nameIdx: ni, seen: state.entityActual(), waiting: waiting})
+		if sm, okSm := e.GetBool("m_bIsSummoned"); okSm && sm {
+			state.SpawnLives[len(state.SpawnLives)-1].summoned = true
+		}
 		if !waiting {
 			state.SpawnWakes[ci] = append(state.SpawnWakes[ci], state.entityActual())
+			state.SpawnLives[len(state.SpawnLives)-1].woke = state.entityActual()
 		}
 		return
 	}
@@ -5991,6 +6419,17 @@ func trackSpawnNeutral(state *ParserState, p *manta.Parser, e *manta.Entity) {
 		return
 	}
 	l := &state.SpawnLives[li]
+	// v4.13.0: the death tick, for the stack outcomes (died above stays the deletion-based end the camp bans use)
+	if l.killed == 0 && !l.waiting {
+		if ls, okL := e.GetUint64("m_lifeState"); okL && ls != 0 {
+			l.killed = state.entityActual()
+			if cx, ok1 := e.GetUint64("CBodyComponent.m_cellX"); ok1 {
+				if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
+					l.kx, l.ky = float64(cx), float64(cy)
+				}
+			}
+		}
+	}
 	if l.species == "" {
 		// a creep waiting to spawn may get its name only when it wakes up
 		if ni, okN := e.GetInt32("m_iUnitNameStringTableIndex"); okN {
@@ -6001,6 +6440,7 @@ func trackSpawnNeutral(state *ParserState, p *manta.Parser, e *manta.Entity) {
 	}
 	if l.waiting && !waiting {
 		l.waiting = false
+		l.woke = state.entityActual()
 		state.SpawnWakes[l.camp] = append(state.SpawnWakes[l.camp], state.entityActual())
 	}
 	if team == 2 || team == 3 {
