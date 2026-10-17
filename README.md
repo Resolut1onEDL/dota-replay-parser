@@ -172,6 +172,25 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.14.0 — lanes: a mid with a ganking partner, a roamer's starting lane
+
+- A lane partner no longer moves a player whose own minutes 2–6 stood his lane
+  (≥ 2/3 of the samples): match 9038946200, a Spirit Breaker who kept ganking
+  mid was 38 % of minutes 1–10 next to Storm Spirit and made the mid Storm an
+  off-laner.
+- A mean "mid" those minutes don't confirm is no longer mid: the side lane they
+  stood wins (match 9013821098, Zeus 86 % in the safe lane, then rotations),
+  and with no lane stood the player gets the lane he started in (the first
+  fifth of his samples, ≈ minutes 1–3) and `laneStats.roamed: true` (omitted
+  when false) — the Techies of 9038946200 stood the off lane alone for two
+  minutes, then roamed the map.
+- Audit set (99 matches of 2026-10-07): `player.lane_role` vs OpenDota 928 →
+  947 of 980; 22 players right where they were wrong, 3 the other way — all
+  three stood a side lane for 4–5 minutes and roamed, OpenDota's mean says
+  mid. Every other field byte-identical to 4.13.0. `roamed` on 7 players of
+  990; positions 1–5 changed for 10 (Juggernaut 317 last hits 3 → 1, Medusa
+  3 → 1, Monkey King 3 → 2 …).
+
 ### 4.13.0 — support exports: 1 Hz positions, stack outcomes, deward bounties
 
 - `positionTrack` (match) — the ten heroes' positions once per game second, the

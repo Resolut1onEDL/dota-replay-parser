@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.13.0"
+const parserVersion = "4.14.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -472,6 +472,9 @@ type HgEntry struct {
 type LaneStats struct {
 	Lane              string  `json:"lane"` // "safe", "mid", "off", "jungle"
 	LanePartner       int     `json:"lanePartner,omitempty"`
+	// v4.14.0: the lane is the one he started in, then he roamed the map
+	// (his minutes 2–6 stood no lane). Absent = he stood his lane.
+	Roamed            bool    `json:"roamed,omitempty"`
 	LaneCreepKills    int     `json:"laneCreepKills"`
 	LaneCreepDenies   int     `json:"laneCreepDenies"`
 	ReaggroCount      int     `json:"reaggroCount"` // v4.4.4: ЧЕСТНОЕ реагро (attack-ордер без урона)
@@ -4107,6 +4110,99 @@ func detectErasedLane(positions []struct{ X, Y float64 }, isRadiant bool) string
 	return ""
 }
 
+// detectLanes classifies every player's lane in three passes: pass 1 by
+// geometry (detectLane), pass 2 reconciles via lane partners (if my partner
+// is on a "stronger" lane I'm probably with them — supports who roam through
+// mid get pulled back to their core's lane), pass 3 builds the reporting
+// lanes. roamed marks a player whose lane is the one he started in before
+// roaming the map. Positions 1-5 are assigned from reportLanes afterwards.
+func detectLanes(state *ParserState) (lanes map[int]string, partners map[int]int, reportLanes map[int]string, roamed map[int]bool) {
+	lanes = make(map[int]string, 10)
+	roamed = make(map[int]bool, 10)
+	for i := 0; i < 10; i++ {
+		lanes[i] = detectLane(state.Players[i].LanePositions, state.Players[i].IsRadiant)
+	}
+	partners = make(map[int]int, 10)
+	for i := 0; i < 10; i++ {
+		partners[i] = detectLanePartner(state, i)
+	}
+	// Lane reconcile: prefer partner's lane if it's safe/off (more reliable
+	// than mid for support detection — supports often pass through mid).
+	for i := 0; i < 10; i++ {
+		p := partners[i]
+		if p < 0 {
+			continue
+		}
+		other := lanes[p]
+		if other != "safe" && other != "off" {
+			continue
+		}
+		// A teammate who keeps ganking a mid is not his lane partner: when the
+		// player's own minutes 2–6 confirm his lane, the partner doesn't move him.
+		// Match 9038946200: a roaming Spirit Breaker spent 38% of minutes 1–10
+		// next to Storm Spirit and turned the mid Storm into an off-laner.
+		if own := detectErasedLane(state.Players[i].LanePositions, state.Players[i].IsRadiant); own != "" && own == lanes[i] {
+			continue
+		}
+		lanes[i] = other
+	}
+	// Reporting lanes: restore lanes the mean erased for zoned laners
+	// (detectErasedLane), so the coach doesn't tell a zoned laner he «played
+	// jungle». Since v4.7.5 roles derive from these exported lanes too.
+	reportLanes = make(map[int]string, 10)
+	for i := 0; i < 10; i++ {
+		reportLanes[i] = lanes[i]
+		if lanes[i] == "jungle" || lanes[i] == "roam" {
+			if up := detectErasedLane(state.Players[i].LanePositions, state.Players[i].IsRadiant); up != "" {
+				reportLanes[i] = up
+			}
+		}
+		// A "mid" the player's own minutes 2–6 don't confirm is a mean, not a
+		// lane: the side lane those minutes stood wins (match 9013821098: Zeus
+		// 86% in the safe lane, then rotated mid), and with no lane stood he
+		// gets the lane he started in, marked roamed (match 9038946200: Techies
+		// stood the off lane alone for two minutes, then roamed the map).
+		if lanes[i] == "mid" {
+			pos := state.Players[i].LanePositions
+			switch up := detectErasedLane(pos, state.Players[i].IsRadiant); up {
+			case "mid":
+			case "":
+				if start := detectStartLane(pos, state.Players[i].IsRadiant); start != "" {
+					reportLanes[i] = start
+					roamed[i] = true
+				}
+			default:
+				reportLanes[i] = up
+			}
+		}
+	}
+	return lanes, partners, reportLanes, roamed
+}
+
+// detectStartLane names the lane a player started in: the side or mid lane
+// holding the most of his first 20% of samples (≈ minutes 1–3, before the
+// window detectLane trusts), at least a third of them. Returns "" otherwise.
+func detectStartLane(positions []struct{ X, Y float64 }, isRadiant bool) string {
+	if len(positions) < 100 {
+		return ""
+	}
+	end := len(positions) / 5
+	votes := map[string]int{}
+	for i := 0; i < end; i++ {
+		votes[laneZoneOf(positions[i].X, positions[i].Y)]++
+	}
+	best, bestN := "", 0
+	for _, z := range []string{"mid", "bottom", "top"} {
+		if votes[z] > bestN {
+			best, bestN = z, votes[z]
+		}
+	}
+	if best == "" || best == "mid" || bestN*3 < end {
+		return ""
+	}
+	return laneZoneToLane(best, isRadiant)
+}
+
 // detectLanePartner finds the hero (player index 0..9) on the same team
 // that this hero spent most of the laning phase next to. Uses the
 // minute-snapshot position samples shared between players. Returns -1 if
@@ -4794,49 +4890,13 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 
 	players := make([]Player, 10)
 
-	// Three-pass build: pass 1 classifies lane per player (geometry),
-	// pass 2 reconciles via lane partners (if my partner is on a "stronger"
-	// lane I'm probably with them — supports who roam through mid get
-	// pulled back to their core's lane), pass 3 assigns positions 1-5.
-	lanes := make(map[int]string, 10)
-
 	// v4.4.4: незакрытые attack-ордера (урон так и не долетел) = реагро
 	for _, pd := range state.PendingAggro {
 		if pd.t > 0 && pd.t < 600 {
 			state.Players[pd.player].TrueReaggroCount++
 		}
 	}
-	for i := 0; i < 10; i++ {
-		lanes[i] = detectLane(state.Players[i].LanePositions, state.Players[i].IsRadiant)
-	}
-	partners := make(map[int]int, 10)
-	for i := 0; i < 10; i++ {
-		partners[i] = detectLanePartner(state, i)
-	}
-	// Lane reconcile: prefer partner's lane if it's safe/off (more reliable
-	// than mid for support detection — supports often pass through mid).
-	for i := 0; i < 10; i++ {
-		p := partners[i]
-		if p < 0 {
-			continue
-		}
-		other := lanes[p]
-		if other == "safe" || other == "off" {
-			lanes[i] = other
-		}
-	}
-	// Reporting lanes: restore lanes the mean erased for zoned laners
-	// (detectErasedLane), so the coach doesn't tell a zoned laner he «played
-	// jungle». Since v4.7.5 roles derive from these exported lanes too.
-	reportLanes := make(map[int]string, 10)
-	for i := 0; i < 10; i++ {
-		reportLanes[i] = lanes[i]
-		if lanes[i] == "jungle" || lanes[i] == "roam" {
-			if up := detectErasedLane(state.Players[i].LanePositions, state.Players[i].IsRadiant); up != "" {
-				reportLanes[i] = up
-			}
-		}
-	}
+	_, partners, reportLanes, roamed := detectLanes(state)
 	// The web re-derives roles from the same laneStats.lane, so the two can't
 	// disagree.
 	positions := assignPositions(state, reportLanes, duration)
@@ -5018,6 +5078,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			LaneStats: LaneStats{
 				Lane:          lane,
 				LanePartner:   partners[i],
+				Roamed:        roamed[i],
 				ReaggroCount:    ps.TrueReaggroCount,
 				LaneHarassCount: ps.LaneHarassCount,
 				DeathsPreTen:  ps.LaneDeaths,

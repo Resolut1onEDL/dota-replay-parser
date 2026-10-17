@@ -2111,3 +2111,94 @@ func TestSupportExportsReplay(t *testing.T) {
 		t.Errorf("%d of %d stacks cleared", cleared, stacks)
 	}
 }
+
+// Match 9038946200 (reported, web_feedback 509db04d): a mid Storm Spirit was
+// moved to the off lane by the Spirit Breaker who kept ganking him, and a
+// Techies who stood the off lane for two minutes and then roamed got "mid"
+// from the mean. The fixture is every 8th LanePositions sample of the real parse.
+func TestDetectLanesGankingPartnerAndRoamer(t *testing.T) {
+	raw, err := os.ReadFile("testdata/lanes-9038946200.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fx struct {
+		IsRadiant []bool        `json:"isRadiant"`
+		Positions [][][2]float64 `json:"positions"`
+	}
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatal(err)
+	}
+	state := &ParserState{}
+	for i := 0; i < 10; i++ {
+		ps := &PlayerState{IsRadiant: fx.IsRadiant[i]}
+		for _, p := range fx.Positions[i] {
+			ps.LanePositions = append(ps.LanePositions, struct{ X, Y float64 }{p[0], p[1]})
+		}
+		state.Players[i] = ps
+	}
+	_, _, lanes, roamed := detectLanes(state)
+	want := []struct {
+		hero   string
+		lane   string
+		roamed bool
+	}{
+		{"Spirit Breaker", "off", false},
+		{"Storm Spirit", "mid", false},
+		{"Pudge", "safe", false},
+		{"Bristleback", "off", false},
+		{"Terrorblade", "safe", false},
+		{"Techies", "off", true},
+		{"Jakiro", "safe", false},
+		{"Shadow Fiend", "mid", false},
+		{"Chaos Knight", "safe", false},
+		{"Sand King", "mid", false},
+	}
+	for i, w := range want {
+		if lanes[i] != w.lane || roamed[i] != w.roamed {
+			t.Errorf("%s: lane %q roamed %v, want %q roamed %v", w.hero, lanes[i], roamed[i], w.lane, w.roamed)
+		}
+	}
+}
+
+func TestDetectStartLane(t *testing.T) {
+	var pos []struct{ X, Y float64 }
+	for i := 0; i < 40; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 176, Y: 96}) // bottom lane
+	}
+	for i := 0; i < 60; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 190, Y: 125}) // roam
+	}
+	for i := 0; i < 400; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 130, Y: 130}) // mid
+	}
+	if got := detectStartLane(pos, false); got != "off" {
+		t.Errorf("dire start in bottom: got %q, want \"off\"", got)
+	}
+	if got := detectStartLane(pos[40:], false); got != "" {
+		t.Errorf("no lane in the first fifth must give \"\", got %q", got)
+	}
+}
+
+// Match 9013821098: Zeus stood the safe lane through minutes 2–6, then rotated
+// to mid; the mean said "mid". The lane those minutes stood wins, not roamed.
+func TestDetectLanesMeanMidStoodSideLane(t *testing.T) {
+	state := &ParserState{}
+	for i := 0; i < 10; i++ {
+		state.Players[i] = &PlayerState{IsRadiant: i < 5}
+	}
+	var pos []struct{ X, Y float64 }
+	for i := 0; i < 450; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 150, Y: 80}) // radiant bottom = safe
+	}
+	for i := 0; i < 250; i++ {
+		pos = append(pos, struct{ X, Y float64 }{X: 110, Y: 190}) // rotations: pulls the mean onto the diagonal
+	}
+	state.Players[0].LanePositions = pos
+	if got := detectLane(pos, true); got != "mid" {
+		t.Fatalf("fixture must reproduce the mean verdict mid, got %q", got)
+	}
+	_, _, lanes, roamed := detectLanes(state)
+	if lanes[0] != "safe" || roamed[0] {
+		t.Errorf("got lane %q roamed %v, want \"safe\" not roamed", lanes[0], roamed[0])
+	}
+}
