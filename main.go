@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.14.0"
+const parserVersion = "4.15.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -221,6 +221,30 @@ type PositionSample struct {
 type PositionTrackRow struct {
 	T int   `json:"t"`
 	P []int `json:"p"`
+}
+
+// v4.15.0: the lane waves, every game second from the horn to 12:00 (or the end), as they stood at its first tick.
+// W: for each lane in turn — top, mid, bot (the lane a creep spawned for) — the radiant wave's front creep x, y and its
+// live creeps, then the dire wave's front x, y and its creeps: 18 numbers. The front is the creep furthest towards the
+// enemy base (radiant: the largest x+y, dire: the smallest — both run monotonically along every lane); x, y -1 when the
+// side has no live creep on that lane. Cells as positionTrack's. Where the two fronts touch, the waves meet.
+type LaneWaveRow struct {
+	T int   `json:"t"`
+	W []int `json:"w"`
+}
+
+// v4.15.0: a tower's cell (CDOTA_BaseNPC_Tower), seen once. Name: the entity name, dota_goodguys_tower1_bot — buildingKills
+// carries the unit name of the same tower, npc_dota_goodguys_tower1_bot.
+type TowerCell struct {
+	Name string `json:"name"`
+	X    int    `json:"x"`
+	Y    int    `json:"y"`
+}
+
+// v4.15.0: the game second a hero reached a level (m_vecPlayerTeamData m_iLevel; level 2 on — level 1 is the start).
+type LevelUp struct {
+	Level int     `json:"level"`
+	Time  float64 `json:"time"`
 }
 
 // Creep kill breakdown by phase and source
@@ -529,6 +553,7 @@ type PlayerStats struct {
 	DamageReceivedReport *DamageReceivedReport `json:"damageReceivedReport,omitempty"`
 	StunDurationDealt    float64              `json:"stunDurationDealt,omitempty"`
 	SkillBuild           []SkillLevelUp       `json:"skillBuild,omitempty"`
+	LevelTimes           []LevelUp            `json:"levelTimes,omitempty"` // v4.15.0
 	ItemUsed             []ItemUsed           `json:"itemUsed,omitempty"`
 	CampStacks           []CampStack          `json:"campStack,omitempty"`
 	CampsStacked         int                  `json:"campsStacked"`
@@ -650,6 +675,8 @@ type Match struct {
 	Teamfights      []Teamfight      `json:"teamfights,omitempty"`
 	PositionSamples []PositionSample `json:"positionSamples,omitempty"`
 	PositionTrack   []PositionTrackRow `json:"positionTrack,omitempty"` // v4.13.0: 1 Hz hero positions
+	LaneWaveTrack   []LaneWaveRow      `json:"laneWaveTrack,omitempty"` // v4.15.0: 1 Hz lane wave fronts, 0-12:00
+	Towers          []TowerCell        `json:"towers,omitempty"`        // v4.15.0: every tower's cell
 	SmokeEvents     []SmokeEvent     `json:"smokeEvents,omitempty"` // v4: group smoke detection
 	CampBlocks      []CampBlock      `json:"campBlocks,omitempty"`  // v4.6.0: laning camp-block war
 	SpawnBlocks     []SpawnBlock     `json:"spawnBlocks,omitempty"` // v4.12.0: camp bans, the whole game
@@ -992,6 +1019,7 @@ type PlayerState struct {
 	Wide            wideTrack // v4.9.0: vitals and item gains (wide.go)
 	XP              int
 	Level           int
+	LevelTimes      []LevelUp // v4.15.0
 	HeroDamage      int
 	TowerDamage     int
 	HeroHealing     int
@@ -1223,6 +1251,11 @@ type ParserState struct {
 	// v4.13.0: the 1 Hz track and the next game second it takes
 	PositionTrack []PositionTrackRow
 	TrackNext     int
+	// v4.15.0: the live lane creeps, the lane wave track and the next game second it takes, every tower's cell
+	LaneCreeps    map[int32]*laneCreep
+	LaneWaveTrack []LaneWaveRow
+	WaveNext      int
+	TowerCells    map[string][2]float64
 
 	// Gold lost tracking (GOLD event fires BEFORE DEATH event, so we buffer)
 	PendingGoldLost [10]PendingGoldLoss
@@ -1744,6 +1777,8 @@ func NewParserState(p *manta.Parser) *ParserState {
 		Pauses:             make([]PauseEvent, 0),
 		NeutralSpawnCells:  make(map[int32][2]float64),
 		HgTowerCells:       make(map[string][2]float64),
+		LaneCreeps:         make(map[int32]*laneCreep),
+		TowerCells:         make(map[string][2]float64),
 		CampWaveRuns:       make(map[int]*campRuns),
 		NeutCampIdx:        make(map[int32]int),
 		SpawnNeutCamp:      make(map[int32]int),
@@ -2969,6 +3004,9 @@ func main() {
 			if cn == "CDOTA_NPC_Observer_Ward" || cn == "CDOTA_NPC_Observer_Ward_TrueSight" {
 				finalizeWard(state, e.GetIndex(), state.ActualGameSeconds(state.GameTime()))
 			}
+			if cn == "CDOTA_BaseNPC_Creep_Lane" || cn == "CDOTA_BaseNPC_Creep_Siege" {
+				delete(state.LaneCreeps, e.GetIndex())
+			}
 			// v4.6.0: neutral creep removed ≈ died a few seconds ago (corpse
 			// decay lags the combat-log death by ~7.5s, measured). Its
 			// first-seen cell identifies the camp for pull detection.
@@ -3003,6 +3041,10 @@ func main() {
 		if state.GameStartTime > 0 {
 			for t := state.entityActual(); float64(state.TrackNext) <= t; state.TrackNext++ {
 				state.PositionTrack = append(state.PositionTrack, trackRow(state, state.TrackNext))
+			}
+			// v4.15.0: the lane waves, the same seconds, to 12:00
+			for t := state.entityActual(); state.WaveNext <= laneWaveLast && float64(state.WaveNext) <= t; state.WaveNext++ {
+				state.LaneWaveTrack = append(state.LaneWaveTrack, waveRow(state, state.WaveNext))
 			}
 		}
 
@@ -3385,6 +3427,12 @@ func main() {
 			}
 		}
 
+		// v4.15.0: the live lane creeps behind laneWaveTrack
+		if (className == "CDOTA_BaseNPC_Creep_Lane" || className == "CDOTA_BaseNPC_Creep_Siege") &&
+			state.GameStartTime > 0 && state.entityActual() <= laneWaveLast+1 {
+			trackLaneCreep(state, e)
+		}
+
 		// v4.6.0: lane wave presence at camps — the pull-v2 engagement seed.
 		// A pulled wave parks inside the camp; a passing wave never gets
 		// within 9 cells of a spawner for long.
@@ -3402,6 +3450,19 @@ func main() {
 								}
 								cr.mark(t, team == 2)
 							}
+						}
+					}
+				}
+			}
+		}
+
+		// v4.15.0: every tower's cell, captured once
+		if className == "CDOTA_BaseNPC_Tower" {
+			if name := state.entityName(e); name != "" {
+				if _, have := state.TowerCells[name]; !have {
+					if cx, ok := e.GetUint64("CBodyComponent.m_cellX"); ok && cx > 0 {
+						if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 && cy > 0 {
+							state.TowerCells[name] = [2]float64{float64(cx), float64(cy)}
 						}
 					}
 				}
@@ -3558,6 +3619,13 @@ func main() {
 					state.Players[i].ValveAssists = int(assists)
 				}
 				if level, ok := e.GetInt32(fmt.Sprintf("m_vecPlayerTeamData.%04d.m_iLevel", i)); ok {
+					// v4.15.0: the second of each new level (a jump of two levels at once stamps both)
+					if ps := state.Players[i]; ps.Level > 0 && int(level) > ps.Level && state.GameStartTime > 0 {
+						t := math.Round(state.entityActual()*10) / 10
+						for l := ps.Level + 1; l <= int(level); l++ {
+							ps.LevelTimes = append(ps.LevelTimes, LevelUp{Level: l, Time: t})
+						}
+					}
 					state.Players[i].Level = int(level)
 				}
 				if steamID, ok := e.GetUint64(fmt.Sprintf("m_vecPlayerData.%04d.m_iPlayerSteamID", i)); ok {
@@ -5071,6 +5139,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			DamageReceivedReport: damageReceivedReport,
 			StunDurationDealt:    stunsOut(ps),
 			SkillBuild:           filterSkillBuild(ps.SkillBuild),
+			LevelTimes:           ps.LevelTimes,
 			ItemUsed:             itemUsed,
 			CampStacks:           ps.CampStacks,
 			CampsStacked:         ps.CampsStacked,
@@ -5237,6 +5306,8 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		Teamfights:             detectTeamfights(state),
 		PositionSamples:        state.PositionSamples,
 		PositionTrack:          trackUntil(state.PositionTrack, int(duration)),
+		LaneWaveTrack:          waveUntil(state.LaneWaveTrack, int(duration)),
+		Towers:                 towerCells(state.TowerCells),
 		SmokeEvents:            detectSmokeEvents(state),
 		CampBlocks:             campBlocks,
 		SpawnBlocks:            spawnBlocks,
@@ -5959,6 +6030,110 @@ func trackRow(state *ParserState, sec int) PositionTrackRow {
 		row.P[2*i], row.P[2*i+1] = x, y
 	}
 	return row
+}
+
+// v4.15.0: lane waves. laneWaveLast — the last game second of laneWaveTrack.
+const laneWaveLast = 720
+
+// laneCreep: a live lane creep — its side, the lane it spawned for (0 top, 1 mid, 2 bot) and its cell now.
+type laneCreep struct {
+	idx     int32
+	radiant bool
+	lane    int
+	x, y    float64
+}
+
+// spawnLane: the lane of a creep at its spawn by the barracks. Both bases sit in corners, the side lanes leave them
+// along the map's edges and mid along the diagonal, so x−y tells them apart there (top far below 0, bot far above).
+func spawnLane(x, y float64) int {
+	switch d := x - y; {
+	case d < -12:
+		return 0
+	case d > 12:
+		return 2
+	}
+	return 1
+}
+
+// trackLaneCreep keeps one lane creep's cell; a dying or dead creep (m_lifeState ≠ 0) leaves the wave at once,
+// before its corpse is deleted.
+func trackLaneCreep(s *ParserState, e *manta.Entity) {
+	idx := e.GetIndex()
+	if ls, ok := e.GetUint64("m_lifeState"); ok && ls != 0 {
+		delete(s.LaneCreeps, idx)
+		return
+	}
+	cx, ok := e.GetUint64("CBodyComponent.m_cellX")
+	cy, ok2 := e.GetUint64("CBodyComponent.m_cellY")
+	if !ok || !ok2 || cx == 0 || cy == 0 {
+		return
+	}
+	c := s.LaneCreeps[idx]
+	if c == nil {
+		team, okT := e.GetUint64("m_iTeamNum")
+		if !okT || (team != 2 && team != 3) {
+			return
+		}
+		c = &laneCreep{idx: idx, radiant: team == 2, lane: spawnLane(float64(cx), float64(cy))}
+		s.LaneCreeps[idx] = c
+	}
+	c.x, c.y = float64(cx), float64(cy)
+}
+
+// waveRow: each lane's front creep and live creeps per side at game second sec (LaneWaveRow). Ties go to the
+// lower entity index, so the row does not depend on map order.
+func waveRow(s *ParserState, sec int) LaneWaveRow {
+	row := LaneWaveRow{T: sec, W: make([]int, 18)}
+	var front [3][2]*laneCreep
+	var n [3][2]int
+	for _, c := range s.LaneCreeps {
+		side := 1
+		if c.radiant {
+			side = 0
+		}
+		n[c.lane][side]++
+		f := front[c.lane][side]
+		ahead := f == nil
+		if f != nil {
+			a, b := c.x+c.y, f.x+f.y
+			if !c.radiant {
+				a, b = -a, -b
+			}
+			ahead = a > b || (a == b && c.idx < f.idx)
+		}
+		if ahead {
+			front[c.lane][side] = c
+		}
+	}
+	for l := 0; l < 3; l++ {
+		for side := 0; side < 2; side++ {
+			o := l*6 + side*3
+			row.W[o], row.W[o+1], row.W[o+2] = -1, -1, n[l][side]
+			if f := front[l][side]; f != nil {
+				row.W[o], row.W[o+1] = int(f.x), int(f.y)
+			}
+		}
+	}
+	return row
+}
+
+// waveUntil keeps the wave rows up to the game's last second.
+func waveUntil(rows []LaneWaveRow, last int) []LaneWaveRow {
+	n := len(rows)
+	for n > 0 && rows[n-1].T > last {
+		n--
+	}
+	return rows[:n]
+}
+
+// towerCells: every tower seen, by name.
+func towerCells(m map[string][2]float64) []TowerCell {
+	out := make([]TowerCell, 0, len(m))
+	for name, c := range m {
+		out = append(out, TowerCell{Name: name, X: int(c[0]), Y: int(c[1])})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // trackUntil keeps the track's rows up to the game's last second (the replay runs on past the end).

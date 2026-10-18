@@ -1944,6 +1944,40 @@ func TestPositionTrack(t *testing.T) {
 	}
 }
 
+// v4.15.0: a creep's lane comes from its spawn by the barracks; each lane's front is the creep furthest towards the
+// enemy base (radiant: largest x+y, dire: smallest), ties to the lower entity index; a side without creeps is -1, -1.
+func TestLaneWaves(t *testing.T) {
+	for _, c := range []struct {
+		x, y float64
+		lane int
+	}{{70, 100, 0}, {86, 86, 1}, {100, 70, 2}, {156, 186, 0}, {170, 170, 1}, {186, 156, 2}} {
+		if got := spawnLane(c.x, c.y); got != c.lane {
+			t.Errorf("spawnLane(%v, %v) = %d, want %d", c.x, c.y, got, c.lane)
+		}
+	}
+	s := &ParserState{LaneCreeps: map[int32]*laneCreep{
+		1: {idx: 1, radiant: true, lane: 2, x: 160, y: 80},
+		2: {idx: 2, radiant: true, lane: 2, x: 168, y: 82},
+		3: {idx: 3, radiant: true, lane: 2, x: 166, y: 84},
+		4: {idx: 4, radiant: false, lane: 2, x: 172, y: 86},
+		5: {idx: 5, radiant: false, lane: 2, x: 176, y: 96},
+		6: {idx: 6, radiant: false, lane: 0, x: 90, y: 174},
+	}}
+	row := waveRow(s, 75)
+	want := []int{-1, -1, 0, 90, 174, 1, -1, -1, 0, -1, -1, 0, 168, 82, 3, 172, 86, 2} // 168,82 and 166,84 tie on x+y: entity 2
+	if row.T != 75 || !slices.Equal(row.W, want) {
+		t.Errorf("waveRow %+v, want w %v", row, want)
+	}
+	rows := []LaneWaveRow{{T: 0}, {T: 1}, {T: 2}}
+	if got := waveUntil(rows, 1); len(got) != 2 {
+		t.Errorf("waveUntil: %+v", got)
+	}
+	towers := towerCells(map[string][2]float64{"dota_goodguys_tower1_bot": {164, 78}, "dota_badguys_tower1_bot": {176, 110}})
+	if len(towers) != 2 || towers[0].Name != "dota_badguys_tower1_bot" || towers[1].X != 164 {
+		t.Errorf("towerCells: %+v", towers)
+	}
+}
+
 // v4.13.0: a counter rising by two at once is two camps stacked in one pull — the second stack goes to the other camp
 // that spawned at that mark with its earlier creeps out, not to the nearest camp again; a single stack goes to the
 // nearest camp that shows a stack, past a nearer one that did not spawn then.

@@ -172,6 +172,22 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.15.0 — lane waves, towers, level-up seconds
+
+- `laneWaveTrack` — every game second from the horn to 12:00: for top, mid and
+  bot (the lane a creep spawned for) each side's front creep cell (radiant: the
+  largest x+y, dire: the smallest) and its live creeps, 18 numbers a row, -1,-1
+  for a side with no creep. Where the two fronts touch, the waves meet: in
+  9048497893 the top lane met in front of the Dire T1 at 0:30–1:10 and at the
+  Radiant T1 from 2:00 to 3:20 (the coach on the call: "lost the lane on the
+  second minute"). Waves touch (≤ 8 cells) ~70 % of each lane's first 10 minutes.
+- `towers` — every tower's cell by entity name (`dota_goodguys_tower1_bot`;
+  `buildingKills` names the same tower `npc_dota_goodguys_tower1_bot`).
+- `players[].stats.levelTimes` — the second each level from 2 was reached
+  (m_iLevel), ~1 s before the skill point in `skillBuild`.
+- Every other field byte-identical to 4.14.0 on 9048497893; parse time the
+  same, output +3.5 %.
+
 ### 4.14.0 — lanes: a mid with a ganking partner, a roamer's starting lane
 
 - A lane partner no longer moves a player whose own minutes 2–6 stood his lane
