@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"dota-replay-parser/internal/reparse"
@@ -57,7 +58,22 @@ func workerParse(ctx context.Context, r io.Reader) ([]byte, error) {
 	return out, nil
 }
 
-// runRole is a machine started with VAULT_ROLE: the same image as the web
+// startRole: the role of a machine started as `./server --role=<r>` (the
+// Machines API config sets it in init.cmd), else REPLAY_ROLE, else the 4.15.1
+// name VAULT_ROLE — which Fly drops from a machine's config env.
+func startRole(args []string, getenv func(string) string) string {
+	for _, a := range args {
+		if strings.HasPrefix(a, "--role=") {
+			return strings.TrimPrefix(a, "--role=")
+		}
+	}
+	if r := getenv("REPLAY_ROLE"); r != "" {
+		return r
+	}
+	return getenv("VAULT_ROLE")
+}
+
+// runRole is a machine started with --role: the same image as the web
 // server, doing one job and exiting. It returns the process exit code.
 func runRole(role string) int {
 	initVault()
@@ -84,7 +100,7 @@ func runRole(role string) int {
 		}
 		return 0
 	}
-	log.Printf("unknown VAULT_ROLE %q", role)
+	log.Printf("unknown role %q", role)
 	return 1
 }
 

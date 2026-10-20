@@ -195,7 +195,11 @@ func TestReparseStartsShardedMachines(t *testing.T) {
 		t.Fatalf("summary %+v, created %d", s, len(fm.created))
 	}
 	r := fm.created[1]
-	if r.Config.Env["VAULT_ROLE"] != "worker" || r.Config.Env["REPARSE_SHARD"] != "1" || r.Config.Env["REPARSE_SHARDS"] != "3" ||
+	if r.Config.Init == nil || strings.Join(r.Config.Init.Cmd, " ") != "/app/server --role=worker" {
+		t.Fatalf("init = %+v", r.Config.Init)
+	}
+	assertNoVaultEnv(t, r.Config.Env)
+	if r.Config.Env["REPLAY_ROLE"] != "worker" || r.Config.Env["REPARSE_SHARD"] != "1" || r.Config.Env["REPARSE_SHARDS"] != "3" ||
 		r.Config.Env["REPARSE_VERSION"] != "4.15.1" || r.Config.Env["WEB_URL"] != "https://reso-ai.com" {
 		t.Fatalf("env = %v", r.Config.Env)
 	}
@@ -299,7 +303,11 @@ func TestEnsureMaintainIsIdempotent(t *testing.T) {
 		t.Fatalf("first = %q %v", r, err)
 	}
 	mc := fm.created[0]
-	if mc.Config.Schedule != "daily" || mc.Config.Env["VAULT_ROLE"] != "maintain" || mc.Config.Metadata["role"] != "maintain" ||
+	if mc.Config.Init == nil || strings.Join(mc.Config.Init.Cmd, " ") != "/app/server --role=maintain" {
+		t.Fatalf("maintain init = %+v", mc.Config.Init)
+	}
+	assertNoVaultEnv(t, mc.Config.Env)
+	if mc.Config.Schedule != "daily" || mc.Config.Env["REPLAY_ROLE"] != "maintain" || mc.Config.Metadata["role"] != "maintain" ||
 		mc.Config.AutoDestroy || mc.Config.Image != p.Cfg.Image {
 		t.Fatalf("maintain config = %+v", mc.Config)
 	}
@@ -715,7 +723,8 @@ func TestBuildStatus(t *testing.T) {
 func TestResumeOnlyActsOnlyAfterARunAndSkipsWhatTheServerParsed(t *testing.T) {
 	p, v, fm, _ := newPlanner(t)
 	ctx := context.Background()
-	put(t, v, 1, vault.Meta{Kind: vault.KindCoach})
+	// stored before the run starts (the planner's clock is 12:00 UTC; left empty, PutNew stamps the wall clock)
+	put(t, v, 1, vault.Meta{Kind: vault.KindCoach, StoredAt: "2026-10-20T11:00:00Z"})
 	// no run was ever started for this version: the daily pass does nothing
 	s, err := p.Reparse(ctx, ReparseOpts{ResumeOnly: true})
 	if err != nil || s.Todo != 0 || len(fm.created) != 0 {
@@ -1005,5 +1014,29 @@ func TestWorkerDoesNotSendAParseTheWebWouldRefuse(t *testing.T) {
 	p.V = v
 	if status, _ := p.BuildStatus(ctx); status.FinalFailed["too_large"] != 1 || status.DoneThisVer != 1 {
 		t.Fatalf("status = %+v", status)
+	}
+}
+
+// Fly drops machine config env names starting with VAULT_ (20.10, 4.15.1): a
+// role machine must not depend on one.
+func assertNoVaultEnv(t *testing.T, env map[string]string) {
+	t.Helper()
+	for k := range env {
+		if strings.HasPrefix(k, "VAULT_") {
+			t.Fatalf("machine env carries %s, which Fly drops", k)
+		}
+	}
+}
+
+// A maintain machine left by 4.15.1 (env role, no init) is updated in place.
+func TestEnsureMaintainUpdatesMissingInit(t *testing.T) {
+	p, _, fm, _ := newPlanner(t)
+	ctx := context.Background()
+	if r, err := p.EnsureMaintain(ctx); err != nil || r != "created" {
+		t.Fatalf("first = %q %v", r, err)
+	}
+	fm.list[0].Config.Init = nil
+	if r, _ := p.EnsureMaintain(ctx); r == "present" || len(fm.updated) != 1 || fm.updated[0].Config.Init == nil {
+		t.Fatalf("missing init not updated: %q updated=%d", r, len(fm.updated))
 	}
 }

@@ -644,3 +644,25 @@ func TestWorkerParseMapsRejectionToParseFailed(t *testing.T) {
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("tigris reset") }
+
+// The role comes from init.cmd (`--role=`), since Fly drops VAULT_* names from
+// a machine's config env; REPLAY_ROLE and the old VAULT_ROLE still count.
+func TestStartRole(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	cases := []struct {
+		args []string
+		env  map[string]string
+		want string
+	}{
+		{[]string{"--role=worker"}, nil, "worker"},
+		{[]string{"--role=maintain"}, map[string]string{"REPLAY_ROLE": "worker"}, "maintain"},
+		{nil, map[string]string{"REPLAY_ROLE": "maintain"}, "maintain"},
+		{nil, map[string]string{"VAULT_ROLE": "worker"}, "worker"},
+		{nil, nil, ""},
+	}
+	for _, c := range cases {
+		if got := startRole(c.args, env(c.env)); got != c.want {
+			t.Errorf("startRole(%v, %v) = %q, want %q", c.args, c.env, got, c.want)
+		}
+	}
+}

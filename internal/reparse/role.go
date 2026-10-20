@@ -10,7 +10,7 @@ import (
 	"dota-replay-parser/internal/vault"
 )
 
-// WorkerFromEnv builds the worker of a VAULT_ROLE=worker machine. Secrets come
+// WorkerFromEnv builds the worker of a `--role=worker` machine. Secrets come
 // from the app's secrets; everything else was set in the machine config. It
 // fails fast when something is missing or the image is not the planned version.
 func WorkerFromEnv(get func(string) string, v *vault.Vault, parse ParseFunc, parserVersion string) (*Worker, Config, error) {

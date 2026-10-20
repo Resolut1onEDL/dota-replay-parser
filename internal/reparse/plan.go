@@ -165,9 +165,25 @@ func (p *Planner) todo(ctx context.Context, freshSince time.Time) (items []PlanI
 
 func verSlug(v string) string { return strings.ReplaceAll(v, ".", "-") }
 
+// RoleInit is the start command of a role machine: the image's server binary (Dockerfile WORKDIR /app) with --role.
+func RoleInit(role string) *InitConfig {
+	return &InitConfig{Cmd: []string{"/app/server", "--role=" + role}}
+}
+
+func sameCmd(a, b *InitConfig) bool {
+	var x, y []string
+	if a != nil {
+		x = a.Cmd
+	}
+	if b != nil {
+		y = b.Cmd
+	}
+	return strings.Join(x, "\x00") == strings.Join(y, "\x00")
+}
+
 func (p *Planner) workerRequest(plan Plan, shard int, planKey string) CreateRequest {
 	env := map[string]string{
-		"VAULT_ROLE":          "worker",
+		"REPLAY_ROLE":         "worker",
 		"REPARSE_VERSION":     p.Cfg.Version,
 		"REPARSE_PLAN":        planKey,
 		"REPARSE_SHARD":       strconv.Itoa(shard),
@@ -185,6 +201,7 @@ func (p *Planner) workerRequest(plan Plan, shard int, planKey string) CreateRequ
 		Region: p.Cfg.Region,
 		Config: MachineConfig{
 			Image:       p.Cfg.Image,
+			Init:        RoleInit("worker"),
 			Env:         env,
 			Guest:       &Guest{CPUKind: "performance", CPUs: p.Cfg.CPUs, MemoryMB: p.Cfg.MemoryMB},
 			Restart:     &Restart{Policy: "no"},
@@ -195,9 +212,9 @@ func (p *Planner) workerRequest(plan Plan, shard int, planKey string) CreateRequ
 	}
 }
 
-// maintainRequest is the daily scheduled machine (same image, VAULT_ROLE=maintain).
+// maintainRequest is the daily scheduled machine (same image, `./server --role=maintain`).
 func (p *Planner) maintainRequest() CreateRequest {
-	env := map[string]string{"VAULT_ROLE": "maintain"}
+	env := map[string]string{"REPLAY_ROLE": "maintain"}
 	for k, v := range p.Cfg.Passthrough {
 		env[k] = v
 	}
@@ -207,6 +224,7 @@ func (p *Planner) maintainRequest() CreateRequest {
 		SkipLaunch: true,
 		Config: MachineConfig{
 			Image:    p.Cfg.Image,
+			Init:     RoleInit("maintain"),
 			Env:      env,
 			Guest:    &Guest{CPUKind: "performance", CPUs: 1, MemoryMB: 2048},
 			Restart:  &Restart{Policy: "no"},
@@ -217,10 +235,10 @@ func (p *Planner) maintainRequest() CreateRequest {
 }
 
 // envDiffers: the machine's env is not what the server would set now. Only the
-// names the server manages are compared (VAULT_ROLE and the passthrough list),
+// names the server manages are compared (REPLAY_ROLE and the passthrough list),
 // so a value dropped from fly.toml also counts as a change.
 func envDiffers(have, want map[string]string) bool {
-	managed := append([]string{"VAULT_ROLE"}, passthroughKeys...)
+	managed := append([]string{"REPLAY_ROLE"}, passthroughKeys...)
 	for _, k := range managed {
 		if have[k] != want[k] {
 			return true
@@ -244,7 +262,8 @@ func (p *Planner) EnsureMaintain(ctx context.Context) (string, error) {
 			continue
 		}
 		want := p.maintainRequest()
-		if m.Config.Image == p.Cfg.Image && m.Config.Schedule == "daily" && !envDiffers(m.Config.Env, want.Config.Env) {
+		if m.Config.Image == p.Cfg.Image && m.Config.Schedule == "daily" && !envDiffers(m.Config.Env, want.Config.Env) &&
+			sameCmd(m.Config.Init, want.Config.Init) {
 			return "present", nil
 		}
 		if err := p.M.Update(ctx, m.ID, want); err != nil {
