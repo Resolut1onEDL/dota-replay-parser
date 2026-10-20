@@ -172,6 +172,27 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.15.1 — the replay vault (no change to the parse)
+
+- The parse output is byte-identical to 4.15.0; only the parse service changed.
+  `cmd/server` keeps every replay it fetches from Valve in a Tigris bucket (Fly
+  Storage) under `replays/<match_id>.dem` — the exact bytes Valve served — with
+  its kind (student, pro, ladder, coach, audit, camp), patch and accounts, and
+  reads a stored replay instead of asking Valve again. Without the bucket's env
+  (`BUCKET_NAME`, `AWS_*`) the server behaves as before.
+- `/parse-valve` takes optional hints in `X-Vault-Kind`, `X-Vault-Patch`,
+  `X-Vault-Account`, `X-Vault-Source` (or the same fields in the body); no kind
+  means a coach analysis. The parser child now runs with a scrubbed environment.
+- `POST /vault/backfill` stores a batch of replays from Valve without parsing,
+  `POST /vault/reparse` re-parses the whole vault with the running version on
+  temporary Fly machines (`VAULT_ROLE=worker`, no Valve client) and delivers
+  each parse to the web app, then dispatches one page refresh;
+  `GET /vault/status` counts what is stored. A daily scheduled machine
+  (`VAULT_ROLE=maintain`) resumes an unfinished run and prunes replays older
+  than the previous patch (dry run unless `RETENTION_APPLY=1`).
+- `cmd/vaultctl` (local): `upload --manifest`, `status`, `purge-student`, `probe`.
+- Design: `specs/replay-vault/design-v3.md` in the ResoAI-web repo.
+
 ### 4.15.0 — lane waves, towers, level-up seconds
 
 - `laneWaveTrack` — every game second from the horn to 12:00: for top, mid and

@@ -7,6 +7,13 @@ primary_region = "arn"
 [env]
   MAX_CONCURRENT = "1"
   PORT = "8080"
+  # Replay vault (Tigris): off until the bucket and secrets exist. Re-parse of the
+  # stored replays after a deploy: scripts/release-sync.sh calls /vault/reparse
+  # only when REPARSE_AUTO is 1 (keep 0 until the backfill is done).
+  REPARSE_AUTO = "0"
+  REPARSE_MACHINES = "8"
+  REPARSE_MAX_RUNTIME = "150m"
+  RETENTION_APPLY = "0"
 
 [http_service]
   internal_port = 8080

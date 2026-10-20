@@ -7,7 +7,9 @@
 # this script fans the version out to every channel and VERIFIES each one:
 #
 #   1. GitHub release assets (built by CI on the tag)   — checked
-#   2. Fly parse-service `resoai-parse` (web + ODB)     — deployed + healthz
+#   2. Fly parse-service `resoai-parse` (web + ODB)     — deployed + healthz,
+#      then (only with REPARSE_AUTO=1 in fly.toml [env]) POST /vault/reparse:
+#      the server re-parses the replay vault on temporary machines
 #   3. reso-coach-companion pin + bin/                  — bumped + checksum
 #   4. gamerjournal-replay-uploader pin + bin/ (legacy) — bumped + checksum
 #   5. local GJ binary (DOTA_PARSER_BIN)                — rebuilt + --version
@@ -64,6 +66,34 @@ for i in $(seq 1 12); do
 done
 [ "$got" = "$VER" ] || fail "healthz отдаёт '$got', ожидал '$VER'"
 echo "  healthz: $got ✓"
+
+step "1b/5 replay vault: перепарс хранилища на временных машинах"
+# Off until the founder flips REPARSE_AUTO to 1 in fly.toml [env] (after the backfill).
+if grep -Eq '^[[:space:]]*REPARSE_AUTO[[:space:]]*=[[:space:]]*"?1"?[[:space:]]*(#.*)?$' "$PARSER_REPO/fly.toml"; then
+  # The token is read from the environment or from the web repo's .env.local and is
+  # never printed; curl gets it on stdin, so it is not in the process list either.
+  tok="${PARSE_SERVICE_TOKEN:-}"
+  if [ -z "$tok" ] && [ -f "$WEB_DIR/.env.local" ]; then
+    tok=$(sed -n 's/^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}PARSE_SERVICE_TOKEN=//p' "$WEB_DIR/.env.local" | tail -1 | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')
+  fi
+  if [ -z "$tok" ]; then
+    echo "  PARSE_SERVICE_TOKEN не найден (ни в окружении, ни в $WEB_DIR/.env.local) — перепарс не запущен"
+  else
+    body=$(mktemp)
+    code=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" |
+      curl -sS -m 180 -K - -o "$body" -w '%{http_code}' -X POST \
+        -H 'Content-Type: application/json' -d '{}' "https://$FLY_APP.fly.dev/vault/reparse" || echo 000)
+    unset tok
+    if [ "$code" = "200" ]; then
+      echo "  /vault/reparse: 200 — $(cat "$body")"
+    else
+      echo "  /vault/reparse: HTTP $code — перепарс не запущен; повтори вручную (команда безопасна при повторе)"
+    fi
+    rm -f "$body"
+  fi
+else
+  echo "  REPARSE_AUTO не равен 1 в fly.toml — перепарс хранилища пропущен"
+fi
 
 sync_electron() { # dir, label
   local dir="$1" label="$2"
