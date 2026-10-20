@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -97,6 +98,8 @@ func authed(r *http.Request) bool {
 // analyses silently fell back to OpenDota stats). Old bzip2 replays are still
 // served for older matches, so BOTH must work — sniff, never trust the URL.
 func writeDem(src io.Reader) (string, int64, error) {
+	var track trackErr
+	src = trackReader{src, &track}
 	head := make([]byte, 4)
 	n, err := io.ReadFull(src, head)
 	if err != nil && n == 0 {
@@ -124,7 +127,7 @@ func writeDem(src io.Reader) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	written, err := io.Copy(f, full)
+	written, err := decodeInto(f, full, &track)
 	closeErr := f.Close()
 	if err != nil {
 		os.Remove(f.Name())
@@ -135,6 +138,69 @@ func writeDem(src io.Reader) (string, int64, error) {
 		return "", 0, closeErr
 	}
 	return f.Name(), written, nil
+}
+
+// errDecode marks a replay whose bytes do not decode (a truncated or garbled
+// bzip2/zstd stream). A failure to read the source or to write the temp file
+// (a full disk) is not one: it says nothing about the replay.
+var errDecode = errors.New("replay does not decode")
+
+// trackErr remembers the first real I/O error seen on the source or the
+// destination. The zstd decoder reads its source from its own goroutines, so
+// it is locked.
+type trackErr struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (t *trackErr) note(err error) error {
+	if err != nil && err != io.EOF {
+		t.mu.Lock()
+		if t.err == nil {
+			t.err = err
+		}
+		t.mu.Unlock()
+	}
+	return err
+}
+
+func (t *trackErr) first() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
+
+type trackReader struct {
+	r io.Reader
+	t *trackErr
+}
+
+func (r trackReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.t.note(err)
+	return n, err
+}
+
+type trackWriter struct {
+	w io.Writer
+	t *trackErr
+}
+
+func (w trackWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	w.t.note(err)
+	return n, err
+}
+
+// decodeInto copies the decoded stream to dst. An error that comes from the
+// decoder itself is wrapped in errDecode; one that comes from reading src or
+// writing dst is returned as it is.
+func decodeInto(dst io.Writer, decoded io.Reader, t *trackErr) (int64, error) {
+	n, err := io.Copy(trackWriter{dst, t}, decoded)
+	if err != nil && t.first() == nil {
+		err = fmt.Errorf("%w: %v", errDecode, err)
+	}
+	return n, err
 }
 
 func reserveSlot(w http.ResponseWriter, r *http.Request) bool {
@@ -155,6 +221,11 @@ func reserveSlot(w http.ResponseWriter, r *http.Request) bool {
 func runParser(ctx context.Context, demPath string) ([]byte, time.Duration, error) {
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, parserBin, demPath)
+	if vlt != nil {
+		// with the vault on the child sees only what it needs (no vault, Fly or
+		// GitHub secret); with it off the child inherits the env as it always did
+		cmd.Env = parserEnv()
+	}
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	return out, time.Since(start), err
@@ -191,10 +262,23 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req valveReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+	var rawBody bytes.Buffer
+	body := io.Reader(r.Body)
+	if vlt != nil {
+		body = io.TeeReader(r.Body, &rawBody)
+	}
+	if err := json.NewDecoder(body).Decode(&req); err != nil ||
 		req.MatchID <= 0 || req.Cluster <= 0 || req.Salt <= 0 {
 		http.Error(w, `{"error":"bad_params"}`, http.StatusBadRequest)
 		return
+	}
+	var hints vaultHints
+	if vlt != nil {
+		var ok bool
+		if hints, ok = parseVaultHints(r, rawBody.Bytes()); !ok {
+			http.Error(w, `{"error":"bad_kind"}`, http.StatusBadRequest)
+			return
+		}
 	}
 	if _, loaded := inFlightMatches.LoadOrStore(req.MatchID, struct{}{}); loaded {
 		w.Header().Set("Retry-After", "5")
@@ -206,6 +290,11 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-sem }()
+
+	if vlt != nil {
+		handleParseValveVault(w, r, req, hints)
+		return
+	}
 
 	url := fmt.Sprintf("http://replay%d.valve.net/570/%d_%d.dem.bz2",
 		req.Cluster, req.MatchID, req.Salt)
@@ -322,6 +411,10 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func main() {
+	if role := os.Getenv("VAULT_ROLE"); role != "" {
+		os.Exit(runRole(role))
+	}
+	initVault()
 	maxConc := 2
 	if v := os.Getenv("MAX_CONCURRENT"); v != "" {
 		fmt.Sscanf(v, "%d", &maxConc)
@@ -333,6 +426,9 @@ func main() {
 	mux.HandleFunc("POST /parse", handleParse)
 	mux.HandleFunc("POST /parse-valve", handleParseValve)
 	mux.HandleFunc("POST /parse-url", handleParseURL)
+	if vlt != nil {
+		registerVaultRoutes(mux)
+	}
 
 	port := envOr("PORT", "8080")
 	log.Printf("parse-service listening on :%s (parser=%s, max_concurrent=%d, auth=%v)",
