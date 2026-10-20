@@ -411,7 +411,7 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func main() {
-	if role := os.Getenv("VAULT_ROLE"); role != "" {
+	if role := startRole(os.Args[1:], os.Getenv); role != "" {
 		os.Exit(runRole(role))
 	}
 	initVault()

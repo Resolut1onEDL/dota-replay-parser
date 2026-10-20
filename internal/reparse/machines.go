@@ -23,8 +23,17 @@ type Restart struct {
 	Policy string `json:"policy"`
 }
 
+// InitConfig: Cmd replaces the image's CMD. A machine's role travels here, as
+// `./server --role=<r>`: Fly passes the machine's config env to the process
+// except names starting with VAULT_ (20.10: VAULT_ROLE=worker never reached the
+// 4.15.1 workers, which then ran as idle web servers until destroyed).
+type InitConfig struct {
+	Cmd []string `json:"cmd,omitempty"`
+}
+
 type MachineConfig struct {
 	Image       string            `json:"image"`
+	Init        *InitConfig       `json:"init,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Guest       *Guest            `json:"guest,omitempty"`
 	Restart     *Restart          `json:"restart,omitempty"`

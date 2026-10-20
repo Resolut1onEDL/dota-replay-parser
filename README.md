@@ -172,6 +172,16 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.15.2 — re-parse machines start in their role (no change to the parse)
+
+- The parse output is byte-identical to 4.15.0. The temporary re-parse machines
+  and the daily maintenance machine get their role in the start command
+  (`/app/server --role=worker|maintain`, Machines API `init.cmd`), with
+  `REPLAY_ROLE` in their env as a second source: Fly does not pass a machine's
+  config env names that start with `VAULT_`, so the 4.15.1 machines never got
+  `VAULT_ROLE` and started as idle web servers. The daily machine is updated in
+  place when its start command differs.
+
 ### 4.15.1 — the replay vault (no change to the parse)
 
 - The parse output is byte-identical to 4.15.0; only the parse service changed.
@@ -185,10 +195,10 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   means a coach analysis. The parser child now runs with a scrubbed environment.
 - `POST /vault/backfill` stores a batch of replays from Valve without parsing,
   `POST /vault/reparse` re-parses the whole vault with the running version on
-  temporary Fly machines (`VAULT_ROLE=worker`, no Valve client) and delivers
+  temporary Fly machines (`./server --role=worker`, no Valve client) and delivers
   each parse to the web app, then dispatches one page refresh;
   `GET /vault/status` counts what is stored. A daily scheduled machine
-  (`VAULT_ROLE=maintain`) resumes an unfinished run and prunes replays older
+  (`./server --role=maintain`) resumes an unfinished run and prunes replays older
   than the previous patch (dry run unless `RETENTION_APPLY=1`).
 - `cmd/vaultctl` (local): `upload --manifest`, `status`, `purge-student`, `probe`.
 - Design: `specs/replay-vault/design-v3.md` in the ResoAI-web repo.
