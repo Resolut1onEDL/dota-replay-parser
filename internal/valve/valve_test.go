@@ -183,3 +183,43 @@ func TestStoreKeepsAFinishedDownloadWhenTheCallerHangsUp(t *testing.T) {
 		t.Fatal("not stored")
 	}
 }
+
+// A China-cluster replay comes from the URL OpenDota gave (replay<N>.dota2.com.cn); only Valve's or a China mirror's
+// file of this very match is accepted.
+func TestAllowedURL(t *testing.T) {
+	for _, tc := range []struct {
+		url  string
+		want bool
+	}{
+		{"http://replay171.valve.net/570/8918319751_456.dem.bz2", true},
+		{"http://replay223.dota2.com.cn/570/8918319751_456.dem.bz2", true},
+		{"https://replay225.wmsj.cn/570/8918319751_456.dem.bz2", true},
+		{"http://replay171.valve.net/570/8918319751_999.dem.bz2", false}, // another salt
+		{"http://replay171.valve.net/570/1_456.dem.bz2", false},          // another match
+		{"http://evil.example/570/8918319751_456.dem.bz2", false},
+		{"http://replay171.valve.net.evil.example/570/8918319751_456.dem.bz2", false},
+		{"http://replay171.valve.net:8080/570/8918319751_456.dem.bz2", false},
+		{"http://user@replay171.valve.net/570/8918319751_456.dem.bz2", false},
+		{"http://replay171.valve.net/570/8918319751_456.dem.bz2?x=1", false},
+		{"file:///etc/passwd", false},
+	} {
+		if got := AllowedURL(tc.url, 8918319751, 456); got != tc.want {
+			t.Errorf("AllowedURL(%s) = %v, want %v", tc.url, got, tc.want)
+		}
+	}
+}
+
+func TestStoreUsesTheGivenURL(t *testing.T) {
+	zst, _ := hex.DecodeString(zstHex)
+	var path string
+	f, v, _ := newFetcher(t, func(w http.ResponseWriter, r *http.Request) { path = r.URL.Path; w.Write(zst) })
+	srvURL := f.URLFor(0, 0, 0)
+	base := srvURL[:strings.LastIndex(srvURL, "/")]
+	it := Item{MatchID: 12, Cluster: 223, Salt: 5, URL: base + "/570/12_5.dem.bz2", Meta: vault.Meta{Kind: vault.KindLadder}}
+	if r := f.Store(context.Background(), v, "backfill", it); r.Status != StatusStored {
+		t.Fatalf("store = %+v", r)
+	}
+	if path != "/570/12_5.dem.bz2" {
+		t.Fatalf("fetched %q, want the given URL's path", path)
+	}
+}

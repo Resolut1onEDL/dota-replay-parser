@@ -479,6 +479,11 @@ func TestVaultBackfillStatuses(t *testing.T) {
 	if o, _, _ := vlt.Find(context.Background(), 4); o.Meta.Kind != vault.KindStudent {
 		t.Fatalf("present item was not merged: %+v", o.Meta)
 	}
+	// a URL that is not Valve's (or a China mirror's) file of this match is refused before any download
+	bad := `{"items":[{"match_id":6,"cluster":1,"salt":9,"kind":"ladder","url":"http://evil.example/570/6_9.dem.bz2"}]}`
+	if w = call(handleVaultBackfill, "POST", bad, "secret"); w.Code != 200 || !strings.Contains(w.Body.String(), `"bad_url"`) {
+		t.Fatalf("bad url = %d %s", w.Code, w.Body.String())
+	}
 	var items []string
 	for i := 0; i < 51; i++ {
 		items = append(items, `{"match_id":1,"cluster":1,"salt":1}`)

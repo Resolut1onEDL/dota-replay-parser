@@ -19,6 +19,7 @@ type backfillItem struct {
 	MatchID  int64             `json:"match_id"`
 	Cluster  int               `json:"cluster"`
 	Salt     int64             `json:"salt"`
+	URL      string            `json:"url"` // optional: Valve's or a China mirror's file of this match (valve.AllowedURL)
 	Kind     string            `json:"kind"`
 	Patch    json.RawMessage   `json:"patch"`
 	Accounts []json.RawMessage `json:"accounts"`
@@ -61,6 +62,10 @@ func handleVaultBackfill(w http.ResponseWriter, r *http.Request) {
 			results[i] = valve.ItemResult{MatchID: it.MatchID, Status: valve.StatusFailed, Error: "bad_item"}
 			continue
 		}
+		if it.URL != "" && !valve.AllowedURL(it.URL, it.MatchID, it.Salt) {
+			results[i] = valve.ItemResult{MatchID: it.MatchID, Status: valve.StatusFailed, Error: "bad_url"}
+			continue
+		}
 		var accounts []string
 		for _, a := range it.Accounts {
 			accounts = append(accounts, rawStrings(a)...)
@@ -71,7 +76,7 @@ func handleVaultBackfill(w http.ResponseWriter, r *http.Request) {
 		go func(i int, it backfillItem, meta vault.Meta) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			results[i] = f.Store(r.Context(), vlt, "backfill", valve.Item{MatchID: it.MatchID, Cluster: it.Cluster, Salt: it.Salt, Meta: meta})
+			results[i] = f.Store(r.Context(), vlt, "backfill", valve.Item{MatchID: it.MatchID, Cluster: it.Cluster, Salt: it.Salt, URL: it.URL, Meta: meta})
 		}(i, it, meta)
 	}
 	wg.Wait()

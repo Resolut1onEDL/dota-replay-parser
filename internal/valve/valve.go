@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"time"
 
 	"dota-replay-parser/internal/vault"
@@ -22,6 +24,20 @@ const DefaultMaxBytes = 700 << 20
 // may be bzip2, zstd or raw).
 func URL(cluster int, matchID, salt int64) string {
 	return fmt.Sprintf("http://replay%d.valve.net/570/%d_%d.dem.bz2", cluster, matchID, salt)
+}
+
+// replayHost: Valve's replay CDN and its China mirrors (OpenDota hands out replay<N>.dota2.com.cn for clusters
+// served from China — 193 of the 1403 games of the 7.41 medal ladder).
+var replayHost = regexp.MustCompile(`^replay\d+\.(valve\.net|dota2\.com\.cn|wmsj\.cn)$`)
+
+// AllowedURL: a replay URL given by a caller is fetched only when it is Valve's (or a China mirror's) file of this very
+// match — never an arbitrary address.
+func AllowedURL(raw string, matchID, salt int64) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Port() != "" {
+		return false
+	}
+	return replayHost.MatchString(u.Hostname()) && u.Path == fmt.Sprintf("/570/%d_%d.dem.bz2", matchID, salt)
 }
 
 // StatusError: Valve answered, but not 200.
@@ -150,6 +166,7 @@ type Item struct {
 	MatchID int64
 	Cluster int
 	Salt    int64
+	URL     string // optional, already checked with AllowedURL: used instead of URL(cluster, ...)
 	Meta    vault.Meta
 }
 
@@ -189,7 +206,13 @@ func (f *Fetcher) Store(ctx context.Context, v *vault.Vault, source string, it I
 		res.Status = StatusPresent
 		return res
 	}
-	d, err := f.Download(ctx, source, it.MatchID, it.Cluster, it.Salt)
+	dl := f
+	if it.URL != "" {
+		c := *f
+		c.URLFor = func(int, int64, int64) string { return it.URL }
+		dl = &c
+	}
+	d, err := dl.Download(ctx, source, it.MatchID, it.Cluster, it.Salt)
 	if err != nil {
 		var se *StatusError
 		if errors.As(err, &se) {
