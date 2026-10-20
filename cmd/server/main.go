@@ -155,6 +155,7 @@ func reserveSlot(w http.ResponseWriter, r *http.Request) bool {
 func runParser(ctx context.Context, demPath string) ([]byte, time.Duration, error) {
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, parserBin, demPath)
+	cmd.Env = parserEnv()
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	return out, time.Since(start), err
@@ -191,10 +192,23 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req valveReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
+	var rawBody bytes.Buffer
+	body := io.Reader(r.Body)
+	if vlt != nil {
+		body = io.TeeReader(r.Body, &rawBody)
+	}
+	if err := json.NewDecoder(body).Decode(&req); err != nil ||
 		req.MatchID <= 0 || req.Cluster <= 0 || req.Salt <= 0 {
 		http.Error(w, `{"error":"bad_params"}`, http.StatusBadRequest)
 		return
+	}
+	var hints vaultHints
+	if vlt != nil {
+		var ok bool
+		if hints, ok = parseVaultHints(r, rawBody.Bytes()); !ok {
+			http.Error(w, `{"error":"bad_kind"}`, http.StatusBadRequest)
+			return
+		}
 	}
 	if _, loaded := inFlightMatches.LoadOrStore(req.MatchID, struct{}{}); loaded {
 		w.Header().Set("Retry-After", "5")
@@ -206,6 +220,11 @@ func handleParseValve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { <-sem }()
+
+	if vlt != nil {
+		handleParseValveVault(w, r, req, hints)
+		return
+	}
 
 	url := fmt.Sprintf("http://replay%d.valve.net/570/%d_%d.dem.bz2",
 		req.Cluster, req.MatchID, req.Salt)
@@ -322,6 +341,10 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func main() {
+	if role := os.Getenv("VAULT_ROLE"); role != "" {
+		os.Exit(runRole(role))
+	}
+	initVault()
 	maxConc := 2
 	if v := os.Getenv("MAX_CONCURRENT"); v != "" {
 		fmt.Sscanf(v, "%d", &maxConc)
@@ -333,6 +356,9 @@ func main() {
 	mux.HandleFunc("POST /parse", handleParse)
 	mux.HandleFunc("POST /parse-valve", handleParseValve)
 	mux.HandleFunc("POST /parse-url", handleParseURL)
+	if vlt != nil {
+		registerVaultRoutes(mux)
+	}
 
 	port := envOr("PORT", "8080")
 	log.Printf("parse-service listening on :%s (parser=%s, max_concurrent=%d, auth=%v)",
