@@ -3,6 +3,7 @@ package vault
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sort"
 	"strings"
@@ -14,16 +15,20 @@ type memObject struct {
 	data []byte
 	meta map[string]string
 	at   time.Time
+	etag string
 }
 
 // MemStore is an in-memory Store for tests.
 type MemStore struct {
 	mu      sync.Mutex
+	seq     int
 	objects map[string]*memObject
 	// Gets counts Get calls per key (tests assert "no fetch").
 	Gets map[string]int
 	// FailPut, when set, makes Put fail for keys it returns true for.
 	FailPut func(key string) error
+	// BeforeCopy, when set, runs at the start of every CopyReplaceIfMatch.
+	BeforeCopy func(key string)
 }
 
 func NewMemStore() *MemStore {
@@ -38,6 +43,12 @@ func copyMap(m map[string]string) map[string]string {
 	return out
 }
 
+// nextETag must be called with s.mu held.
+func (s *MemStore) nextETag() string {
+	s.seq++
+	return fmt.Sprintf(`"mem-%d"`, s.seq)
+}
+
 func (s *MemStore) Head(_ context.Context, key string) (ObjectInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -45,7 +56,7 @@ func (s *MemStore) Head(_ context.Context, key string) (ObjectInfo, error) {
 	if !ok {
 		return ObjectInfo{}, ErrNotFound
 	}
-	return ObjectInfo{Key: key, Size: int64(len(o.data)), Meta: copyMap(o.meta), LastModified: o.at}, nil
+	return ObjectInfo{Key: key, Size: int64(len(o.data)), Meta: copyMap(o.meta), LastModified: o.at, ETag: o.etag}, nil
 }
 
 func (s *MemStore) Get(_ context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
@@ -57,10 +68,13 @@ func (s *MemStore) Get(_ context.Context, key string) (io.ReadCloser, ObjectInfo
 	}
 	s.Gets[key]++
 	return io.NopCloser(bytes.NewReader(append([]byte(nil), o.data...))),
-		ObjectInfo{Key: key, Size: int64(len(o.data)), Meta: copyMap(o.meta), LastModified: o.at}, nil
+		ObjectInfo{Key: key, Size: int64(len(o.data)), Meta: copyMap(o.meta), LastModified: o.at, ETag: o.etag}, nil
 }
 
-func (s *MemStore) Put(_ context.Context, key string, body io.ReadSeeker, _ int64, opts PutOpts) error {
+func (s *MemStore) Put(ctx context.Context, key string, body io.ReadSeeker, _ int64, opts PutOpts) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -75,7 +89,7 @@ func (s *MemStore) Put(_ context.Context, key string, body io.ReadSeeker, _ int6
 	if _, ok := s.objects[key]; ok && opts.IfNoneMatch {
 		return ErrExists
 	}
-	s.objects[key] = &memObject{data: data, meta: copyMap(opts.Meta), at: time.Now()}
+	s.objects[key] = &memObject{data: data, meta: copyMap(opts.Meta), at: time.Now(), etag: s.nextETag()}
 	return nil
 }
 
@@ -87,6 +101,28 @@ func (s *MemStore) CopyReplace(_ context.Context, key string, meta map[string]st
 		return ErrNotFound
 	}
 	o.meta = copyMap(meta)
+	o.etag = s.nextETag()
+	return nil
+}
+
+// CopyReplaceIfMatch is the conditional rewrite; BeforeCopy (when set) runs
+// first, outside the lock, so a test can change the object "between" the read
+// and the write.
+func (s *MemStore) CopyReplaceIfMatch(_ context.Context, key, etag string, meta map[string]string) error {
+	if s.BeforeCopy != nil {
+		s.BeforeCopy(key)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.objects[key]
+	if !ok {
+		return ErrNotFound
+	}
+	if etag != "" && o.etag != etag {
+		return ErrChanged
+	}
+	o.meta = copyMap(meta)
+	o.etag = s.nextETag()
 	return nil
 }
 

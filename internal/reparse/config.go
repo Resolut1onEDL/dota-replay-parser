@@ -66,8 +66,7 @@ func ConfigFromEnv(get func(string) string, version string) Config {
 		c.MaxRuntime = d
 	}
 	c.Passthrough = map[string]string{}
-	for _, k := range []string{"WEB_URL", "REPARSE_MACHINES", "REPARSE_CPUS", "REPARSE_MEMORY_MB",
-		"REPARSE_PARALLEL", "REPARSE_MAX_RUNTIME", "RETENTION_APPLY", "GH_REPO", "GH_WORKFLOW", "PARSER_BIN"} {
+	for _, k := range passthroughKeys {
 		if v := get(k); v != "" {
 			c.Passthrough[k] = v
 		}
@@ -75,10 +74,16 @@ func ConfigFromEnv(get func(string) string, version string) Config {
 	return c
 }
 
-// MachinesFor is N = clamp(ceil(todo/(PerSlot*parallel)), 1, max).
+// passthroughKeys are the env names copied from the server to the machines it
+// creates through the API (those do not get fly.toml [env]).
+var passthroughKeys = []string{"WEB_URL", "REPARSE_MACHINES", "REPARSE_CPUS", "REPARSE_MEMORY_MB",
+	"REPARSE_PARALLEL", "REPARSE_MAX_RUNTIME", "RETENTION_APPLY", "GH_REPO", "GH_WORKFLOW", "PARSER_BIN"}
+
+// MachinesFor is N = clamp(ceil(todo/(PerSlot*parallel)), 1, max). A caller's
+// override can lower the cap but never raise it past REPARSE_MACHINES.
 func (c Config) MachinesFor(todo, override int) int {
 	max := c.MaxMachines
-	if override > 0 {
+	if override > 0 && override < max {
 		max = override
 	}
 	per := c.PerSlot * c.Parallel

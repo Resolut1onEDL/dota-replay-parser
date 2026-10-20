@@ -18,7 +18,8 @@ import (
 // workerParse is the parser handed to the worker: it turns a stored replay
 // into the parser's JSON. The replay is copied to local disk first, so a
 // network failure reading it is told apart from a replay that does not decode
-// (only the second is a verdict on the replay).
+// (only the second is a verdict on the replay, and a failure to write the
+// unpacked file, such as a full disk, is not one either).
 func workerParse(ctx context.Context, r io.Reader) ([]byte, error) {
 	tmp, err := os.CreateTemp("", "replay-vault-*")
 	if err != nil {
@@ -39,7 +40,11 @@ func workerParse(ctx context.Context, r io.Reader) ([]byte, error) {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("%w: %v", reparse.ErrParseFailed, err)
+		if errors.Is(err, errDecode) {
+			return nil, fmt.Errorf("%w: %v", reparse.ErrParseFailed, err)
+		}
+		// a full disk or a failing temp file says nothing about the replay
+		return nil, fmt.Errorf("unpack replay: %w", err)
 	}
 	defer os.Remove(demPath)
 	out, _, err := runParser(ctx, demPath)

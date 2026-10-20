@@ -213,8 +213,8 @@ func cmdUpload(ctx context.Context, args []string, out io.Writer, v *vault.Vault
 	}
 	wg.Wait()
 	fmt.Fprintf(out, "done: %s\n", summarize(counts))
-	if counts["failed"] > 0 || counts["conflict"] > 0 {
-		return fmt.Errorf("%d failed, %d conflicting", counts["failed"], counts["conflict"])
+	if counts["failed"] > 0 || counts["conflict"] > 0 || counts["invalid"] > 0 {
+		return fmt.Errorf("%d failed, %d conflicting, %d invalid", counts["failed"], counts["conflict"], counts["invalid"])
 	}
 	return nil
 }
@@ -230,7 +230,9 @@ func summarize(c map[string]int) string {
 
 // uploadOne: missing file -> "missing"; stored with the same sha256 (or none
 // recorded) -> "present" (metadata merged); stored with another sha256 ->
-// "conflict" (never overwritten); otherwise "uploaded".
+// "conflict" (never overwritten); a file that does not decompress into a demo
+// -> "invalid" (never stored); otherwise "uploaded". An object marked corrupt
+// counts as absent and is replaced.
 func uploadOne(ctx context.Context, v *vault.Vault, row manifestRow, dry bool) (string, string) {
 	sum, size, head, err := fileSHA256(row.Path)
 	if err != nil {
@@ -245,7 +247,7 @@ func uploadOne(ctx context.Context, v *vault.Vault, row manifestRow, dry bool) (
 	if err != nil {
 		return "failed", err.Error()
 	}
-	if found {
+	if found && !o.Meta.Corrupt {
 		if o.Meta.SHA256 != "" && o.Meta.SHA256 != sum {
 			return "conflict", fmt.Sprintf("stored sha256 %s... differs from %s...", o.Meta.SHA256[:8], sum[:8])
 		}
@@ -256,14 +258,23 @@ func uploadOne(ctx context.Context, v *vault.Vault, row manifestRow, dry bool) (
 		}
 		return "present", ""
 	}
-	if dry {
-		return "would-upload", fmt.Sprintf("%d MB", size>>20)
-	}
+	// Only bytes that decompress into a demo are stored: PutNew never
+	// overwrites, so a truncated file kept here would hide the real replay from
+	// every later backfill.
 	f, err := os.Open(row.Path)
 	if err != nil {
 		return "failed", err.Error()
 	}
 	defer f.Close()
+	if _, _, err := vault.Verify(f); err != nil {
+		return "invalid", err.Error()
+	}
+	if dry {
+		return "would-upload", fmt.Sprintf("%d MB", size>>20)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "failed", err.Error()
+	}
 	if _, err := v.PutNew(ctx, row.ID, f, size, meta); err != nil {
 		return "failed", err.Error()
 	}
@@ -328,22 +339,60 @@ func cmdPurge(ctx context.Context, args []string, out io.Writer, v *vault.Vault)
 		if !has {
 			continue
 		}
-		if len(rest) == 0 {
-			del++
-			fmt.Fprintf(out, "delete %d\n", o.ID)
+		// With no student left the object is deleted, unless it was also kept
+		// for another reason (a pro or ladder game the student kind absorbed):
+		// then it drops back to that kind.
+		if len(rest) == 0 && len(o.Meta.Also) == 0 {
 			if *apply {
+				// look again right before the delete: a claim added since the listing keeps it
+				cur, ok, err := v.Find(ctx, o.ID)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					continue
+				}
+				if cur.Meta.Kind != vault.KindStudent || len(cur.Meta.Also) > 0 ||
+					len(cur.Meta.Accounts) != 1 || cur.Meta.Accounts[0] != *account {
+					fmt.Fprintf(out, "skip %d (changed since the listing)\n", o.ID)
+					continue
+				}
 				if err := v.S.Delete(ctx, vault.ReplayKey(o.ID)); err != nil {
 					return err
 				}
 			}
+			del++
+			fmt.Fprintf(out, "delete %d\n", o.ID)
 			continue
 		}
 		detach++
-		fmt.Fprintf(out, "detach %d (still wanted by %s)\n", o.ID, strings.Join(rest, ","))
+		if len(rest) == 0 {
+			fmt.Fprintf(out, "detach %d (still kept as %s)\n", o.ID, vault.HighestKind(o.Meta.Also))
+		} else {
+			fmt.Fprintf(out, "detach %d (still wanted by %s)\n", o.ID, strings.Join(rest, ","))
+		}
 		if *apply {
-			m := o.Meta
-			m.Accounts = rest
-			if err := v.S.CopyReplace(ctx, vault.ReplayKey(o.ID), m.ToS3()); err != nil {
+			// conditional on the ETag, so another student's claim added meanwhile survives
+			if _, err := v.MutateMeta(ctx, o.ID, func(m vault.Meta) vault.Meta {
+				var keep []string
+				for _, a := range m.Accounts {
+					if a != *account {
+						keep = append(keep, a)
+					}
+				}
+				m.Accounts = keep
+				if len(keep) == 0 && m.Kind == vault.KindStudent {
+					m.Kind = vault.HighestKind(m.Also)
+					var also []vault.Kind
+					for _, k := range m.Also {
+						if k != m.Kind {
+							also = append(also, k)
+						}
+					}
+					m.Also = also
+				}
+				return m
+			}); err != nil {
 				return err
 			}
 		}
@@ -359,7 +408,8 @@ func cmdPurge(ctx context.Context, args []string, out io.Writer, v *vault.Vault)
 // ---- probe ----
 
 // cmdProbe tries what the design leans on and prints what works: conditional
-// create (If-None-Match), in-place metadata replace, and the delete of both.
+// create (If-None-Match), in-place metadata replace, the ETag-conditional
+// rewrite, and the delete of both.
 func cmdProbe(ctx context.Context, out io.Writer, v *vault.Vault) error {
 	key := fmt.Sprintf("_vault/probe/%d", time.Now().UnixNano())
 	defer v.S.Delete(ctx, key)
@@ -390,6 +440,18 @@ func cmdProbe(ctx context.Context, out io.Writer, v *vault.Vault) error {
 		}
 	}
 	report("metadata replace on the same key", err)
+	// the metadata merge depends on a stale ETag refusing the rewrite
+	if info, herr := v.S.Head(ctx, key); herr != nil || info.ETag == "" {
+		report("head returns an ETag", fmt.Errorf("none (%v): metadata updates would be unconditional", herr))
+	} else {
+		err := v.S.CopyReplaceIfMatch(ctx, key, `"not-the-etag"`, map[string]string{"a": "9"})
+		if errors.Is(err, vault.ErrChanged) {
+			report("stale ETag refuses a metadata rewrite", nil)
+		} else {
+			report("stale ETag refuses a metadata rewrite", fmt.Errorf("got %v (concurrent updates could overwrite each other)", err))
+		}
+		report("metadata rewrite with the current ETag", v.S.CopyReplaceIfMatch(ctx, key, info.ETag, map[string]string{"a": "2", "b": "3"}))
+	}
 	_, err = v.S.Head(ctx, key+"-none")
 	if errors.Is(err, vault.ErrNotFound) {
 		report("head of a missing key is not-found", nil)

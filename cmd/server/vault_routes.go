@@ -93,6 +93,10 @@ type reparseReq struct {
 	DryRun     bool `json:"dry_run"`
 	Machines   int  `json:"machines"`
 	Redispatch bool `json:"redispatch"`
+	// MaintainOnly only brings the daily maintain machine to this server's
+	// image and env, and starts no re-parse (release-sync.sh uses it while
+	// REPARSE_AUTO is off).
+	MaintainOnly bool `json:"maintain_only"`
 }
 
 // handleVaultReparse starts (or resumes) the re-parse of the whole vault for
@@ -114,6 +118,17 @@ func handleVaultReparse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := newPlanner()
+	if req.MaintainOnly {
+		sum := reparse.Summary{Version: parserVersion}
+		m, merr := p.EnsureMaintain(r.Context())
+		if merr != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "maintain_failed", "detail": merr.Error()})
+			return
+		}
+		sum.Maintain = m
+		writeJSON(w, http.StatusOK, sum)
+		return
+	}
 	sum, err := p.Reparse(r.Context(), reparse.ReparseOpts{DryRun: req.DryRun, Machines: req.Machines, Redispatch: req.Redispatch})
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "reparse_failed", "detail": err.Error(), "summary": sum})

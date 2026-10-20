@@ -170,16 +170,18 @@ type ItemResult struct {
 }
 
 // Store puts one replay into the vault without parsing it: skip if present
-// (merging the metadata), else download, verify and store.
+// (merging the metadata), else download, verify and store. An object marked
+// corrupt counts as absent and is replaced.
 func (f *Fetcher) Store(ctx context.Context, v *vault.Vault, source string, it Item) ItemResult {
 	res := ItemResult{MatchID: it.MatchID}
 	if it.Meta.Source == "" {
 		it.Meta.Source = "valve-backfill"
 	}
-	if _, ok, err := v.Find(ctx, it.MatchID); err != nil {
+	// a stored object marked corrupt is not "present": it is fetched again and replaced
+	if o, ok, err := v.Find(ctx, it.MatchID); err != nil {
 		res.Status, res.Error = StatusFailed, "vault: "+err.Error()
 		return res
-	} else if ok {
+	} else if ok && !o.Meta.Corrupt {
 		if _, err := v.UpdateMeta(ctx, it.MatchID, it.Meta); err != nil {
 			res.Status, res.Error = StatusFailed, "vault: "+err.Error()
 			return res
@@ -213,7 +215,10 @@ func (f *Fetcher) Store(ctx context.Context, v *vault.Vault, source string, it I
 		return res
 	}
 	defer file.Close()
-	if _, err := v.PutNew(ctx, it.MatchID, file, d.Size, it.Meta); err != nil {
+	// a finished download is worth keeping even if the caller hung up
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	defer cancel()
+	if _, err := v.PutNew(sctx, it.MatchID, file, d.Size, it.Meta); err != nil {
 		res.Status, res.Error = StatusFailed, "vault: "+err.Error()
 		return res
 	}

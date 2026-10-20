@@ -60,6 +60,18 @@ func rawStrings(raw json.RawMessage) []string {
 	return out
 }
 
+// nonEmptyStrings is rawStrings without blank entries: an empty body field
+// ("kind":"", "account":"") says nothing and must not wipe a header hint.
+func nonEmptyStrings(raw json.RawMessage) []string {
+	var out []string
+	for _, s := range rawStrings(raw) {
+		if strings.TrimSpace(s) != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // parseVaultHints reads headers, then body fields over them. ok=false: the
 // kind was given but is not one we know.
 func parseVaultHints(r *http.Request, body []byte) (vaultHints, bool) {
@@ -69,16 +81,16 @@ func parseVaultHints(r *http.Request, body []byte) (vaultHints, bool) {
 	source := r.Header.Get("X-Vault-Source")
 	var fields map[string]json.RawMessage
 	if json.NewDecoder(bytes.NewReader(body)).Decode(&fields) == nil {
-		if v := rawStrings(fields["kind"]); len(v) > 0 {
+		if v := nonEmptyStrings(fields["kind"]); len(v) > 0 {
 			kind = v[0]
 		}
-		if v := rawStrings(fields["patch"]); len(v) > 0 {
+		if v := nonEmptyStrings(fields["patch"]); len(v) > 0 {
 			patch = v[0]
 		}
-		if v := append(rawStrings(fields["account"]), rawStrings(fields["accounts"])...); len(v) > 0 {
+		if v := append(nonEmptyStrings(fields["account"]), nonEmptyStrings(fields["accounts"])...); len(v) > 0 {
 			accounts = v
 		}
-		if v := rawStrings(fields["source"]); len(v) > 0 {
+		if v := nonEmptyStrings(fields["source"]); len(v) > 0 {
 			source = v[0]
 		}
 	}
@@ -138,26 +150,57 @@ func respondParseFailed(w http.ResponseWriter, err error, vaultState string) {
 	http.Error(w, `{"error":"parse_failed"}`, http.StatusUnprocessableEntity)
 }
 
+// demMagicOK: the unpacked file starts like a Dota 2 demo. writeDem has
+// already decoded the whole stream (a truncated bzip2/zstd body fails there),
+// so this is vault.Verify without decompressing twice.
+func demMagicOK(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	magic := make([]byte, 7)
+	if _, err := io.ReadFull(f, magic); err != nil {
+		return false
+	}
+	return string(magic) == "PBDEMS2"
+}
+
 // handleParseValveVault is /parse-valve with the vault on: a stored replay is
 // read from the vault (no Valve call); otherwise Valve is asked once, the
-// bytes are kept, and only a clean download that parses (or a clean download
-// the parser rejects, flagged bad) is stored. The caller holds the parse slot.
+// bytes are kept, and only a clean download that really is a demo is stored
+// (flagged bad when the parser rejects it). A stored replay that does not
+// decode, or that the parser rejects for the first time under this version,
+// sends the request to Valve once, and a clean download replaces it. The
+// caller holds the parse slot.
 func handleParseValveVault(w http.ResponseWriter, r *http.Request, req valveReq, h vaultHints) {
 	ctx := r.Context()
+	var held error // the parse failure of a stored copy, answered if Valve cannot help
+	existed := false
 
-	if _, found, err := vlt.Find(ctx, req.MatchID); err != nil {
+	if obj, found, err := vlt.Find(ctx, req.MatchID); err != nil {
 		log.Printf("vault: head %d: %v", req.MatchID, err)
 	} else if found {
+		existed = true
 		if _, err := vlt.UpdateMeta(ctx, req.MatchID, h.meta()); err != nil {
 			log.Printf("vault: merge meta %d: %v", req.MatchID, err)
 		}
-		if served := serveFromVault(w, r, req.MatchID); served {
-			return
+		if !obj.Meta.Corrupt {
+			switch outcome, perr := serveFromVault(w, r, req.MatchID, obj.Meta); outcome {
+			case vaultServed:
+				return
+			case vaultParseFailed:
+				held = perr
+			}
 		}
 	}
 
 	dl, err := newFetcher().Download(ctx, h.Source, req.MatchID, req.Cluster, req.Salt)
 	if err != nil {
+		if held != nil {
+			respondParseFailed(w, held, "hit")
+			return
+		}
 		var se *valve.StatusError
 		switch {
 		case errors.As(err, &se):
@@ -188,6 +231,10 @@ func handleParseValveVault(w http.ResponseWriter, r *http.Request, req valveReq,
 	demPath, size, err := writeDem(raw)
 	if err != nil {
 		log.Printf("parse-valve: undecodable download: %v", err)
+		if held != nil {
+			respondParseFailed(w, held, "hit")
+			return
+		}
 		http.Error(w, `{"error":"download_failed"}`, http.StatusBadGateway)
 		return
 	}
@@ -196,20 +243,41 @@ func handleParseValveVault(w http.ResponseWriter, r *http.Request, req valveReq,
 
 	out, parseDur, perr := runParser(ctx, demPath)
 
-	// The download is clean, so it is kept either way (Valve replays expire).
-	// Only the parser's own verdict flags it bad; a signal kill or a cancelled
-	// request says nothing about the replay.
-	meta := h.meta()
-	meta.Container = container
-	meta.Bad = parseExitFailure(ctx, perr)
+	// A download that decodes into a demo is kept either way (Valve replays
+	// expire). Anything else (an HTML error page served with 200, a stream
+	// that is not a demo) is never stored. Only the parser's own verdict flags
+	// a stored replay bad; a signal kill or a cancelled request says nothing
+	// about the replay.
 	state := "stored"
-	sctx, cancel := storeCtx(ctx)
-	raw.Seek(0, io.SeekStart)
-	_, serr := vlt.PutNew(sctx, req.MatchID, raw, dl.Size, meta)
-	cancel()
-	if serr != nil {
-		log.Printf("vault: store %d: %v", req.MatchID, serr)
-		state = "store_failed"
+	switch {
+	case !demMagicOK(demPath):
+		log.Printf("parse-valve: download of %d is not a demo (%d bytes), not stored", req.MatchID, dl.Size)
+		state = "not_stored"
+	case held != nil && perr != nil:
+		// the stored copy and the fresh download fail alike: nothing to replace
+		state = "hit"
+	default:
+		meta := h.meta()
+		meta.Container = container
+		if parseExitFailure(ctx, perr) {
+			meta.Bad, meta.BadVer = true, parserVersion
+		}
+		sctx, cancel := storeCtx(ctx)
+		if held != nil {
+			// the stored copy failed where this one parses: it was broken, replace it
+			if err := vlt.MarkCorrupt(sctx, req.MatchID); err != nil {
+				log.Printf("vault: mark corrupt %d: %v", req.MatchID, err)
+			}
+		}
+		raw.Seek(0, io.SeekStart)
+		stored, serr := vlt.PutNew(sctx, req.MatchID, raw, dl.Size, meta)
+		cancel()
+		if serr != nil {
+			log.Printf("vault: store %d: %v", req.MatchID, serr)
+			state = "store_failed"
+		} else if stored && existed {
+			state = "replaced" // PutNew only overwrites an object marked corrupt
+		}
 	}
 
 	if perr != nil {
@@ -219,20 +287,32 @@ func handleParseValveVault(w http.ResponseWriter, r *http.Request, req valveReq,
 	respondParsed(w, out, parseDur, dl.Elapsed, state)
 }
 
-// serveFromVault parses a stored replay and answers; false means it could not
-// be used and the caller should fall back to Valve.
-func serveFromVault(w http.ResponseWriter, r *http.Request, id int64) bool {
+type vaultOutcome int
+
+const (
+	vaultServed      vaultOutcome = iota // the request was answered
+	vaultUnusable                        // could not be read or decoded: ask Valve
+	vaultParseFailed                     // the parser rejected it for the first time under this version: ask Valve once
+)
+
+// serveFromVault parses a stored replay and answers it. Otherwise the caller
+// falls back to Valve: vaultUnusable for bytes that cannot be read or decoded
+// (flagged corrupt when they do not decode, so the clean download replaces
+// them), vaultParseFailed with the parser's error for a replay the parser of
+// this version has not yet been seen to reject (flagged bad now, so the next
+// request does not go back to Valve again).
+func serveFromVault(w http.ResponseWriter, r *http.Request, id int64, have vault.Meta) (vaultOutcome, error) {
 	ctx := r.Context()
 	start := time.Now()
 	rc, _, err := vlt.Open(ctx, id)
 	if err != nil {
 		log.Printf("vault: open %d: %v", id, err)
-		return false
+		return vaultUnusable, nil
 	}
 	tmp, err := os.CreateTemp("", "replay-vault-*")
 	if err != nil {
 		rc.Close()
-		return false
+		return vaultUnusable, nil
 	}
 	defer os.Remove(tmp.Name())
 	_, cerr := io.Copy(tmp, rc)
@@ -241,13 +321,18 @@ func serveFromVault(w http.ResponseWriter, r *http.Request, id int64) bool {
 	if cerr != nil {
 		tmp.Close()
 		log.Printf("vault: read %d: %v", id, cerr)
-		return false
+		return vaultUnusable, nil
 	}
 	demPath, size, err := writeDem(tmp)
 	tmp.Close()
 	if err != nil {
 		log.Printf("vault: stored replay %d does not decode: %v", id, err)
-		return false
+		if errors.Is(err, errDecode) {
+			if merr := vlt.MarkCorrupt(context.WithoutCancel(ctx), id); merr != nil {
+				log.Printf("vault: mark corrupt %d: %v", id, merr)
+			}
+		}
+		return vaultUnusable, nil
 	}
 	defer os.Remove(demPath)
 	dl := time.Since(start)
@@ -256,13 +341,24 @@ func serveFromVault(w http.ResponseWriter, r *http.Request, id int64) bool {
 	out, parseDur, perr := runParser(ctx, demPath)
 	if perr != nil {
 		if parseExitFailure(ctx, perr) {
-			if _, err := vlt.UpdateMeta(context.WithoutCancel(ctx), id, vault.Meta{Bad: true}); err != nil {
+			if have.BadFor(parserVersion) {
+				respondParseFailed(w, perr, "hit")
+				return vaultServed, nil
+			}
+			if err := vlt.MarkBad(context.WithoutCancel(ctx), id, parserVersion); err != nil {
 				log.Printf("vault: flag bad %d: %v", id, err)
 			}
+			return vaultParseFailed, perr
 		}
 		respondParseFailed(w, perr, "hit")
-		return true
+		return vaultServed, nil
+	}
+	if have.Bad {
+		// the parser takes it now: an earlier verdict (an older release) is void
+		if err := vlt.ClearBad(context.WithoutCancel(ctx), id); err != nil {
+			log.Printf("vault: clear bad %d: %v", id, err)
+		}
 	}
 	respondParsed(w, out, parseDur, dl, "hit")
-	return true
+	return vaultServed, nil
 }

@@ -23,11 +23,19 @@ type fakeS3 struct {
 	rejectCopy  bool // refuse a copy onto the same key (the fallback path)
 	sawIfNone   bool
 	sawChecksum bool
+	sawIfMatch  bool
+	seq         int
+}
+
+func (f *fakeS3) nextETag() string {
+	f.seq++
+	return fmt.Sprintf(`"etag-%d"`, f.seq)
 }
 
 type fakeObj struct {
 	data []byte
 	meta map[string]string
+	etag string
 }
 
 func s3Err(w http.ResponseWriter, status int, code string) {
@@ -80,6 +88,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for k, v := range o.meta {
 			w.Header().Set("x-amz-meta-"+k, v)
 		}
+		w.Header().Set("ETag", o.etag)
 		w.Write(o.data)
 	case http.MethodHead:
 		o, ok := f.objs[key]
@@ -90,6 +99,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for k, v := range o.meta {
 			w.Header().Set("x-amz-meta-"+k, v)
 		}
+		w.Header().Set("ETag", o.etag)
 		w.Header().Set("Content-Length", fmt.Sprint(len(o.data)))
 		w.Header().Set("Last-Modified", "Tue, 20 Oct 2026 10:00:00 GMT")
 	case http.MethodPut:
@@ -100,6 +110,12 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				s3Err(w, 404, "NoSuchKey")
 				return
 			}
+			im := r.Header.Get("x-amz-copy-source-if-match")
+			f.sawIfMatch = f.sawIfMatch || im != ""
+			if im != "" && im != so.etag {
+				s3Err(w, 412, "PreconditionFailed")
+				return
+			}
 			if f.rejectCopy && srcKey == key {
 				s3Err(w, 400, "InvalidRequest")
 				return
@@ -108,7 +124,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if strings.EqualFold(r.Header.Get("x-amz-metadata-directive"), "REPLACE") {
 				nm = meta
 			}
-			f.objs[key] = &fakeObj{data: so.data, meta: nm}
+			f.objs[key] = &fakeObj{data: so.data, meta: nm, etag: f.nextETag()}
 			w.Header().Set("Content-Type", "application/xml")
 			io.WriteString(w, `<CopyObjectResult><ETag>"x"</ETag></CopyObjectResult>`)
 			return
@@ -124,7 +140,7 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.Header.Get("x-amz-content-sha256"), "STREAMING") {
 			f.sawChecksum = true
 		}
-		f.objs[key] = &fakeObj{data: b, meta: meta}
+		f.objs[key] = &fakeObj{data: b, meta: meta, etag: f.nextETag()}
 	case http.MethodDelete:
 		delete(f.objs, key)
 		w.WriteHeader(204)
@@ -233,5 +249,39 @@ func TestS3StoreRoundTripAndErrors(t *testing.T) {
 	}
 	if o, _, _ := v.Find(ctx, 7); o.Meta.Kind != KindStudent || o.Meta.Accounts[0] != "9" {
 		t.Fatalf("merged over S3 = %+v", o.Meta)
+	}
+}
+
+func TestS3StoreConditionalMetadataRewrite(t *testing.T) {
+	ctx := context.Background()
+	s, f := newFakeStore(t)
+	s.Put(ctx, "replays/1.dem", bytes.NewReader([]byte("bytes")), 5, PutOpts{Meta: Meta{Kind: KindCoach}.ToS3()})
+	info, err := s.Head(ctx, "replays/1.dem")
+	if err != nil || info.ETag == "" {
+		t.Fatalf("head = %+v %v", info, err)
+	}
+	// somebody else rewrites the metadata after our read: ours is refused
+	if err := s.CopyReplace(ctx, "replays/1.dem", Meta{Kind: KindCoach, Accounts: []string{"3"}}.ToS3()); err != nil {
+		t.Fatal(err)
+	}
+	err = s.CopyReplaceIfMatch(ctx, "replays/1.dem", info.ETag, Meta{Kind: KindStudent}.ToS3())
+	if !errors.Is(err, ErrChanged) || !f.sawIfMatch {
+		t.Fatalf("stale ETag = %v (sent If-Match: %v); want ErrChanged", err, f.sawIfMatch)
+	}
+	cur, _ := s.Head(ctx, "replays/1.dem")
+	if got := MetaFromS3(cur.Meta); got.Kind != KindCoach || got.Accounts[0] != "3" {
+		t.Fatalf("a refused rewrite changed the object: %+v", got)
+	}
+	if err := s.CopyReplaceIfMatch(ctx, "replays/1.dem", cur.ETag, Meta{Kind: KindStudent}.ToS3()); err != nil {
+		t.Fatalf("current ETag: %v", err)
+	}
+	// the temporary-key fallback is conditional on the first copy too
+	f.rejectCopy = true
+	cur, _ = s.Head(ctx, "replays/1.dem")
+	if err := s.CopyReplaceIfMatch(ctx, "replays/1.dem", `"stale"`, Meta{Kind: KindPro}.ToS3()); !errors.Is(err, ErrChanged) {
+		t.Fatalf("fallback with a stale ETag = %v", err)
+	}
+	if err := s.CopyReplaceIfMatch(ctx, "replays/1.dem", cur.ETag, Meta{Kind: KindPro}.ToS3()); err != nil {
+		t.Fatalf("fallback with the current ETag: %v", err)
 	}
 }

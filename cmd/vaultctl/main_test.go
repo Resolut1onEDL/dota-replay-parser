@@ -139,7 +139,7 @@ func TestStatusAndProbeOnTheMemoryStore(t *testing.T) {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	out, err = runCmd(t, v, "probe")
-	if err != nil || strings.Contains(out, "FAIL") || strings.Count(out, "ok ") != 5 {
+	if err != nil || strings.Contains(out, "FAIL") || strings.Count(out, "ok ") != 7 {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	if keys := v.S.(*vault.MemStore).Keys("_vault/probe/"); len(keys) != 0 {
@@ -156,4 +156,111 @@ func TestReadEnvFileOnlyTakesVaultNames(t *testing.T) {
 	if len(readEnvFile("/nonexistent/.env")) != 0 {
 		t.Fatal("missing file must be empty")
 	}
+}
+
+func TestUploadNeverStoresAFileThatIsNotADemo(t *testing.T) {
+	dir := t.TempDir()
+	good := writeFile(t, dir, "good.dem", "PBDEMS2 whole file")
+	html := writeFile(t, dir, "html.dem", "<html>not a replay</html>")
+	zst, _ := hex.DecodeString("28b52ffd2417b90000504244454d53320068656c6c6f2d64656d6f2d626f64794c58d1ad")
+	cut := writeFile(t, dir, "cut.dem", string(zst[:len(zst)-9])) // a download that stopped early
+	m := writeFile(t, dir, "m.csv", fmt.Sprintf("201,student,60,7,%s\n202,student,60,7,%s\n203,pro,60,,%s\n", good, html, cut))
+	v := vault.New(vault.NewMemStore())
+	out, err := runCmd(t, v, "upload", "--manifest", m, "--dry-run")
+	if err == nil || !strings.Contains(out, "invalid=2") || !strings.Contains(out, "would-upload=1") {
+		t.Fatalf("dry run: %v\n%s", err, out)
+	}
+	out, err = runCmd(t, v, "upload", "--manifest", m)
+	if err == nil || !strings.Contains(out, "invalid=2") || !strings.Contains(out, "uploaded=1") {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	ids, _ := v.ListIDs(context.Background())
+	if len(ids) != 1 || ids[0] != 201 {
+		t.Fatalf("stored %v; only the whole file may be stored", ids)
+	}
+	// the truncated file was never kept, so the real one can still go in later
+	os.WriteFile(cut, zst, 0600)
+	if out, err = runCmd(t, v, "upload", "--manifest", m); err == nil || !strings.Contains(out, "uploaded=1") {
+		t.Fatalf("rerun: %v\n%s", err, out)
+	}
+	if ok, _ := v.Exists(context.Background(), vault.ReplayKey(203)); !ok {
+		t.Fatal("the complete file was not stored")
+	}
+}
+
+func TestUploadReplacesAnObjectMarkedCorrupt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := writeFile(t, dir, "a.dem", "PBDEMS2 whole file")
+	m := writeFile(t, dir, "m.csv", fmt.Sprintf("301,student,60,7,%s\n", a))
+	v := vault.New(vault.NewMemStore())
+	v.PutNew(ctx, 301, strings.NewReader("junk"), 4, vault.Meta{Kind: vault.KindCoach, SHA256: "deadbeefdeadbeef"})
+	v.MarkCorrupt(ctx, 301)
+	out, err := runCmd(t, v, "upload", "--manifest", m)
+	if err != nil || !strings.Contains(out, "uploaded=1") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	o, _, _ := v.Find(ctx, 301)
+	if o.Info.Size != int64(len("PBDEMS2 whole file")) || o.Meta.Corrupt || o.Meta.Kind != vault.KindStudent {
+		t.Fatalf("after replace = %+v size %d", o.Meta, o.Info.Size)
+	}
+}
+
+func TestPurgeStudentKeepsAGameThatIsAlsoProOrLadder(t *testing.T) {
+	ctx := context.Background()
+	v := vault.New(vault.NewMemStore())
+	// a pro game a student also asked for: the student kind absorbed the pro claim
+	v.PutNew(ctx, 1, strings.NewReader("PBDEMS2"), 7, vault.Meta{Kind: vault.KindPro, Patch: "60"})
+	v.UpdateMeta(ctx, 1, vault.Meta{Kind: vault.KindStudent, Accounts: []string{"111"}})
+	v.PutNew(ctx, 2, strings.NewReader("PBDEMS2"), 7, vault.Meta{Kind: vault.KindStudent, Accounts: []string{"111"}})
+	out, err := runCmd(t, v, "purge-student", "--account", "111", "--apply")
+	if err != nil || !strings.Contains(out, "delete 2") || !strings.Contains(out, "detach 1 (still kept as pro)") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	o, ok, _ := v.Find(ctx, 1)
+	if !ok || o.Meta.Kind != vault.KindPro || len(o.Meta.Accounts) != 0 || len(o.Meta.Also) != 0 {
+		t.Fatalf("the pro game = %+v ok=%v", o.Meta, ok)
+	}
+	if ok, _ := v.Exists(ctx, vault.ReplayKey(2)); ok {
+		t.Fatal("the student-only game must go")
+	}
+}
+
+func TestPurgeStudentDoesNotDeleteAGameAnotherStudentClaimedMeanwhile(t *testing.T) {
+	ctx := context.Background()
+	mem := vault.NewMemStore()
+	v := vault.New(mem)
+	v.PutNew(ctx, 1, strings.NewReader("PBDEMS2"), 7, vault.Meta{Kind: vault.KindStudent, Accounts: []string{"111"}})
+	// the delete would go ahead on the listing alone; another student claims the game just before it
+	claimed := false
+	orig := v.S
+	v.S = &claimOnHead{Store: orig, onSecondHead: func() {
+		if !claimed {
+			claimed = true
+			v.UpdateMeta(ctx, 1, vault.Meta{Kind: vault.KindStudent, Accounts: []string{"222"}})
+		}
+	}}
+	out, err := runCmd(t, v, "purge-student", "--account", "111", "--apply")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := vault.New(mem).Exists(ctx, vault.ReplayKey(1)); !ok {
+		t.Fatalf("a game another student claimed was deleted:\n%s", out)
+	}
+}
+
+type claimOnHead struct {
+	vault.Store
+	heads        int
+	onSecondHead func()
+}
+
+func (c *claimOnHead) Head(ctx context.Context, key string) (vault.ObjectInfo, error) {
+	if key == vault.ReplayKey(1) {
+		c.heads++
+		if c.heads == 2 {
+			c.onSecondHead()
+		}
+	}
+	return c.Store.Head(ctx, key)
 }

@@ -12,12 +12,16 @@ var (
 	ErrNotFound = errors.New("vault: not found")
 	// ErrExists: a conditional create found the key already there.
 	ErrExists = errors.New("vault: already exists")
+	// ErrChanged: a conditional metadata rewrite found the object changed
+	// since it was read (HTTP 412).
+	ErrChanged = errors.New("vault: object changed")
 )
 
 // ObjectInfo describes one stored object.
 type ObjectInfo struct {
 	Key          string
 	Size         int64
+	ETag         string            // as the store reported it; "" when it does not
 	Meta         map[string]string // lowercase user metadata; empty from List
 	LastModified time.Time
 }
@@ -36,6 +40,10 @@ type Store interface {
 	Put(ctx context.Context, key string, body io.ReadSeeker, size int64, opts PutOpts) error
 	// CopyReplace rewrites the metadata of an existing key in place.
 	CopyReplace(ctx context.Context, key string, meta map[string]string) error
+	// CopyReplaceIfMatch is CopyReplace that only applies if the object still
+	// has the ETag it was read with (ErrChanged otherwise). An empty etag
+	// means the store gave none and the rewrite is unconditional.
+	CopyReplaceIfMatch(ctx context.Context, key, etag string, meta map[string]string) error
 	Delete(ctx context.Context, key string) error
 	// List calls fn for every key under prefix (no metadata).
 	List(ctx context.Context, prefix string, fn func(ObjectInfo) error) error

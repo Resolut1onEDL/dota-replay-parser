@@ -18,6 +18,9 @@ const (
 	KindCoach   Kind = "coach"
 	KindAudit   Kind = "audit"
 	KindCamp    Kind = "camp"
+	// KindUnknown is what an object without a readable kind reads as: it is
+	// kept (retention never touches it) and not re-parsed until a hint names a kind.
+	KindUnknown Kind = "unknown"
 )
 
 var allKinds = []Kind{KindStudent, KindPro, KindLadder, KindCoach, KindAudit, KindCamp}
@@ -38,18 +41,27 @@ func ParseKind(s string) (Kind, bool) {
 }
 
 // Class decides conflicts when the same match is stored for two reasons:
-// the higher class wins (student > audit,camp > pro,ladder,coach).
+// the higher class wins (student > audit,camp > pro,ladder > coach). Coach is
+// the only deletable-by-default kind, so a pro or ladder hint must always beat
+// it: on a tie the first kind stays, and a coach copy would otherwise shed the
+// pro/ladder protection.
 func (k Kind) Class() int {
 	switch k {
 	case KindStudent:
-		return 3
+		return 4
 	case KindAudit, KindCamp:
+		return 3
+	case KindPro, KindLadder:
 		return 2
-	case KindPro, KindLadder, KindCoach:
+	case KindCoach:
 		return 1
 	}
 	return 0
 }
+
+// Protected: a kind whose membership must survive a merge into a higher kind
+// (everything but a plain coach analysis).
+func (k Kind) Protected() bool { return k.Class() > KindCoach.Class() }
 
 // ReparseOrder is the order a re-parse works through kinds: pages first
 // (students, pros, medals), coach games after. Audit is never re-parsed.
@@ -79,4 +91,16 @@ func (k Kind) DeliveryMode() string {
 		return "storage"
 	}
 	return "ingest"
+}
+
+// HighestKind is the kind of the highest class among ks (the first on a tie);
+// an empty list gives coach, the kind nobody protects.
+func HighestKind(ks []Kind) Kind {
+	best := KindCoach
+	for i, k := range ks {
+		if i == 0 || k.Class() > best.Class() {
+			best = k
+		}
+	}
+	return best
 }

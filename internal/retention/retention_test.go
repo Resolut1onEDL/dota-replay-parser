@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -200,4 +201,77 @@ func TestSemverLess(t *testing.T) {
 		}
 	}
 	_ = fmt.Sprint
+}
+
+// raceStore lets a test change an object between retention's first look at it
+// (the listing HEAD) and the second look right before the delete.
+type raceStore struct {
+	vault.Store
+	mu        sync.Mutex
+	heads     map[string]int
+	onRecheck func(key string)
+}
+
+func (r *raceStore) Head(ctx context.Context, key string) (vault.ObjectInfo, error) {
+	r.mu.Lock()
+	r.heads[key]++
+	second := r.heads[key] == 2
+	r.mu.Unlock()
+	if second && r.onRecheck != nil {
+		r.onRecheck(key)
+	}
+	return r.Store.Head(ctx, key)
+}
+
+func TestDeleteRechecksTheObjectAfterTheListing(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	rs := &raceStore{Store: e.mem, heads: map[string]int{}}
+	e.v = vault.New(rs)
+	e.recent(t, 40)
+	e.put(t, 1, vault.KindCoach, "58") // upgraded to a student game after the listing
+	e.put(t, 2, vault.KindCoach, "58") // untouched: goes
+	e.put(t, 3, vault.KindCoach, "58") // re-dated to the current patch after the listing
+	rs.onRecheck = func(key string) {
+		switch key {
+		case vault.ReplayKey(1):
+			e.mem.CopyReplace(ctx, key, vault.Meta{Kind: vault.KindStudent, Patch: "58", Accounts: []string{"7"}}.ToS3())
+		case vault.ReplayKey(3):
+			e.mem.CopyReplace(ctx, key, vault.Meta{Kind: vault.KindCoach, Patch: "60"}.ToS3())
+		}
+	}
+	rep, err := Run(ctx, e.v, e.cfg(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Deleted != 1 || rep.ChangedSkip != 2 || !e.has(1) || e.has(2) || !e.has(3) {
+		t.Fatalf("report = %+v 1=%v 2=%v 3=%v", rep, e.has(1), e.has(2), e.has(3))
+	}
+}
+
+func TestAnUnreadableKindIsKept(t *testing.T) {
+	e := setup(t)
+	ctx := context.Background()
+	e.recent(t, 40)
+	e.put(t, 1, vault.KindCoach, "58")
+	// an object without a kind (put by hand): it reads as unknown, not as a deletable coach game
+	e.mem.CopyReplace(ctx, vault.ReplayKey(1), map[string]string{"patch": "58"})
+	rep, _ := Run(ctx, e.v, e.cfg(true))
+	if rep.Deleted != 0 || !e.has(1) {
+		t.Fatalf("report = %+v", rep)
+	}
+}
+
+func TestACoachCopyOfAProGameCannotShedItsProtection(t *testing.T) {
+	e := setup(t)
+	e.recent(t, 40)
+	e.pins = []int64{1}
+	e.put(t, 1, vault.KindCoach, "58") // stored first by a hint-less /parse-valve call
+	if _, err := e.v.UpdateMeta(context.Background(), 1, vault.Meta{Kind: vault.KindPro}); err != nil {
+		t.Fatal(err)
+	}
+	rep, _ := Run(context.Background(), e.v, e.cfg(true))
+	if rep.Deleted != 0 || rep.PinnedPro != 1 || !e.has(1) {
+		t.Fatalf("a pinned pro game was deleted: %+v", rep)
+	}
 }

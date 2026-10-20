@@ -27,7 +27,8 @@ const zstDemoHex = "28b52ffd2417b90000504244454d53320068656c6c6f2d64656d6f2d626f
 // valveFake answers Valve GETs from a table by match id and counts them.
 type valveFake struct {
 	mu     sync.Mutex
-	status map[int64]int // default 200 with the zstd demo
+	status map[int64]int    // default 200 with the zstd demo
+	body   map[int64][]byte // a different 200 body for a match
 	hits   atomic.Int32
 }
 
@@ -43,6 +44,11 @@ func (v *valveFake) RoundTrip(r *http.Request) (*http.Response, error) {
 		code = 200
 	}
 	body, _ := hex.DecodeString(zstDemoHex)
+	v.mu.Lock()
+	if b, ok := v.body[id]; ok {
+		body = b
+	}
+	v.mu.Unlock()
 	if code != 200 {
 		body = nil
 	}
@@ -198,10 +204,136 @@ func TestParseValveStoreFailureNeverFailsTheParse(t *testing.T) {
 
 func TestParseValveUndecodableStoredObjectFallsBackToValve(t *testing.T) {
 	mem, vf := vaultSetup(t)
-	mem.Put(context.Background(), vault.ReplayKey(123), strings.NewReader("BZh not really bzip2"), 20, vault.PutOpts{Meta: vault.Meta{Kind: vault.KindCoach}.ToS3()})
+	ctx := context.Background()
+	mem.Put(ctx, vault.ReplayKey(123), strings.NewReader("BZh not really bzip2"), 20,
+		vault.PutOpts{Meta: vault.Meta{Kind: vault.KindPro, Patch: "60", Accounts: []string{"5"}}.ToS3()})
+	w := postValve(body123, map[string]string{"X-Vault-Account": "6"})
+	if w.Code != 200 || vf.hits.Load() != 1 || w.Header().Get("X-Vault") != "replaced" {
+		t.Fatalf("fallback: %d X-Vault=%q valve hits %d", w.Code, w.Header().Get("X-Vault"), vf.hits.Load())
+	}
+	// the broken object is healed, not left to fail every later call
+	o, _, _ := vlt.Find(ctx, 123)
+	rc, _, _ := vlt.Open(ctx, 123)
+	got, _ := io.ReadAll(rc)
+	if hex.EncodeToString(got) != zstDemoHex || o.Meta.Corrupt || o.Meta.Bad || o.Meta.Container != vault.ContainerZst ||
+		o.Meta.Kind != vault.KindPro || o.Meta.Patch != "60" || strings.Join(o.Meta.Accounts, ",") != "5,6" {
+		t.Fatalf("healed object = %+v (%d bytes)", o.Meta, len(got))
+	}
+	w = postValve(body123, nil)
+	if w.Code != 200 || w.Header().Get("X-Vault") != "hit" || vf.hits.Load() != 1 {
+		t.Fatalf("after healing: %d X-Vault=%q valve hits %d", w.Code, w.Header().Get("X-Vault"), vf.hits.Load())
+	}
+}
+
+// Valve answering 200 with something that is not a replay (an error page, a
+// stream that is not a demo) must never be kept under the replay's key: the
+// real replay could not be stored there afterwards.
+func TestParseValveNeverStoresADownloadThatIsNotADemo(t *testing.T) {
+	_, vf := vaultSetup(t)
+	vf.body = map[int64][]byte{123: []byte("<html>502 Bad Gateway</html>")}
+	writeParser(t, "echo not a replay >&2; exit 1")
 	w := postValve(body123, nil)
-	if w.Code != 200 || vf.hits.Load() != 1 {
-		t.Fatalf("fallback: %d valve hits %d", w.Code, vf.hits.Load())
+	if w.Code != http.StatusUnprocessableEntity || w.Header().Get("X-Vault") != "not_stored" {
+		t.Fatalf("html 200: %d X-Vault=%q", w.Code, w.Header().Get("X-Vault"))
+	}
+	if ids, _ := vlt.ListIDs(context.Background()); len(ids) != 0 {
+		t.Fatalf("stored %v", ids)
+	}
+	// a body that decodes as bzip2/zstd to something other than a demo is no better
+	vf.body[124] = []byte("BZh not really bzip2")
+	if w = postValve(`{"match_id":124,"cluster":1,"salt":456}`, nil); w.Code != http.StatusBadGateway {
+		t.Fatalf("broken bzip2 = %d", w.Code)
+	}
+	if ids, _ := vlt.ListIDs(context.Background()); len(ids) != 0 {
+		t.Fatalf("stored %v", ids)
+	}
+	// the real replay can still be stored afterwards
+	delete(vf.body, 123)
+	writeParser(t, `printf '{"match_id":123}'`)
+	if w = postValve(body123, nil); w.Code != 200 || w.Header().Get("X-Vault") != "stored" {
+		t.Fatalf("real replay: %d X-Vault=%q", w.Code, w.Header().Get("X-Vault"))
+	}
+}
+
+const parserFailsOnBroken = `grep -q broken "$1" && { echo rejected >&2; exit 1; }; printf '{"match_id":123}'`
+
+// A stored replay the parser rejects, not yet seen to do so under this
+// version, may be the vault's fault: Valve is asked once and a clean copy that
+// parses replaces it.
+func TestParseValveHitThatFailsToParseFallsBackToValveOnce(t *testing.T) {
+	mem, vf := vaultSetup(t)
+	ctx := context.Background()
+	writeParser(t, parserFailsOnBroken)
+	mem.Put(ctx, vault.ReplayKey(123), strings.NewReader("PBDEMS2 broken"), 14,
+		vault.PutOpts{Meta: vault.Meta{Kind: vault.KindStudent, Accounts: []string{"5"}, Bad: true, BadVer: "0.0.1"}.ToS3()})
+	w := postValve(body123, nil)
+	if w.Code != 200 || vf.hits.Load() != 1 || w.Header().Get("X-Vault") != "replaced" {
+		t.Fatalf("fallback: %d X-Vault=%q valve hits %d", w.Code, w.Header().Get("X-Vault"), vf.hits.Load())
+	}
+	o, _, _ := vlt.Find(ctx, 123)
+	rc, _, _ := vlt.Open(ctx, 123)
+	got, _ := io.ReadAll(rc)
+	if hex.EncodeToString(got) != zstDemoHex || o.Meta.Bad || o.Meta.Corrupt || o.Meta.Kind != vault.KindStudent {
+		t.Fatalf("replaced object = %+v (%d bytes)", o.Meta, len(got))
+	}
+}
+
+func TestParseValveHitThatKeepsFailingDoesNotGoBackToValve(t *testing.T) {
+	mem, vf := vaultSetup(t)
+	ctx := context.Background()
+	writeParser(t, "exit 1")
+	vf.status[123] = 404 // the replay has expired at Valve
+	mem.Put(ctx, vault.ReplayKey(123), strings.NewReader("PBDEMS2 x"), 9, vault.PutOpts{Meta: vault.Meta{Kind: vault.KindCoach}.ToS3()})
+	w := postValve(body123, nil)
+	if w.Code != http.StatusUnprocessableEntity || w.Header().Get("X-Vault") != "hit" || vf.hits.Load() != 1 {
+		t.Fatalf("first: %d X-Vault=%q valve hits %d", w.Code, w.Header().Get("X-Vault"), vf.hits.Load())
+	}
+	if o, _, _ := vlt.Find(ctx, 123); !o.Meta.BadFor(parserVersion) {
+		t.Fatalf("the verdict was not recorded: %+v", o.Meta)
+	}
+	// flagged for this version: answered from the vault, Valve left alone
+	w = postValve(body123, nil)
+	if w.Code != http.StatusUnprocessableEntity || w.Header().Get("X-Vault") != "hit" || vf.hits.Load() != 1 {
+		t.Fatalf("second: %d X-Vault=%q valve hits %d", w.Code, w.Header().Get("X-Vault"), vf.hits.Load())
+	}
+	// Valve having the replay again but the parser failing on it as well: nothing is replaced
+	delete(vf.status, 123)
+	mem.CopyReplace(ctx, vault.ReplayKey(123), vault.Meta{Kind: vault.KindCoach}.ToS3())
+	w = postValve(body123, nil)
+	rc, _, _ := vlt.Open(ctx, 123)
+	got, _ := io.ReadAll(rc)
+	if w.Code != http.StatusUnprocessableEntity || string(got) != "PBDEMS2 x" {
+		t.Fatalf("both fail: %d, stored %q", w.Code, got)
+	}
+}
+
+func TestParseValveSuccessfulHitVoidsAnOlderVerdict(t *testing.T) {
+	mem, _ := vaultSetup(t)
+	ctx := context.Background()
+	mem.Put(ctx, vault.ReplayKey(123), strings.NewReader("PBDEMS2 fine"), 12,
+		vault.PutOpts{Meta: vault.Meta{Kind: vault.KindCoach, Bad: true, BadVer: "0.0.1"}.ToS3()})
+	if w := postValve(body123, nil); w.Code != 200 || w.Header().Get("X-Vault") != "hit" {
+		t.Fatalf("%d X-Vault=%q", w.Code, w.Header().Get("X-Vault"))
+	}
+	if o, _, _ := vlt.Find(ctx, 123); o.Meta.Bad {
+		t.Fatalf("an old verdict outlived a good parse: %+v", o.Meta)
+	}
+}
+
+func TestEmptyBodyHintsDoNotWipeHeaderHints(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/parse-valve", nil)
+	req.Header.Set("X-Vault-Kind", "student")
+	req.Header.Set("X-Vault-Account", "4242")
+	req.Header.Set("X-Vault-Patch", "60")
+	req.Header.Set("X-Vault-Source", "autoparse")
+	h, ok := parseVaultHints(req, []byte(`{"match_id":1,"kind":"","account":"","accounts":[],"patch":"  ","source":""}`))
+	if !ok || h.Kind != vault.KindStudent || strings.Join(h.Accounts, ",") != "4242" || h.Patch != "60" || h.Source != "autoparse" {
+		t.Fatalf("hints = %+v ok=%v", h, ok)
+	}
+	// a body that does name something still wins
+	h, _ = parseVaultHints(req, []byte(`{"kind":"pro","account":"7"}`))
+	if h.Kind != vault.KindPro || strings.Join(h.Accounts, ",") != "7" {
+		t.Fatalf("body hints = %+v", h)
 	}
 }
 
@@ -219,8 +351,24 @@ func TestVaultOffLeavesParseValveAsItWas(t *testing.T) {
 	}
 }
 
-func TestParserChildSeesNoSecrets(t *testing.T) {
+// The vault being off, the parser child gets the environment it always did.
+func TestVaultOffLeavesTheParserEnvironmentAlone(t *testing.T) {
 	lifecycleSetup(t, 1)
+	old := vlt
+	vlt = nil
+	t.Cleanup(func() { vlt = old })
+	t.Setenv("PARSER_TEST_MARKER", "inherited")
+	writeParser(t, `printf '{"marker":"%s"}' "$PARSER_TEST_MARKER"`)
+	dem := filepath.Join(t.TempDir(), "x.dem")
+	os.WriteFile(dem, []byte("PBDEMS2"), 0600)
+	out, _, err := runParser(context.Background(), dem)
+	if err != nil || string(out) != `{"marker":"inherited"}` {
+		t.Fatalf("out=%s err=%v", out, err)
+	}
+}
+
+func TestParserChildSeesNoSecrets(t *testing.T) {
+	vaultSetup(t)
 	for k, v := range map[string]string{"AWS_SECRET_ACCESS_KEY": "topsecret-aws", "PARSE_TOKEN": "topsecret-parse",
 		"VAULT_FLY_TOKEN": "topsecret-fly", "GH_DISPATCH_TOKEN": "topsecret-gh", "VAULT_SERVICE_TOKEN": "topsecret-svc"} {
 		t.Setenv(k, v)
@@ -368,6 +516,53 @@ func TestVaultReparseRouteStartsMachinesAndMaintain(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &sum)
 	if !sum.AlreadyRunning || len(fm.created) != 2 {
 		t.Fatalf("second call: %s created=%d", w.Body.String(), len(fm.created))
+	}
+}
+
+func TestVaultReparseCapsTheMachineCountAtTheConfiguredMaximum(t *testing.T) {
+	vaultSetup(t)
+	token = "secret"
+	for i := int64(1); i <= 500; i++ {
+		vlt.PutNew(context.Background(), i, strings.NewReader("PBDEMS2"), 7, vault.Meta{Kind: vault.KindStudent})
+	}
+	fm := &routeMachines{}
+	machines = fm
+	w := call(handleVaultReparse, "POST", `{"machines":500}`, "secret")
+	var sum reparse.Summary
+	json.Unmarshal(w.Body.Bytes(), &sum)
+	if w.Code != 200 || sum.Machines != vaultCfg.MaxMachines || len(sum.Started) != vaultCfg.MaxMachines {
+		t.Fatalf("machines=500 started %d (cap %d): %s", len(sum.Started), vaultCfg.MaxMachines, w.Body.String())
+	}
+}
+
+func TestVaultReparseMaintainOnlyStartsNoRun(t *testing.T) {
+	vaultSetup(t)
+	token = "secret"
+	for i := int64(1); i <= 3; i++ {
+		vlt.PutNew(context.Background(), i, strings.NewReader("PBDEMS2"), 7, vault.Meta{Kind: vault.KindStudent})
+	}
+	fm := &routeMachines{}
+	machines = fm
+	w := call(handleVaultReparse, "POST", `{"maintain_only":true}`, "secret")
+	var sum reparse.Summary
+	json.Unmarshal(w.Body.Bytes(), &sum)
+	if w.Code != 200 || sum.Maintain != "created" || len(fm.created) != 1 || fm.created[0].Config.Metadata["role"] != "maintain" {
+		t.Fatalf("maintain only: %d %s created=%d", w.Code, w.Body.String(), len(fm.created))
+	}
+	if ok, _ := vlt.Exists(context.Background(), vault.PlanKey("4.15.1")); ok {
+		t.Fatal("maintain_only planned a run")
+	}
+	// the maintain machine follows a changed env on the next release
+	vaultCfg.Passthrough = map[string]string{"RETENTION_APPLY": "1"}
+	fm.list[0].Config.Env = fm.created[0].Config.Env
+	w = call(handleVaultReparse, "POST", `{"maintain_only":true}`, "secret")
+	json.Unmarshal(w.Body.Bytes(), &sum)
+	if sum.Maintain != "image_updated" {
+		t.Fatalf("env change: %s", w.Body.String())
+	}
+	machines = nil
+	if w = call(handleVaultReparse, "POST", `{"maintain_only":true}`, "secret"); w.Code != 503 {
+		t.Fatalf("no Fly token = %d", w.Code)
 	}
 }
 

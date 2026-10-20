@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +22,8 @@ const (
 	runsPrefix    = "_vault/runs/"
 	valvelogPref  = "_vault/valvelog/"
 	retentionPref = "_vault/retention/"
+	failedPrefix  = "_vault/failed/"
+	finalPrefix   = "_vault/final/"
 )
 
 // ReplayKey is the object key of a match.
@@ -43,6 +47,34 @@ func RetentionKey(date string) string     { return retentionPref + date + ".json
 func ValvelogPrefix(day string) string    { return valvelogPref + day + "/" }
 func RunsPrefix(ver string) string        { return runsPrefix + ver + "/" }
 func DoneRoot() string                    { return donePrefix }
+func LockKey(ver string) string           { return runsPrefix + ver + "/lock" }
+
+// FailKey holds the failure count of one replay for one parser version.
+func FailKey(ver string, id int64) string {
+	return failedPrefix + ver + "/" + strconv.FormatInt(id, 10)
+}
+
+// FinalPrefix indexes the final failures of a version by error:
+// _vault/final/<ver>/<error>/<id>. It exists so a status call counts them with
+// one LIST instead of reading every done marker.
+func FinalPrefix(ver string) string { return finalPrefix + ver + "/" }
+
+var errSlugRe = regexp.MustCompile(`[^a-z0-9_]+`)
+
+func errSlug(e string) string {
+	s := strings.Trim(errSlugRe.ReplaceAllString(strings.ToLower(e), "_"), "_")
+	if s == "" {
+		return "unknown"
+	}
+	if len(s) > 40 {
+		s = s[:40]
+	}
+	return s
+}
+
+func FinalKey(ver, errMsg string, id int64) string {
+	return FinalPrefix(ver) + errSlug(errMsg) + "/" + strconv.FormatInt(id, 10)
+}
 
 // Object is a stored replay with its parsed metadata.
 type Object struct {
@@ -79,26 +111,74 @@ func (v *Vault) Open(ctx context.Context, id int64) (io.ReadCloser, Meta, error)
 	return rc, MetaFromS3(info.Meta), nil
 }
 
+// MutateMeta is a read-modify-write of a replay's metadata that cannot lose a
+// concurrent update: the rewrite is conditional on the ETag that was read, and
+// a 412 starts over from a fresh read. fn gets the stored metadata and returns
+// the wanted one; nothing is written when they are equal.
+func (v *Vault) MutateMeta(ctx context.Context, id int64, fn func(Meta) Meta) (Meta, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		o, ok, err := v.Find(ctx, id)
+		if err != nil {
+			return Meta{}, err
+		}
+		if !ok {
+			return Meta{}, ErrNotFound
+		}
+		next := fn(o.Meta)
+		if equalMeta(o.Meta, next) {
+			return next, nil
+		}
+		err = v.S.CopyReplaceIfMatch(ctx, ReplayKey(id), o.Info.ETag, next.ToS3())
+		if errors.Is(err, ErrChanged) {
+			continue
+		}
+		return next, err
+	}
+	return Meta{}, fmt.Errorf("vault: metadata of %d kept changing", id)
+}
+
 // UpdateMeta merges want into the stored metadata and rewrites it only when
-// something changed (read-modify-write; the merge is monotone, so a lost race
-// only delays a union).
+// something changed.
 func (v *Vault) UpdateMeta(ctx context.Context, id int64, want Meta) (Meta, error) {
-	o, ok, err := v.Find(ctx, id)
-	if err != nil {
-		return Meta{}, err
-	}
-	if !ok {
-		return Meta{}, ErrNotFound
-	}
-	merged, changed := Merge(o.Meta, want)
-	if !changed {
-		return merged, nil
-	}
-	return merged, v.S.CopyReplace(ctx, ReplayKey(id), merged.ToS3())
+	return v.MutateMeta(ctx, id, func(have Meta) Meta {
+		merged, _ := Merge(have, want)
+		return merged
+	})
+}
+
+// MarkBad flags a replay the parser of version ver rejected.
+func (v *Vault) MarkBad(ctx context.Context, id int64, ver string) error {
+	_, err := v.MutateMeta(ctx, id, func(m Meta) Meta {
+		m.Bad, m.BadVer = true, ver
+		return m
+	})
+	return err
+}
+
+// ClearBad removes the bad flag after a successful parse.
+func (v *Vault) ClearBad(ctx context.Context, id int64) error {
+	_, err := v.MutateMeta(ctx, id, func(m Meta) Meta {
+		m.Bad, m.BadVer = false, ""
+		return m
+	})
+	return err
+}
+
+// MarkCorrupt flags stored bytes that do not decode, so that the next clean
+// download replaces them.
+func (v *Vault) MarkCorrupt(ctx context.Context, id int64) error {
+	_, err := v.MutateMeta(ctx, id, func(m Meta) Meta {
+		m.Corrupt = true
+		return m
+	})
+	return err
 }
 
 // PutNew stores the bytes under the match key if it is free. When the key is
-// taken the metadata is merged instead and stored=false.
+// taken the metadata is merged instead and stored=false — unless the stored
+// object is marked corrupt, which the new bytes replace (stored=true, the
+// kind, accounts and patch carried over, the bad and corrupt flags dropped).
+// Callers pass bytes they have verified (see Verify).
 func (v *Vault) PutNew(ctx context.Context, id int64, body io.ReadSeeker, size int64, m Meta) (stored bool, err error) {
 	if m.StoredAt == "" {
 		m.StoredAt = Now().Format(time.RFC3339)
@@ -108,6 +188,21 @@ func (v *Vault) PutNew(ctx context.Context, id int64, body io.ReadSeeker, size i
 	}
 	err = v.S.Put(ctx, ReplayKey(id), body, size, PutOpts{Meta: m.ToS3(), IfNoneMatch: true, ContentType: "application/octet-stream"})
 	if errors.Is(err, ErrExists) {
+		o, ok, ferr := v.Find(ctx, id)
+		if ferr != nil {
+			return false, ferr
+		}
+		if ok && o.Meta.Corrupt {
+			base := o.Meta
+			base.Corrupt, base.Bad, base.BadVer = false, false, ""
+			base.Container, base.StoredAt, base.SHA256 = "", "", ""
+			merged, _ := Merge(base, m)
+			if _, serr := body.Seek(0, io.SeekStart); serr != nil {
+				return false, serr
+			}
+			err = v.S.Put(ctx, ReplayKey(id), body, size, PutOpts{Meta: merged.ToS3(), ContentType: "application/octet-stream"})
+			return err == nil, err
+		}
 		_, merr := v.UpdateMeta(ctx, id, m)
 		return false, merr
 	}
@@ -228,7 +323,53 @@ func (v *Vault) WriteDone(ctx context.Context, ver string, id int64, d Done) err
 	if d.At == "" {
 		d.At = Now().Format(time.RFC3339)
 	}
-	return v.PutJSON(ctx, DoneKey(ver, id), d)
+	if err := v.PutJSON(ctx, DoneKey(ver, id), d); err != nil {
+		return err
+	}
+	if d.Final && !d.OK {
+		// the index is for the status page only: its loss must not undo the marker
+		if err := v.PutJSON(ctx, FinalKey(ver, d.Error, id), map[string]string{"at": d.At}); err != nil {
+			log.Printf("vault: final-failure index %d: %v", id, err)
+		}
+	}
+	return nil
+}
+
+// FinalFailures counts the replays of ver whose final marker is a failure,
+// by error ("parse_failed", "web_413", "too_large", ...).
+func (v *Vault) FinalFailures(ctx context.Context, ver string) (map[string]int, error) {
+	out := map[string]int{}
+	prefix := FinalPrefix(ver)
+	err := v.S.List(ctx, prefix, func(o ObjectInfo) error {
+		if slug, _, ok := strings.Cut(strings.TrimPrefix(o.Key, prefix), "/"); ok {
+			out[slug]++
+		}
+		return nil
+	})
+	return out, err
+}
+
+// Failure is the running count of non-final failures of one replay.
+type Failure struct {
+	N     int    `json:"n"`
+	Error string `json:"error,omitempty"`
+	At    string `json:"at"`
+}
+
+// BumpFailure records one more failed attempt at a replay and returns the new
+// count. Only the worker that owns the replay's shard calls it, so the
+// read-then-write needs no condition.
+func (v *Vault) BumpFailure(ctx context.Context, ver string, id int64, errMsg string) (int, error) {
+	var f Failure
+	if _, err := v.GetJSON(ctx, FailKey(ver, id), &f); err != nil {
+		return 0, err
+	}
+	f.N++
+	if len(errMsg) > 200 {
+		errMsg = errMsg[:200]
+	}
+	f.Error, f.At = errMsg, Now().Format(time.RFC3339)
+	return f.N, v.PutJSON(ctx, FailKey(ver, id), f)
 }
 
 func (v *Vault) ReadDone(ctx context.Context, ver string, id int64) (Done, bool, error) {

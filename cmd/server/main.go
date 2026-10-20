@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -97,6 +98,8 @@ func authed(r *http.Request) bool {
 // analyses silently fell back to OpenDota stats). Old bzip2 replays are still
 // served for older matches, so BOTH must work — sniff, never trust the URL.
 func writeDem(src io.Reader) (string, int64, error) {
+	var track trackErr
+	src = trackReader{src, &track}
 	head := make([]byte, 4)
 	n, err := io.ReadFull(src, head)
 	if err != nil && n == 0 {
@@ -124,7 +127,7 @@ func writeDem(src io.Reader) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	written, err := io.Copy(f, full)
+	written, err := decodeInto(f, full, &track)
 	closeErr := f.Close()
 	if err != nil {
 		os.Remove(f.Name())
@@ -135,6 +138,69 @@ func writeDem(src io.Reader) (string, int64, error) {
 		return "", 0, closeErr
 	}
 	return f.Name(), written, nil
+}
+
+// errDecode marks a replay whose bytes do not decode (a truncated or garbled
+// bzip2/zstd stream). A failure to read the source or to write the temp file
+// (a full disk) is not one: it says nothing about the replay.
+var errDecode = errors.New("replay does not decode")
+
+// trackErr remembers the first real I/O error seen on the source or the
+// destination. The zstd decoder reads its source from its own goroutines, so
+// it is locked.
+type trackErr struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (t *trackErr) note(err error) error {
+	if err != nil && err != io.EOF {
+		t.mu.Lock()
+		if t.err == nil {
+			t.err = err
+		}
+		t.mu.Unlock()
+	}
+	return err
+}
+
+func (t *trackErr) first() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.err
+}
+
+type trackReader struct {
+	r io.Reader
+	t *trackErr
+}
+
+func (r trackReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.t.note(err)
+	return n, err
+}
+
+type trackWriter struct {
+	w io.Writer
+	t *trackErr
+}
+
+func (w trackWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	w.t.note(err)
+	return n, err
+}
+
+// decodeInto copies the decoded stream to dst. An error that comes from the
+// decoder itself is wrapped in errDecode; one that comes from reading src or
+// writing dst is returned as it is.
+func decodeInto(dst io.Writer, decoded io.Reader, t *trackErr) (int64, error) {
+	n, err := io.Copy(trackWriter{dst, t}, decoded)
+	if err != nil && t.first() == nil {
+		err = fmt.Errorf("%w: %v", errDecode, err)
+	}
+	return n, err
 }
 
 func reserveSlot(w http.ResponseWriter, r *http.Request) bool {
@@ -155,7 +221,11 @@ func reserveSlot(w http.ResponseWriter, r *http.Request) bool {
 func runParser(ctx context.Context, demPath string) ([]byte, time.Duration, error) {
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, parserBin, demPath)
-	cmd.Env = parserEnv()
+	if vlt != nil {
+		// with the vault on the child sees only what it needs (no vault, Fly or
+		// GitHub secret); with it off the child inherits the env as it always did
+		cmd.Env = parserEnv()
+	}
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
 	return out, time.Since(start), err

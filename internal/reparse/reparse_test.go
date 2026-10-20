@@ -29,9 +29,21 @@ type fakeMachines struct {
 	updated []CreateRequest
 	deleted []string
 	failAt  int // 1-based create that fails
+	// when set, the first Create announces itself on entered and waits for gate
+	entered chan struct{}
+	gate    chan struct{}
+	gated   bool
 }
 
 func (f *fakeMachines) Create(_ context.Context, r CreateRequest) (Machine, error) {
+	f.mu.Lock()
+	first := f.entered != nil && !f.gated
+	f.gated = true
+	f.mu.Unlock()
+	if first {
+		f.entered <- struct{}{}
+		<-f.gate
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failAt > 0 && len(f.created)+1 == f.failAt {
@@ -125,6 +137,7 @@ func TestMachinesFor(t *testing.T) {
 	c := testCfg() // 25 * 2 = 50 replays per machine
 	for _, tc := range []struct{ todo, override, want int }{
 		{0, 0, 1}, {1, 0, 1}, {50, 0, 1}, {51, 0, 2}, {399, 0, 8}, {5000, 0, 8}, {5000, 3, 3}, {120, 0, 3},
+		{5000, 500, 8}, {5000, 9, 8}, {120, 500, 3},
 	} {
 		if got := c.MachinesFor(tc.todo, tc.override); got != tc.want {
 			t.Errorf("MachinesFor(%d,%d) = %d, want %d", tc.todo, tc.override, got, tc.want)
@@ -141,8 +154,11 @@ func TestTodoSkipsAuditBadAndDone_OrderStudentsFirst(t *testing.T) {
 	put(t, v, 4, vault.Meta{Kind: vault.KindLadder})
 	put(t, v, 5, vault.Meta{Kind: vault.KindPro})
 	put(t, v, 6, vault.Meta{Kind: vault.KindCamp})
-	put(t, v, 7, vault.Meta{Kind: vault.KindStudent, Bad: true})
+	put(t, v, 7, vault.Meta{Kind: vault.KindStudent, Bad: true, BadVer: "4.15.1"})
 	put(t, v, 8, vault.Meta{Kind: vault.KindStudent})
+	// rejected by an older release, or flagged without a version: a new release tries again
+	put(t, v, 9, vault.Meta{Kind: vault.KindStudent, Bad: true, BadVer: "4.15.0"})
+	put(t, v, 10, vault.Meta{Kind: vault.KindStudent, Bad: true})
 	v.WriteDone(ctx, "4.15.1", 8, vault.Done{OK: true})
 	v.WriteDone(ctx, "4.15.0", 2, vault.Done{OK: true}) // an older version's marker does not count
 	items, s, err := p.Todo(ctx)
@@ -153,11 +169,11 @@ func TestTodoSkipsAuditBadAndDone_OrderStudentsFirst(t *testing.T) {
 	for _, it := range items {
 		got = append(got, fmt.Sprintf("%d:%s", it.ID, it.Kind))
 	}
-	want := "2:student,5:pro,4:ladder,1:coach,6:camp"
+	want := "2:student,9:student,10:student,5:pro,4:ladder,1:coach,6:camp"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("order = %v, want %s", got, want)
 	}
-	if s.Skipped["audit"] != 1 || s.Skipped["bad"] != 1 || s.AlreadyDone != 1 || s.InVault != 8 {
+	if s.Skipped["audit"] != 1 || s.Skipped["bad"] != 1 || s.AlreadyDone != 1 || s.InVault != 10 {
 		t.Fatalf("summary = %+v", s)
 	}
 }
@@ -293,6 +309,38 @@ func TestEnsureMaintainIsIdempotent(t *testing.T) {
 	p.Cfg.Image = "registry.fly.io/resoai-parse:dep2"
 	if r, _ := p.EnsureMaintain(ctx); r != "image_updated" || len(fm.updated) != 1 || !fm.updated[0].SkipLaunch {
 		t.Fatalf("after deploy = %q updated=%d", r, len(fm.updated))
+	}
+}
+
+// An API-created machine keeps the env it was made with: a changed
+// RETENTION_APPLY or WEB_URL has to reach it through EnsureMaintain.
+func TestEnsureMaintainFollowsTheEnv(t *testing.T) {
+	p, _, fm, _ := newPlanner(t)
+	ctx := context.Background()
+	p.Cfg.Passthrough = map[string]string{"WEB_URL": "https://reso-ai.com", "RETENTION_APPLY": "1"}
+	if r, _ := p.EnsureMaintain(ctx); r != "created" {
+		t.Fatalf("first = %q", r)
+	}
+	if r, _ := p.EnsureMaintain(ctx); r != "present" {
+		t.Fatalf("unchanged = %q", r)
+	}
+	// RETENTION_APPLY switched off in fly.toml
+	p.Cfg.Passthrough["RETENTION_APPLY"] = "0"
+	if r, _ := p.EnsureMaintain(ctx); r != "image_updated" || len(fm.updated) != 1 || fm.updated[0].Config.Env["RETENTION_APPLY"] != "0" {
+		t.Fatalf("env change = %q updated=%v", r, fm.updated)
+	}
+	// the machine as the API now lists it carries the new env
+	fm.list[0].Config.Env = fm.updated[0].Config.Env
+	if r, _ := p.EnsureMaintain(ctx); r != "present" {
+		t.Fatalf("after the update = %q", r)
+	}
+	// a value removed from the config is removed from the machine as well
+	delete(p.Cfg.Passthrough, "RETENTION_APPLY")
+	if r, _ := p.EnsureMaintain(ctx); r != "image_updated" || len(fm.updated) != 2 {
+		t.Fatalf("removed env = %q updated=%d", r, len(fm.updated))
+	}
+	if _, has := fm.updated[1].Config.Env["RETENTION_APPLY"]; has {
+		t.Fatalf("removed value still sent: %v", fm.updated[1].Config.Env)
 	}
 }
 
@@ -468,6 +516,10 @@ func TestWorkerRetriesThen500LeavesNoMarker(t *testing.T) {
 	if ok, _ := v.Exists(context.Background(), vault.DispatchedKey("4.15.1")); ok {
 		t.Fatal("must not dispatch with a replay missing")
 	}
+	// the web being down says nothing about replay 20: it is not counted against it
+	if ok, _ := v.Exists(context.Background(), vault.FailKey("4.15.1", 20)); ok {
+		t.Fatal("a delivery failure counted toward giving up on the replay")
+	}
 }
 
 func TestWorkerParseFailureMarksBadFinal(t *testing.T) {
@@ -482,8 +534,29 @@ func TestWorkerParseFailureMarksBadFinal(t *testing.T) {
 	}
 	o, _, _ := v.Find(ctx, 30)
 	d, ok, _ := v.ReadDone(ctx, "4.15.1", 30)
-	if !o.Meta.Bad || !ok || !d.Final || d.OK {
-		t.Fatalf("bad=%v marker=%+v ok=%v", o.Meta.Bad, d, ok)
+	if !o.Meta.BadFor("4.15.1") || !ok || !d.Final || d.OK {
+		t.Fatalf("bad=%+v marker=%+v ok=%v", o.Meta, d, ok)
+	}
+}
+
+// A release that fixes the parser must get another go at the replays the
+// previous release rejected, and a good parse clears the old verdict.
+func TestWorkerRetriesWhatAnOlderReleaseRejected(t *testing.T) {
+	srv, calls := fakeWeb(t, func(webCall) (int, string) { return 200, okResp })
+	v := vault.New(vault.NewMemStore())
+	ctx := context.Background()
+	put(t, v, 31, vault.Meta{Kind: vault.KindStudent, Bad: true, BadVer: "4.15.0"})
+	p, _, _, _ := newPlanner(t)
+	p.V = v
+	if items, _, _ := p.Todo(ctx); len(items) != 1 || items[0].ID != 31 {
+		t.Fatalf("a replay rejected by 4.15.0 must be planned for 4.15.1: %v", items)
+	}
+	w := newWorker(t, v, srv.URL, &fakeGH{}, Plan{Attempt: "1", Shards: 1, Items: []PlanItem{{31, "student"}}}, 0, 1)
+	if st, err := w.Run(ctx); err != nil || st.Delivered != 1 || len(*calls) != 1 {
+		t.Fatalf("run: %+v err=%v", st, err)
+	}
+	if o, _, _ := v.Find(ctx, 31); o.Meta.Bad || o.Meta.BadVer != "" {
+		t.Fatalf("a good parse must clear the verdict: %+v", o.Meta)
 	}
 }
 
@@ -624,7 +697,7 @@ func TestBuildStatus(t *testing.T) {
 	p, v, _, _ := newPlanner(t)
 	ctx := context.Background()
 	fill(t, v, 4)
-	put(t, v, 99, vault.Meta{Kind: vault.KindLadder, Bad: true})
+	put(t, v, 99, vault.Meta{Kind: vault.KindLadder, Bad: true, BadVer: "4.15.1"})
 	p.Reparse(ctx, ReparseOpts{})
 	v.WriteDone(ctx, "4.15.1", 1000, vault.Done{OK: true})
 	v.LogValve(ctx, "server", "backfill", 1, 200)
@@ -678,5 +751,259 @@ func TestReparseNeedsTheImageRef(t *testing.T) {
 	}
 	if _, err := p.Reparse(context.Background(), ReparseOpts{DryRun: true}); err != nil {
 		t.Fatalf("dry run needs no image: %v", err)
+	}
+}
+
+// ---- starting machines: partial starts, concurrent calls ----
+
+func TestReparseCompletesAPartiallyStartedAttempt(t *testing.T) {
+	p, v, fm, _ := newPlanner(t)
+	ctx := context.Background()
+	fill(t, v, 400) // 8 machines
+	fm.failAt = 4   // the Machines API gives out after three
+	if _, err := p.Reparse(ctx, ReparseOpts{}); err == nil {
+		t.Fatal("the cut-off call must report the failure")
+	}
+	if len(fm.created) != 3 {
+		t.Fatalf("created %d, want 3", len(fm.created))
+	}
+	attempt := fm.created[0].Config.Metadata["attempt"]
+	// "safe to retry": the second call creates the missing shards of the same attempt
+	fm.failAt = 0
+	s, err := p.Reparse(ctx, ReparseOpts{})
+	if err != nil || !s.AlreadyRunning || len(s.Started) != 5 || len(fm.created) != 8 || s.Machines != 8 {
+		t.Fatalf("second call: %+v err=%v created=%d", s, err, len(fm.created))
+	}
+	seen := map[string]bool{}
+	for _, r := range fm.created {
+		if r.Config.Metadata["attempt"] != attempt || r.Config.Env["REPARSE_SHARDS"] != "8" ||
+			r.Config.Metadata["shard"] != r.Config.Env["REPARSE_SHARD"] {
+			t.Fatalf("machine %s: %v", r.Name, r.Config.Metadata)
+		}
+		if seen[r.Name] {
+			t.Fatalf("shard %s started twice", r.Name)
+		}
+		seen[r.Name] = true
+	}
+	// a third call finds every shard alive and starts nothing
+	s, _ = p.Reparse(ctx, ReparseOpts{})
+	if len(s.Started) != 0 || len(fm.created) != 8 {
+		t.Fatalf("third call: %+v created=%d", s, len(fm.created))
+	}
+}
+
+func TestReparseRestartsAShardThatDiedWhileOthersRun(t *testing.T) {
+	p, v, fm, _ := newPlanner(t)
+	ctx := context.Background()
+	fill(t, v, 100) // 2 machines
+	if _, err := p.Reparse(ctx, ReparseOpts{}); err != nil || len(fm.created) != 2 {
+		t.Fatal(err, len(fm.created))
+	}
+	// shard 1 is gone (crashed, auto-destroyed) with its replays unfinished; shard 0 still runs
+	fm.list = fm.list[:1]
+	s, _ := p.Reparse(ctx, ReparseOpts{})
+	if len(s.Started) != 1 || !strings.HasSuffix(s.Started[0], "-s1") || len(fm.created) != 3 {
+		t.Fatalf("%+v created=%d", s, len(fm.created))
+	}
+	// shard 1 has nothing left to do: it is not started again
+	for i := 0; i < 100; i++ {
+		if Shard(int64(1000+i), 2) == 1 {
+			v.WriteDone(ctx, "4.15.1", int64(1000+i), vault.Done{OK: true})
+		}
+	}
+	fm.list = fm.list[:1]
+	if s, _ = p.Reparse(ctx, ReparseOpts{}); len(s.Started) != 0 || len(fm.created) != 3 {
+		t.Fatalf("finished shard restarted: %+v created=%d", s, len(fm.created))
+	}
+}
+
+func TestConcurrentReparseCallsStartOneSetOfMachines(t *testing.T) {
+	p, v, fm, _ := newPlanner(t)
+	fill(t, v, 130) // 3 machines
+	fm.entered, fm.gate = make(chan struct{}), make(chan struct{})
+	first := make(chan Summary, 1)
+	go func() {
+		s, _ := p.Reparse(context.Background(), ReparseOpts{})
+		first <- s
+	}()
+	<-fm.entered // call A is inside its first machine create, holding the lock
+	// call B (a release-sync, a manual curl) arrives at the same moment
+	s, err := p.Reparse(context.Background(), ReparseOpts{})
+	if err != nil || !s.Locked || len(s.Started) != 0 {
+		t.Fatalf("concurrent call: %+v err=%v", s, err)
+	}
+	close(fm.gate)
+	a := <-first
+	if len(a.Started) != 3 || len(fm.created) != 3 {
+		t.Fatalf("first call: %+v created=%d", a, len(fm.created))
+	}
+	if ok, _ := v.Exists(context.Background(), vault.LockKey("4.15.1")); ok {
+		t.Fatal("the lock was not released")
+	}
+	// the lock being gone, the next call is an ordinary one
+	if s, _ = p.Reparse(context.Background(), ReparseOpts{}); s.Locked || !s.AlreadyRunning {
+		t.Fatalf("after: %+v", s)
+	}
+}
+
+func TestStaleLockIsTakenOver(t *testing.T) {
+	p, v, fm, _ := newPlanner(t)
+	ctx := context.Background()
+	fill(t, v, 10)
+	// a caller that died an hour ago left its lock behind
+	v.PutJSON(ctx, vault.LockKey("4.15.1"), runLock{At: p.Now().Add(-time.Hour).Format(time.RFC3339)})
+	if s, err := p.Reparse(ctx, ReparseOpts{}); err != nil || s.Locked || len(fm.created) != 1 {
+		t.Fatalf("stale lock: %+v err=%v created=%d", s, err, len(fm.created))
+	}
+	// a fresh one holds
+	fm.list, fm.created = nil, nil
+	v.PutJSON(ctx, vault.LockKey("4.15.1"), runLock{At: p.Now().Add(-time.Minute).Format(time.RFC3339)})
+	if s, _ := p.Reparse(ctx, ReparseOpts{}); !s.Locked || len(fm.created) != 0 {
+		t.Fatalf("fresh lock: %+v created=%d", s, len(fm.created))
+	}
+}
+
+// ---- finishing a run: replays that will never get a marker ----
+
+// a replay in `other` shard of n, so that one worker never owns it
+func idsInShards(t *testing.T, n int) (a, b int64) {
+	t.Helper()
+	a, b = -1, -1
+	for id := int64(1); id < 200 && (a < 0 || b < 0); id++ {
+		switch Shard(id, n) {
+		case 0:
+			if a < 0 {
+				a = id
+			}
+		case 1:
+			if b < 0 {
+				b = id
+			}
+		}
+	}
+	return a, b
+}
+
+func TestWorkerDispatchesWhenAnotherShardsReplayWasDeletedByRetention(t *testing.T) {
+	srv, _ := fakeWeb(t, func(webCall) (int, string) { return 200, okResp })
+	v := vault.New(vault.NewMemStore())
+	mine, theirs := idsInShards(t, 2)
+	put(t, v, mine, vault.Meta{Kind: vault.KindStudent})
+	put(t, v, theirs, vault.Meta{Kind: vault.KindCoach})
+	plan := Plan{Attempt: "1", Shards: 2, Items: []PlanItem{{mine, "student"}, {theirs, "coach"}}}
+	// retention removes the other shard's replay after the plan was made
+	v.S.Delete(context.Background(), vault.ReplayKey(theirs))
+	gh := &fakeGH{}
+	w := newWorker(t, v, srv.URL, gh, plan, 0, 2)
+	st, err := w.Run(context.Background())
+	if err != nil || st.Dispatch != "dispatched" || gh.dispatches.Load() != 1 {
+		t.Fatalf("run: %+v err=%v dispatches=%d", st, err, gh.dispatches.Load())
+	}
+}
+
+func TestWorkerCountsAGoneReplayAndStillDispatches(t *testing.T) {
+	srv, _ := fakeWeb(t, func(webCall) (int, string) { return 200, okResp })
+	v := vault.New(vault.NewMemStore())
+	put(t, v, 60, vault.Meta{Kind: vault.KindStudent})
+	put(t, v, 61, vault.Meta{Kind: vault.KindStudent})
+	plan := Plan{Attempt: "1", Shards: 1, Items: []PlanItem{{60, "student"}, {61, "student"}}}
+	v.S.Delete(context.Background(), vault.ReplayKey(61))
+	gh := &fakeGH{}
+	w := newWorker(t, v, srv.URL, gh, plan, 0, 1)
+	st, err := w.Run(context.Background())
+	if err != nil || st.Gone != 1 || st.Delivered != 1 || st.Dispatch != "dispatched" {
+		t.Fatalf("run: %+v err=%v", st, err)
+	}
+	// a replay that is still stored but has no marker keeps the dispatch back
+	v2 := vault.New(vault.NewMemStore())
+	put(t, v2, 70, vault.Meta{Kind: vault.KindStudent})
+	w2 := newWorker(t, v2, srv.URL, &fakeGH{}, Plan{Attempt: "1", Shards: 2, Items: []PlanItem{{70, "student"}}}, 1-Shard(70, 2), 2)
+	if st, _ := w2.Run(context.Background()); st.Dispatch != "" {
+		t.Fatalf("dispatched with replay 70 still open: %+v", st)
+	}
+}
+
+func TestPlannerDispatchesAfterARunWhoseLastReplayWasDeleted(t *testing.T) {
+	p, v, fm, gh := newPlanner(t)
+	ctx := context.Background()
+	fill(t, v, 3)
+	p.Reparse(ctx, ReparseOpts{}) // plans a run
+	v.WriteDone(ctx, "4.15.1", 1000, vault.Done{OK: true})
+	v.WriteDone(ctx, "4.15.1", 1001, vault.Done{OK: true})
+	v.S.Delete(ctx, vault.ReplayKey(1002)) // retention took the third
+	fm.list = nil
+	s, _ := p.Reparse(ctx, ReparseOpts{})
+	if s.Dispatch != "dispatched" || gh.dispatches.Load() != 1 {
+		t.Fatalf("%+v dispatches=%d", s, gh.dispatches.Load())
+	}
+}
+
+func TestWorkerGivesUpOnAReplayThatKeepsFailingByItself(t *testing.T) {
+	srv, _ := fakeWeb(t, func(webCall) (int, string) { return 200, okResp })
+	v := vault.New(vault.NewMemStore())
+	ctx := context.Background()
+	v.PutNew(ctx, 80, strings.NewReader("KILLED replay"), 13, vault.Meta{Kind: vault.KindStudent}) // its parser keeps dying
+	put(t, v, 81, vault.Meta{Kind: vault.KindStudent})
+	plan := Plan{Attempt: "1", Shards: 1, Items: []PlanItem{{80, "student"}, {81, "student"}}}
+	gh := &fakeGH{}
+	parse := func(ctx context.Context, r io.Reader) ([]byte, error) {
+		if b, _ := io.ReadAll(r); strings.Contains(string(b), "KILLED") {
+			return nil, errors.New("signal: killed") // not a verdict on the replay
+		}
+		return fakeParse(ctx, strings.NewReader("ok"))
+	}
+	run := func() (Stats, error) {
+		w := newWorker(t, v, srv.URL, gh, plan, 0, 1)
+		w.Parse = parse
+		return w.Run(ctx)
+	}
+	for attempt := 1; attempt <= 2; attempt++ {
+		st, err := run()
+		if err == nil || st.Failed != 1 || st.Dispatch != "" {
+			t.Fatalf("attempt %d: %+v err=%v", attempt, st, err)
+		}
+		if ok, _ := v.Exists(ctx, vault.DoneKey("4.15.1", 80)); ok {
+			t.Fatalf("attempt %d: given up too early", attempt)
+		}
+	}
+	// the third attempt closes it, and with it the run: nothing is left to wait for
+	st, err := run()
+	if err != nil || st.Failed != 1 || st.Dispatch != "dispatched" || gh.dispatches.Load() != 1 {
+		t.Fatalf("attempt 3: %+v err=%v dispatches=%d", st, err, gh.dispatches.Load())
+	}
+	d, ok, _ := v.ReadDone(ctx, "4.15.1", 80)
+	if !ok || !d.Final || d.OK || d.Error != "gave_up" {
+		t.Fatalf("marker = %+v ok=%v", d, ok)
+	}
+	if o, _, _ := v.Find(ctx, 80); o.Meta.Bad {
+		t.Fatal("a replay lost to its parser dying is not flagged bad")
+	}
+	// and the status says that it was given up on
+	p, _, _, _ := newPlanner(t)
+	p.V = v
+	if status, _ := p.BuildStatus(ctx); status.FinalFailed["gave_up"] != 1 {
+		t.Fatalf("final_failed = %v", status.FinalFailed)
+	}
+}
+
+func TestWorkerDoesNotSendAParseTheWebWouldRefuse(t *testing.T) {
+	srv, calls := fakeWeb(t, func(webCall) (int, string) { return 200, okResp })
+	v := vault.New(vault.NewMemStore())
+	ctx := context.Background()
+	put(t, v, 90, vault.Meta{Kind: vault.KindCoach})
+	w := newWorker(t, v, srv.URL, &fakeGH{}, Plan{Attempt: "1", Shards: 1, Items: []PlanItem{{90, "coach"}}}, 0, 1)
+	w.MaxBody = 10 // a stand-in for the 4.5 MB Vercel limit
+	st, err := w.Run(ctx)
+	if err != nil || len(*calls) != 0 || st.Failed != 1 {
+		t.Fatalf("run: %+v err=%v web calls=%d", st, err, len(*calls))
+	}
+	d, ok, _ := v.ReadDone(ctx, "4.15.1", 90)
+	if !ok || !d.Final || d.OK || d.Error != "too_large" {
+		t.Fatalf("marker = %+v", d)
+	}
+	p, _, _, _ := newPlanner(t)
+	p.V = v
+	if status, _ := p.BuildStatus(ctx); status.FinalFailed["too_large"] != 1 || status.DoneThisVer != 1 {
+		t.Fatalf("status = %+v", status)
 	}
 }

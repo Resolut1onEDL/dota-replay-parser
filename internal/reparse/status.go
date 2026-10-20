@@ -27,15 +27,18 @@ type RunProgress struct {
 
 // Status is the answer of GET /vault/status.
 type Status struct {
-	Version        string               `json:"version"`
-	Objects        int                  `json:"objects"`
-	Bytes          int64                `json:"bytes"`
-	Kinds          map[string]KindStats `json:"kinds"`
-	DoneThisVer    int                  `json:"done_this_version"`
-	Run            *RunProgress         `json:"run,omitempty"`
-	ValveGets24h   map[string]int       `json:"valve_gets_24h"`
-	MachinesAlive  int                  `json:"machines_alive"`
-	GeneratedAtUTC string               `json:"generated_at"`
+	Version     string               `json:"version"`
+	Objects     int                  `json:"objects"`
+	Bytes       int64                `json:"bytes"`
+	Kinds       map[string]KindStats `json:"kinds"`
+	DoneThisVer int                  `json:"done_this_version"`
+	// FinalFailed counts the replays whose marker is a final failure (they
+	// count as done above but their pages were not refreshed), by error.
+	FinalFailed    map[string]int `json:"final_failed,omitempty"`
+	Run            *RunProgress   `json:"run,omitempty"`
+	ValveGets24h   map[string]int `json:"valve_gets_24h"`
+	MachinesAlive  int            `json:"machines_alive"`
+	GeneratedAtUTC string         `json:"generated_at"`
 }
 
 // BuildStatus counts what the vault holds and how the current run stands.
@@ -65,6 +68,11 @@ func (p *Planner) BuildStatus(ctx context.Context) (Status, error) {
 		return st, err
 	}
 	st.DoneThisVer = len(done)
+	if ff, err := p.V.FinalFailures(ctx, p.Cfg.Version); err != nil {
+		return st, err
+	} else if len(ff) > 0 {
+		st.FinalFailed = ff
+	}
 
 	var attempts []string
 	_ = p.V.S.List(ctx, vault.RunsPrefix(p.Cfg.Version), func(o vault.ObjectInfo) error {

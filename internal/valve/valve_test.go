@@ -125,3 +125,61 @@ func TestDownloadCapIsAnErrorNotATruncation(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreReplacesAnObjectMarkedCorrupt(t *testing.T) {
+	zst, _ := hex.DecodeString(zstHex)
+	f, v, hits := newFetcher(t, func(w http.ResponseWriter, r *http.Request) { w.Write(zst) })
+	ctx := context.Background()
+	v.PutNew(ctx, 21, strings.NewReader("truncated junk"), 14, vault.Meta{Kind: vault.KindLadder, Patch: "60", Container: vault.ContainerBz2})
+	it := Item{MatchID: 21, Cluster: 1, Salt: 2, Meta: vault.Meta{Kind: vault.KindLadder}}
+	// healthy as far as anyone knows: present, no fetch
+	if r := f.Store(ctx, v, "backfill", it); r.Status != StatusPresent || hits.Load() != 0 {
+		t.Fatalf("unflagged = %+v hits=%d", r, hits.Load())
+	}
+	if err := v.MarkCorrupt(ctx, 21); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.Store(ctx, v, "backfill", it); r.Status != StatusStored || hits.Load() != 1 {
+		t.Fatalf("corrupt = %+v hits=%d", r, hits.Load())
+	}
+	o, _, _ := v.Find(ctx, 21)
+	if o.Meta.Corrupt || o.Meta.Container != vault.ContainerZst || o.Meta.Patch != "60" || o.Info.Size != int64(len(zst)) {
+		t.Fatalf("after replace = %+v size %d", o.Meta, o.Info.Size)
+	}
+}
+
+type cancelOnEOF struct {
+	r      *strings.Reader
+	cancel context.CancelFunc
+}
+
+func (c cancelOnEOF) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if err != nil {
+		c.cancel() // the caller hangs up just as the download ends
+	}
+	return n, err
+}
+func (c cancelOnEOF) Close() error { return nil }
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestStoreKeepsAFinishedDownloadWhenTheCallerHangsUp(t *testing.T) {
+	zst, _ := hex.DecodeString(zstHex)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	v := vault.New(vault.NewMemStore())
+	f := &Fetcher{Vault: v, Role: "server", Client: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, ContentLength: int64(len(zst)), Header: http.Header{}, Request: r,
+			Body: cancelOnEOF{r: strings.NewReader(string(zst)), cancel: cancel}}, nil
+	})}}
+	r := f.Store(ctx, v, "backfill", Item{MatchID: 22, Cluster: 1, Salt: 2, Meta: vault.Meta{Kind: vault.KindLadder}})
+	if r.Status != StatusStored {
+		t.Fatalf("a cancelled request dropped a finished download: %+v", r)
+	}
+	if _, ok, _ := v.Find(context.Background(), 22); !ok {
+		t.Fatal("not stored")
+	}
+}

@@ -18,8 +18,25 @@ import (
 	"dota-replay-parser/internal/vault"
 )
 
-// ErrParseFailed: the parser rejected a replay that downloaded cleanly.
+// ErrParseFailed: the parser rejected a replay that downloaded cleanly, or the
+// stored bytes do not decode. Nothing else may be mapped to it: it flags the
+// replay bad.
 var ErrParseFailed = errors.New("parse failed")
+
+const (
+	// defaultMaxFailures: a replay that fails this many separate attempts for
+	// reasons of its own gets a final marker, so it cannot hold up the run.
+	defaultMaxFailures = 3
+	// defaultMaxBody is the largest gzip body sent to the web app: the Vercel
+	// function limit is 4.5 MB and a full parse gzips to about 1 MB.
+	defaultMaxBody = 4_000_000
+)
+
+// deliveryError marks a failure of the web side (5xx, 429, network). It says
+// nothing about the replay, so it never counts toward giving up on it.
+type deliveryError struct{ error }
+
+func (e deliveryError) Unwrap() error { return e.error }
 
 // ParseFunc turns a stored replay into the parser's JSON. main supplies it
 // (decompress, run the parser binary); the worker holds no parser or Valve code.
@@ -41,6 +58,9 @@ type Worker struct {
 	Sleep     func(time.Duration)
 	Backoff   time.Duration // base of the retry backoff (1s default)
 	RoleLabel string
+	// MaxFailures and MaxBody default to defaultMaxFailures and defaultMaxBody.
+	MaxFailures int
+	MaxBody     int
 }
 
 // Stats is what a worker did.
@@ -118,6 +138,7 @@ func (w *Worker) Run(ctx context.Context) (Stats, error) {
 				default:
 					atomic.AddInt64(&st.Failed, 1)
 					log.Printf("reparse: %d: %v", it.ID, err)
+					w.recordFailure(ctx, it, err)
 				}
 			}
 		}()
@@ -134,18 +155,27 @@ func (w *Worker) Run(ctx context.Context) (Stats, error) {
 	if err := ctx.Err(); err != nil {
 		return st, err
 	}
-	// Last one out dispatches: every replay of the plan has a marker.
+	// Last one out dispatches: every replay of the plan has a marker, or is
+	// gone (retention removed it after the plan was made, so it never will).
 	done, err = w.V.DoneSet(context.Background(), w.Version)
 	if err != nil {
 		return st, err
 	}
+	left := 0
 	for _, it := range plan.Items {
-		if !done[it.ID] {
-			if st.Failed > 0 {
-				return st, fmt.Errorf("%d replays left without a marker", st.Failed)
-			}
-			return st, nil // other machines are still working
+		if done[it.ID] {
+			continue
 		}
+		if present, err := w.V.Exists(context.Background(), vault.ReplayKey(it.ID)); err == nil && !present {
+			continue
+		}
+		left++
+	}
+	if left > 0 {
+		if st.Failed > 0 {
+			return st, fmt.Errorf("%d replays left without a marker", left)
+		}
+		return st, nil // other machines are still working
 	}
 	d, err := Dispatch(context.Background(), w.V, w.GH, w.Version)
 	st.Dispatch = d
@@ -154,6 +184,33 @@ func (w *Worker) Run(ctx context.Context) (Stats, error) {
 	}
 	log.Printf("reparse: dispatch=%s", d)
 	return st, nil
+}
+
+// recordFailure counts a failed attempt at a replay and, once the limit is
+// reached, closes it with a final marker so the run can finish. Failures of
+// the web side do not count: when it is down every replay fails, and none of
+// them should be given up on.
+func (w *Worker) recordFailure(ctx context.Context, it PlanItem, cause error) {
+	var de deliveryError
+	if errors.As(cause, &de) || ctx.Err() != nil {
+		return
+	}
+	n, err := w.V.BumpFailure(ctx, w.Version, it.ID, cause.Error())
+	if err != nil {
+		log.Printf("reparse: %d: count failure: %v", it.ID, err)
+		return
+	}
+	limit := w.MaxFailures
+	if limit < 1 {
+		limit = defaultMaxFailures
+	}
+	if n < limit {
+		return
+	}
+	log.Printf("reparse: %d: giving up after %d failed attempts: %v", it.ID, n, cause)
+	if err := w.V.WriteDone(ctx, w.Version, it.ID, vault.Done{Kind: it.Kind, Final: true, Error: "gave_up", Role: "worker"}); err != nil {
+		log.Printf("reparse: %d: write final marker: %v", it.ID, err)
+	}
 }
 
 func (w *Worker) one(ctx context.Context, it PlanItem, st *Stats) error {
@@ -170,13 +227,19 @@ func (w *Worker) one(ctx context.Context, it PlanItem, st *Stats) error {
 	rc.Close()
 	if perr != nil {
 		if errors.Is(perr, ErrParseFailed) {
-			if _, err := w.V.UpdateMeta(ctx, it.ID, vault.Meta{Kind: meta.Kind, Bad: true}); err != nil {
+			if err := w.V.MarkBad(ctx, it.ID, w.Version); err != nil {
 				log.Printf("reparse: %d: set bad: %v", it.ID, err)
 			}
 			atomic.AddInt64(&st.Bad, 1)
 			return w.V.WriteDone(ctx, w.Version, it.ID, vault.Done{Kind: meta.Kind, Final: true, Error: "parse_failed", Role: "worker"})
 		}
 		return perr
+	}
+	if meta.Bad {
+		// the parser took it this time: an earlier verdict (an older release) is void
+		if err := w.V.ClearBad(ctx, it.ID); err != nil {
+			log.Printf("reparse: %d: clear bad: %v", it.ID, err)
+		}
 	}
 	var head struct {
 		StartDateTime int64 `json:"startDateTime"`
@@ -190,6 +253,17 @@ func (w *Worker) one(ctx context.Context, it PlanItem, st *Stats) error {
 
 	kind := meta.Kind
 	mode := kind.DeliveryMode()
+	limit := w.MaxBody
+	if limit <= 0 {
+		limit = defaultMaxBody
+	}
+	if gz.Len() > limit {
+		// the web would answer 413: do not send it, and say so in the marker
+		atomic.AddInt64(&st.Failed, 1)
+		log.Printf("reparse: %d: parse is %d bytes gzipped, over the %d limit", it.ID, gz.Len(), limit)
+		return w.V.WriteDone(ctx, w.Version, it.ID, vault.Done{Kind: kind, Final: true, Mode: mode,
+			Bytes: int64(len(out)), Error: "too_large", Role: "worker"})
+	}
 	resp, derr := w.deliver(ctx, it.ID, kind, mode, gz.Bytes())
 	if derr != nil {
 		var pe permanentError
@@ -273,5 +347,5 @@ func (w *Worker) deliver(ctx context.Context, id int64, kind vault.Kind, mode st
 			return deliverResp{}, permanentError{fmt.Sprintf("web_%d", resp.StatusCode)}
 		}
 	}
-	return deliverResp{}, last
+	return deliverResp{}, deliveryError{last}
 }

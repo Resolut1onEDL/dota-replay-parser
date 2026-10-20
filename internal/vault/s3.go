@@ -76,7 +76,7 @@ func (s *S3Store) Head(ctx context.Context, key string) (ObjectInfo, error) {
 		}
 		return ObjectInfo{}, err
 	}
-	info := ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), Meta: copyMap(out.Metadata)}
+	info := ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), Meta: copyMap(out.Metadata), ETag: aws.ToString(out.ETag)}
 	if out.LastModified != nil {
 		info.LastModified = *out.LastModified
 	}
@@ -91,7 +91,7 @@ func (s *S3Store) Get(ctx context.Context, key string) (io.ReadCloser, ObjectInf
 		}
 		return nil, ObjectInfo{}, err
 	}
-	info := ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), Meta: copyMap(out.Metadata)}
+	info := ObjectInfo{Key: key, Size: aws.ToInt64(out.ContentLength), Meta: copyMap(out.Metadata), ETag: aws.ToString(out.ETag)}
 	if out.LastModified != nil {
 		info.LastModified = *out.LastModified
 	}
@@ -121,32 +121,56 @@ func (s *S3Store) Put(ctx context.Context, key string, body io.ReadSeeker, size 
 	return err
 }
 
-func (s *S3Store) copyOnto(ctx context.Context, dst, src string, meta map[string]string) error {
-	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+func preconditionFailed(err error) bool {
+	return isCode(err, "PreconditionFailed") || httpStatus(err) == http.StatusPreconditionFailed
+}
+
+// copyOnto copies src onto dst with REPLACE metadata; a non-empty ifMatch
+// makes the copy conditional on the source still having that ETag.
+func (s *S3Store) copyOnto(ctx context.Context, dst, src, ifMatch string, meta map[string]string) error {
+	in := &s3.CopyObjectInput{
 		Bucket:            &s.bucket,
 		Key:               &dst,
 		CopySource:        aws.String(s.bucket + "/" + src),
 		MetadataDirective: types.MetadataDirectiveReplace,
 		Metadata:          meta,
-	})
+	}
+	if ifMatch != "" {
+		in.CopySourceIfMatch = aws.String(ifMatch)
+	}
+	_, err := s.client.CopyObject(ctx, in)
 	return err
 }
 
 // CopyReplace rewrites metadata in place; if the endpoint refuses a copy onto
 // the same key it goes through a temporary key and back.
 func (s *S3Store) CopyReplace(ctx context.Context, key string, meta map[string]string) error {
-	err := s.copyOnto(ctx, key, key, meta)
+	return s.CopyReplaceIfMatch(ctx, key, "", meta)
+}
+
+// CopyReplaceIfMatch is CopyReplace conditional on the object's ETag (ErrChanged
+// when it moved on). In the temporary-key fallback only the first copy is
+// conditional: a write landing between the two copies would be lost, so that
+// path is a last resort (vaultctl probe tells whether Tigris needs it).
+func (s *S3Store) CopyReplaceIfMatch(ctx context.Context, key, etag string, meta map[string]string) error {
+	err := s.copyOnto(ctx, key, key, etag, meta)
 	if err == nil {
 		return nil
+	}
+	if etag != "" && preconditionFailed(err) {
+		return ErrChanged
 	}
 	if notFound(err) {
 		return ErrNotFound
 	}
 	tmp := "_vault/tmp/" + strings.ReplaceAll(key, "/", "_")
-	if err2 := s.copyOnto(ctx, tmp, key, meta); err2 != nil {
+	if err2 := s.copyOnto(ctx, tmp, key, etag, meta); err2 != nil {
+		if etag != "" && preconditionFailed(err2) {
+			return ErrChanged
+		}
 		return fmt.Errorf("copy-replace %s: %v; via temp key: %w", key, err, err2)
 	}
-	if err2 := s.copyOnto(ctx, key, tmp, meta); err2 != nil {
+	if err2 := s.copyOnto(ctx, key, tmp, "", meta); err2 != nil {
 		return fmt.Errorf("copy-replace %s back from temp: %w", key, err2)
 	}
 	_ = s.Delete(ctx, tmp)

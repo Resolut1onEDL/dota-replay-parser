@@ -72,11 +72,14 @@ type Summary struct {
 	Machines       int            `json:"machines"`
 	Started        []string       `json:"started,omitempty"`
 	AlreadyRunning bool           `json:"already_running,omitempty"`
-	Superseded     int            `json:"superseded,omitempty"`
-	Reaped         int            `json:"reaped,omitempty"`
-	Dispatch       string         `json:"dispatch,omitempty"`
-	Maintain       string         `json:"maintain,omitempty"`
-	Attempt        string         `json:"attempt,omitempty"`
+	// Locked: another /vault/reparse call is in the middle of starting
+	// machines; this one did nothing.
+	Locked     bool   `json:"locked,omitempty"`
+	Superseded int    `json:"superseded,omitempty"`
+	Reaped     int    `json:"reaped,omitempty"`
+	Dispatch   string `json:"dispatch,omitempty"`
+	Maintain   string `json:"maintain,omitempty"`
+	Attempt    string `json:"attempt,omitempty"`
 }
 
 func (p *Planner) now() time.Time {
@@ -95,7 +98,8 @@ func (p *Planner) sleep(d time.Duration) {
 }
 
 // Todo computes what the current version still needs: stored replays without
-// a done marker, minus audit (never parsed) and replays marked bad.
+// a done marker, minus audit (never parsed) and replays this version's parser
+// already rejected.
 func (p *Planner) Todo(ctx context.Context) ([]PlanItem, Summary, error) {
 	return p.todo(ctx, time.Time{})
 }
@@ -138,7 +142,8 @@ func (p *Planner) todo(ctx context.Context, freshSince time.Time) (items []PlanI
 		switch {
 		case !o.Meta.Kind.Reparsed():
 			s.Skipped[string(o.Meta.Kind)]++
-		case o.Meta.Bad:
+		case o.Meta.BadFor(p.Cfg.Version):
+			// a parser of this version rejected it; a newer release tries again
 			s.Skipped["bad"]++
 		case parsedOnStore(o.Meta, freshSince):
 			s.Skipped["parsed_on_store"]++
@@ -184,7 +189,8 @@ func (p *Planner) workerRequest(plan Plan, shard int, planKey string) CreateRequ
 			Guest:       &Guest{CPUKind: "performance", CPUs: p.Cfg.CPUs, MemoryMB: p.Cfg.MemoryMB},
 			Restart:     &Restart{Policy: "no"},
 			AutoDestroy: true,
-			Metadata:    map[string]string{"role": "reparse", "version": p.Cfg.Version, "attempt": plan.Attempt},
+			Metadata: map[string]string{"role": "reparse", "version": p.Cfg.Version, "attempt": plan.Attempt,
+				"shard": strconv.Itoa(shard), "shards": strconv.Itoa(plan.Shards)},
 		},
 	}
 }
@@ -210,9 +216,24 @@ func (p *Planner) maintainRequest() CreateRequest {
 	}
 }
 
+// envDiffers: the machine's env is not what the server would set now. Only the
+// names the server manages are compared (VAULT_ROLE and the passthrough list),
+// so a value dropped from fly.toml also counts as a change.
+func envDiffers(have, want map[string]string) bool {
+	managed := append([]string{"VAULT_ROLE"}, passthroughKeys...)
+	for _, k := range managed {
+		if have[k] != want[k] {
+			return true
+		}
+	}
+	return false
+}
+
 // EnsureMaintain creates the daily maintain machine if there is none, and
-// restores an existing one (found by role or name) to the current image and
-// schedule — a deploy may have touched it. Idempotent.
+// restores an existing one (found by role or name) to the current image,
+// schedule and env — a deploy may have touched them, and an API-created
+// machine does not pick up fly.toml [env] changes (RETENTION_APPLY, WEB_URL)
+// by itself. Idempotent.
 func (p *Planner) EnsureMaintain(ctx context.Context) (string, error) {
 	ms, err := p.M.List(ctx)
 	if err != nil {
@@ -222,10 +243,11 @@ func (p *Planner) EnsureMaintain(ctx context.Context) (string, error) {
 		if m.Config.Metadata["role"] != "maintain" && m.Name != "vault-maintain" {
 			continue
 		}
-		if m.Config.Image == p.Cfg.Image && m.Config.Schedule == "daily" && m.Config.Env["VAULT_ROLE"] == "maintain" {
+		want := p.maintainRequest()
+		if m.Config.Image == p.Cfg.Image && m.Config.Schedule == "daily" && !envDiffers(m.Config.Env, want.Config.Env) {
 			return "present", nil
 		}
-		if err := p.M.Update(ctx, m.ID, p.maintainRequest()); err != nil {
+		if err := p.M.Update(ctx, m.ID, want); err != nil {
 			return "", err
 		}
 		return "image_updated", nil
@@ -302,11 +324,26 @@ func (p *Planner) Reparse(ctx context.Context, o ReparseOpts) (Summary, error) {
 		return s, nil
 	}
 
+	// One call at a time past this point: two callers that both saw no live
+	// worker would otherwise each start a full set of machines.
+	release, locked, err := p.lock(ctx)
+	if err != nil {
+		return s, fmt.Errorf("lock: %w", err)
+	}
+	if !locked {
+		s.Locked = true
+		return s, nil
+	}
+	defer release()
+
 	machines, err := p.M.List(ctx)
 	if err != nil {
 		return s, err
 	}
 	alive := 0
+	newest := 0                  // newest attempt among the live workers of this version
+	liveShards := map[int]bool{} // shards of that attempt with a live machine
+	idle := map[string]string{}  // machine name -> id of this version's machines that are not alive
 	for _, m := range machines {
 		if m.Config.Metadata["role"] != "reparse" {
 			continue
@@ -322,6 +359,16 @@ func (p *Planner) Reparse(ctx context.Context, o ReparseOpts) (Summary, error) {
 			}
 		case m.Alive():
 			alive++
+			if a, aerr := strconv.Atoi(m.Config.Metadata["attempt"]); aerr == nil {
+				if a > newest {
+					newest, liveShards = a, map[int]bool{}
+				}
+				if k, kerr := strconv.Atoi(m.Config.Metadata["shard"]); kerr == nil && a == newest {
+					liveShards[k] = true
+				}
+			}
+		default:
+			idle[m.Name] = m.ID
 		}
 	}
 
@@ -344,6 +391,16 @@ func (p *Planner) Reparse(ctx context.Context, o ReparseOpts) (Summary, error) {
 	if alive > 0 {
 		s.AlreadyRunning = true
 		s.Machines = alive
+		// A call cut off half-way leaves the later shards of its attempt
+		// unstarted: create the ones that still have work and no machine.
+		if newest > 0 {
+			started, err := p.startMissing(ctx, strconv.Itoa(newest), items, liveShards, idle)
+			s.Started = started
+			s.Machines += len(started)
+			if err != nil {
+				return s, err
+			}
+		}
 		return s, nil
 	}
 
@@ -367,10 +424,84 @@ func (p *Planner) Reparse(ctx context.Context, o ReparseOpts) (Summary, error) {
 			p.sleep(300 * time.Millisecond)
 		}
 		req := p.workerRequest(plan, k, planKey)
+		if id, ok := idle[req.Name]; ok {
+			_ = p.M.Delete(ctx, id) // a dead machine of the same name would refuse the create
+		}
 		if _, err := p.M.Create(ctx, req); err != nil {
 			return s, fmt.Errorf("create machine %s: %w", req.Name, err)
 		}
 		s.Started = append(s.Started, req.Name)
 	}
 	return s, nil
+}
+
+// startMissing creates the machines of an attempt's shards that still have
+// replays to do and no live machine.
+func (p *Planner) startMissing(ctx context.Context, attempt string, todo []PlanItem, live map[int]bool, idle map[string]string) ([]string, error) {
+	var plan Plan
+	planKey := vault.AttemptKey(p.Cfg.Version, attempt)
+	if ok, err := p.V.GetJSON(ctx, planKey, &plan); err != nil || !ok || plan.Shards < 1 {
+		return nil, err
+	}
+	inPlan := map[int64]bool{}
+	for _, it := range plan.Items {
+		inPlan[it.ID] = true
+	}
+	hasWork := map[int]bool{}
+	for _, it := range todo {
+		if inPlan[it.ID] {
+			hasWork[Shard(it.ID, plan.Shards)] = true
+		}
+	}
+	var started []string
+	for k := 0; k < plan.Shards; k++ {
+		if live[k] || !hasWork[k] {
+			continue
+		}
+		if len(started) > 0 {
+			p.sleep(300 * time.Millisecond)
+		}
+		req := p.workerRequest(plan, k, planKey)
+		if id, ok := idle[req.Name]; ok {
+			_ = p.M.Delete(ctx, id)
+		}
+		if _, err := p.M.Create(ctx, req); err != nil {
+			return started, fmt.Errorf("create machine %s: %w", req.Name, err)
+		}
+		started = append(started, req.Name)
+	}
+	return started, nil
+}
+
+// lockTTL bounds how long a crashed caller can keep others out.
+const lockTTL = 10 * time.Minute
+
+type runLock struct {
+	At string `json:"at"`
+}
+
+// lock takes the per-version start lock: a conditional create of
+// _vault/runs/<ver>/lock. A lock older than lockTTL is stale (its owner died)
+// and is taken over. locked=false means another call holds it.
+func (p *Planner) lock(ctx context.Context) (release func(), locked bool, err error) {
+	key := vault.LockKey(p.Cfg.Version)
+	for try := 0; try < 2; try++ {
+		created, err := p.V.PutJSONIfAbsent(ctx, key, runLock{At: p.now().Format(time.RFC3339)})
+		if err != nil {
+			return nil, false, err
+		}
+		if created {
+			return func() { _ = p.V.S.Delete(context.WithoutCancel(ctx), key) }, true, nil
+		}
+		var cur runLock
+		if ok, err := p.V.GetJSON(ctx, key, &cur); err != nil {
+			return nil, false, err
+		} else if ok {
+			if at, perr := time.Parse(time.RFC3339, cur.At); perr == nil && p.now().Sub(at) < lockTTL {
+				return nil, false, nil
+			}
+		}
+		_ = p.V.S.Delete(ctx, key) // stale, or released between the two calls
+	}
+	return nil, false, nil
 }

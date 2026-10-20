@@ -40,6 +40,7 @@ type Report struct {
 	Deleted       int     `json:"deleted"`
 	PinnedPro     int     `json:"pinned_pro"`
 	ProSkipped    int     `json:"pro_skipped_no_pins,omitempty"`
+	ChangedSkip   int     `json:"changed_skipped,omitempty"`
 	UnknownPatch  int     `json:"unknown_patch"`
 	ResolvedPatch int     `json:"resolved_patch"`
 	Aborted       string  `json:"aborted,omitempty"`
@@ -247,7 +248,12 @@ func Run(ctx context.Context, v *vault.Vault, cfg Config) (Report, error) {
 	if len(unknown) > 0 {
 		times = startTimes(ctx, v, unknown)
 	}
-	var cands []int64
+	type cand struct {
+		id    int64
+		kind  vault.Kind
+		patch int
+	}
+	var cands []cand
 	for _, o := range pool {
 		patch := 0
 		if o.Meta.Patch != "" {
@@ -267,11 +273,13 @@ func Run(ctx context.Context, v *vault.Vault, cfg Config) (Report, error) {
 			continue
 		}
 		if patch < prev.ID {
-			cands = append(cands, o.ID)
+			cands = append(cands, cand{o.ID, o.Meta.Kind, patch})
 		}
 	}
 	rep.Candidates = len(cands)
-	rep.CandidateIDs = cands
+	for _, c := range cands {
+		rep.CandidateIDs = append(rep.CandidateIDs, c.id)
+	}
 	if len(rep.CandidateIDs) > 500 {
 		rep.CandidateIDs = rep.CandidateIDs[:500]
 	}
@@ -285,9 +293,22 @@ func Run(ctx context.Context, v *vault.Vault, cfg Config) (Report, error) {
 		return finish(nil)
 	}
 	if cfg.Apply {
-		for _, id := range cands {
-			if err := v.S.Delete(ctx, vault.ReplayKey(id)); err != nil {
-				return finish(fmt.Errorf("delete %d: %w", id, err))
+		for _, c := range cands {
+			// The decision rests on HEADs taken minutes ago: look again, and
+			// leave the object alone if it was upgraded or re-dated meanwhile.
+			cur, ok, err := v.Find(ctx, c.id)
+			if err != nil {
+				return finish(fmt.Errorf("recheck %d: %w", c.id, err))
+			}
+			if !ok {
+				continue
+			}
+			if cur.Meta.Kind != c.kind || (cur.Meta.Patch != "" && cur.Meta.Patch != strconv.Itoa(c.patch)) {
+				rep.ChangedSkip++
+				continue
+			}
+			if err := v.S.Delete(ctx, vault.ReplayKey(c.id)); err != nil {
+				return finish(fmt.Errorf("delete %d: %w", c.id, err))
 			}
 			rep.Deleted++
 		}
