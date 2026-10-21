@@ -172,6 +172,17 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.15.4 — a refused re-parse machine no longer stalls the run (no change to the parse)
+
+- The parse output is byte-identical to 4.15.0. 4.15.3 asked for 16 workers and
+  the Machines API refused the 15th: the org's machine limit (20, six of them
+  always taken). Its shards had no machine, so the run could not finish or
+  dispatch the page refresh. Now each worker marks its shard taken
+  (`_vault/runs/<ver>/claims-<attempt>/shard-<k>`); a worker done with its own
+  shard takes the replays of shards nobody took, one item claim each, so the
+  started workers split them. The planner reports refused machines
+  (`unstarted`, `refused`) instead of failing the call. `REPARSE_MACHINES=12`.
+
 ### 4.15.3 — the vault re-parses itself after a release (no change to the parse)
 
 - The parse output is byte-identical to 4.15.0. `fly.toml`: `REPARSE_AUTO=1`,

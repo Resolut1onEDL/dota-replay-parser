@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +57,7 @@ type Worker struct {
 	WebURL    string
 	Token     string // VAULT_SERVICE_TOKEN, never logged
 	Sleep     func(time.Duration)
+	Now       func() time.Time
 	Backoff   time.Duration // base of the retry backoff (1s default)
 	RoleLabel string
 	// MaxFailures and MaxBody default to defaultMaxFailures and defaultMaxBody.
@@ -66,6 +68,7 @@ type Worker struct {
 // Stats is what a worker did.
 type Stats struct {
 	Mine, Skipped, Delivered, Bad, Failed, Gone int64
+	Shared                                      int64 // replays of unclaimed shards this worker took
 	Dispatch                                    string
 }
 
@@ -79,9 +82,15 @@ func (w *Worker) sleep(d time.Duration) {
 	time.Sleep(d)
 }
 
-// Run works through this shard's replays, then (if every replay of the plan
-// has a marker) triggers the single page refresh. A non-nil error means some
-// replay did not get a marker; the daily maintain resumes those.
+// orphanGrace: how long after the plan's start every machine the planner
+// created has had time to boot and claim its shard.
+const orphanGrace = 3 * time.Minute
+
+// Run works through this shard's replays, then through the replays of the
+// shards no machine claimed (the Machines API refused them: the org's machine
+// limit), each taken by one worker through an item claim, and then (if every
+// replay of the plan has a marker) triggers the single page refresh. A non-nil
+// error means some replay did not get a marker; the daily maintain resumes those.
 func (w *Worker) Run(ctx context.Context) (Stats, error) {
 	var st Stats
 	if w.WebURL == "" || w.Token == "" {
@@ -112,6 +121,9 @@ func (w *Worker) Run(ctx context.Context) (Stats, error) {
 	}
 	st.Mine = int64(len(mine))
 	log.Printf("reparse: role=worker version=%s shard=%d/%d items=%d valve_requests=0", w.Version, w.Shard, w.Shards, len(mine))
+	if _, err := w.V.PutJSONIfAbsent(ctx, vault.ClaimKey(w.Version, plan.Attempt, "shard-"+strconv.Itoa(w.Shard)), map[string]int{"shard": w.Shard}); err != nil {
+		log.Printf("reparse: claim of shard %d not written: %v", w.Shard, err)
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -146,6 +158,7 @@ func (w *Worker) Run(ctx context.Context) (Stats, error) {
 	for _, it := range mine {
 		work <- it
 	}
+	w.shareOrphans(ctx, plan, done, work, &st)
 	close(work)
 	wg.Wait()
 
@@ -184,6 +197,46 @@ func (w *Worker) Run(ctx context.Context) (Stats, error) {
 	}
 	log.Printf("reparse: dispatch=%s", d)
 	return st, nil
+}
+
+// shareOrphans feeds the pool the replays of shards no machine claimed, one
+// item claim at a time, so the workers that finish first split them.
+func (w *Worker) shareOrphans(ctx context.Context, plan Plan, done map[int64]bool, work chan<- PlanItem, st *Stats) {
+	if w.Shards <= 1 || ctx.Err() != nil {
+		return
+	}
+	if at, err := time.Parse(time.RFC3339, plan.StartedAt); err == nil {
+		if wait := orphanGrace - w.since(at); wait > 0 {
+			w.sleep(wait)
+		}
+	}
+	for k := 0; k < w.Shards; k++ {
+		if k == w.Shard || ctx.Err() != nil {
+			continue
+		}
+		claimed, err := w.V.Exists(ctx, vault.ClaimKey(w.Version, plan.Attempt, "shard-"+strconv.Itoa(k)))
+		if err != nil || claimed {
+			continue
+		}
+		for _, it := range plan.Items {
+			if Shard(it.ID, w.Shards) != k || done[it.ID] || ctx.Err() != nil {
+				continue
+			}
+			took, err := w.V.PutJSONIfAbsent(ctx, vault.ClaimKey(w.Version, plan.Attempt, "item-"+strconv.FormatInt(it.ID, 10)), map[string]int{"shard": w.Shard})
+			if err != nil || !took {
+				continue
+			}
+			atomic.AddInt64(&st.Shared, 1)
+			work <- it
+		}
+	}
+}
+
+func (w *Worker) since(t time.Time) time.Duration {
+	if w.Now != nil {
+		return w.Now().Sub(t)
+	}
+	return time.Since(t)
 }
 
 // recordFailure counts a failed attempt at a replay and, once the limit is

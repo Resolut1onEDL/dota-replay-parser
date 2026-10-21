@@ -11,10 +11,12 @@ primary_region = "arn"
   # scripts/release-sync.sh always brings the daily maintain machine to the new
   # image and env (RETENTION_APPLY, WEB_URL); it starts the re-parse of the stored
   # replays only when REPARSE_AUTO is 1 (on since 4.15.3: the vault is filled).
-  # 16 workers: the 4.15.2 trial took 53 min on 8 for 1885 games; the same
-  # machine time, half the wait.
+  # 12 workers: the 4.15.2 trial took 53 min on 8 for 1885 games. The org's
+  # machine limit is 20 (6 always there: parse x2 + maintain, lobby bots, GC,
+  # lead agent) — 4.15.3 got 14 of 16; leave room for a deploy elsewhere. A
+  # refused machine no longer stalls a run: the started workers share its shard.
   REPARSE_AUTO = "1"
-  REPARSE_MACHINES = "16"
+  REPARSE_MACHINES = "12"
   REPARSE_MAX_RUNTIME = "150m"
   RETENTION_APPLY = "0"
 
