@@ -49,6 +49,13 @@ func RunsPrefix(ver string) string        { return runsPrefix + ver + "/" }
 func DoneRoot() string                    { return donePrefix }
 func LockKey(ver string) string           { return runsPrefix + ver + "/lock" }
 
+// ClaimKey is a worker's mark on part of an attempt — "shard-<k>" (the machine
+// of shard k is up) or "item-<id>" (a replay of a shard no machine took, taken
+// by a worker that finished its own): a conditional create, the first wins.
+func ClaimKey(ver, stamp, what string) string {
+	return runsPrefix + ver + "/claims-" + stamp + "/" + what
+}
+
 // FailKey holds the failure count of one replay for one parser version.
 func FailKey(ver string, id int64) string {
 	return failedPrefix + ver + "/" + strconv.FormatInt(id, 10)

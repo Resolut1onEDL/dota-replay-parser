@@ -80,6 +80,10 @@ type Summary struct {
 	Dispatch   string `json:"dispatch,omitempty"`
 	Maintain   string `json:"maintain,omitempty"`
 	Attempt    string `json:"attempt,omitempty"`
+	// Unstarted shards the Machines API refused (the org's machine limit): the
+	// workers that finish first share their replays (Worker.Run).
+	Unstarted int    `json:"unstarted,omitempty"`
+	Refused   string `json:"refused,omitempty"`
 }
 
 func (p *Planner) now() time.Time {
@@ -417,7 +421,9 @@ func (p *Planner) Reparse(ctx context.Context, o ReparseOpts) (Summary, error) {
 			s.Started = started
 			s.Machines += len(started)
 			if err != nil {
-				return s, err
+				// no room while the run's workers live: they share the shards left without one
+				s.Refused = err.Error()
+				log.Printf("reparse: missing shards not started (%v): the live workers share them", err)
 			}
 		}
 		return s, nil
@@ -447,7 +453,13 @@ func (p *Planner) Reparse(ctx context.Context, o ReparseOpts) (Summary, error) {
 			_ = p.M.Delete(ctx, id) // a dead machine of the same name would refuse the create
 		}
 		if _, err := p.M.Create(ctx, req); err != nil {
-			return s, fmt.Errorf("create machine %s: %w", req.Name, err)
+			if len(s.Started) == 0 {
+				return s, fmt.Errorf("create machine %s: %w", req.Name, err)
+			}
+			// the started workers share the rest once their own shard is done
+			s.Unstarted, s.Refused = plan.Shards-k, err.Error()
+			log.Printf("reparse: %d of %d machines started, the rest refused (%v): the started ones share their replays", k, plan.Shards, err)
+			break
 		}
 		s.Started = append(s.Started, req.Name)
 	}

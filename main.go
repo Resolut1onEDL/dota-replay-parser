@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.15.3"
+const parserVersion = "4.15.4"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 

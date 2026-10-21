@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -478,6 +479,8 @@ func TestWorkerSkipsDoneAndOtherShards(t *testing.T) {
 	}
 	v.WriteDone(context.Background(), "4.15.1", 3, vault.Done{OK: true})
 	v.WriteDone(context.Background(), "4.15.1", 4, vault.Done{OK: true})
+	// shard 1's machine is up (its claim is there): its replays are its own
+	v.PutJSONIfAbsent(context.Background(), vault.ClaimKey("4.15.1", "1", "shard-1"), map[string]int{"shard": 1})
 	w := newWorker(t, v, srv.URL, &fakeGH{}, Plan{Attempt: "1", Shards: 2, Items: items}, 0, 2)
 	st, err := w.Run(context.Background())
 	if err != nil {
@@ -492,6 +495,69 @@ func TestWorkerSkipsDoneAndOtherShards(t *testing.T) {
 	}
 	if st.Dispatch != "" {
 		t.Fatalf("dispatched while shard 1 is still open: %q", st.Dispatch)
+	}
+}
+
+// The Machines API refused shards 2 and 3 of 4 (the org's machine limit, 21.10:
+// 14 of 16 started): the two workers that did start share their replays, each
+// taken once, and the last one out dispatches.
+func TestWorkersShareTheShardsNoMachineTook(t *testing.T) {
+	srv, calls := fakeWeb(t, func(webCall) (int, string) { return 200, okResp })
+	v := vault.New(vault.NewMemStore())
+	var items []PlanItem
+	for i := int64(1); i <= 60; i++ {
+		put(t, v, i, vault.Meta{Kind: vault.KindStudent})
+		items = append(items, PlanItem{i, vault.KindStudent})
+	}
+	plan := Plan{Attempt: "7", Shards: 4, Items: items, StartedAt: "2026-10-21T02:04:40Z"}
+	gh := &fakeGH{}
+	w0 := newWorker(t, v, srv.URL, gh, plan, 0, 4)
+	w1 := newWorker(t, v, srv.URL, gh, plan, 1, 4)
+	var slept time.Duration
+	clock := func() time.Time { return time.Date(2026, 10, 21, 2, 5, 40, 0, time.UTC) } // a minute after the start
+	w0.Now, w0.Sleep = clock, func(d time.Duration) { slept += d }
+	w1.Now = clock
+	// both machines are up before either looks for orphans
+	ctx := context.Background()
+	for k := 0; k < 2; k++ {
+		v.PutJSONIfAbsent(ctx, vault.ClaimKey("4.15.1", "7", "shard-"+strconv.Itoa(k)), map[string]int{"shard": k})
+	}
+	var wg sync.WaitGroup
+	var s0, s1 Stats
+	var e0, e1 error
+	wg.Add(2)
+	go func() { defer wg.Done(); s0, e0 = w0.Run(ctx) }()
+	go func() { defer wg.Done(); s1, e1 = w1.Run(ctx) }()
+	wg.Wait()
+	if e0 != nil || e1 != nil {
+		t.Fatalf("errors %v %v", e0, e1)
+	}
+	seen := map[string]int{}
+	for _, c := range *calls {
+		seen[c.id]++
+	}
+	if len(seen) != 60 {
+		t.Fatalf("delivered %d distinct replays, want all 60", len(seen))
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("replay %s delivered %d times", id, n)
+		}
+	}
+	orphans := 0
+	for _, it := range items {
+		if k := Shard(it.ID, 4); k >= 2 {
+			orphans++
+		}
+	}
+	if s0.Shared+s1.Shared != int64(orphans) {
+		t.Fatalf("shared %d+%d, want the %d replays of shards 2 and 3", s0.Shared, s1.Shared, orphans)
+	}
+	if slept != 2*time.Minute {
+		t.Fatalf("waited %v for the other machines to boot, want the rest of the 3-minute grace", slept)
+	}
+	if gh.dispatches.Load() != 1 {
+		t.Fatalf("dispatches = %d", gh.dispatches.Load())
 	}
 }
 
@@ -769,9 +835,9 @@ func TestReparseCompletesAPartiallyStartedAttempt(t *testing.T) {
 	p, v, fm, _ := newPlanner(t)
 	ctx := context.Background()
 	fill(t, v, 400) // 8 machines
-	fm.failAt = 4   // the Machines API gives out after three
-	if _, err := p.Reparse(ctx, ReparseOpts{}); err == nil {
-		t.Fatal("the cut-off call must report the failure")
+	fm.failAt = 4   // the Machines API gives out after three (the org's machine limit)
+	if s, err := p.Reparse(ctx, ReparseOpts{}); err != nil || s.Unstarted != 5 || s.Refused == "" {
+		t.Fatalf("a refused machine after three started: %+v err=%v; the started ones share the rest", s, err)
 	}
 	if len(fm.created) != 3 {
 		t.Fatalf("created %d, want 3", len(fm.created))
@@ -926,6 +992,8 @@ func TestWorkerCountsAGoneReplayAndStillDispatches(t *testing.T) {
 	// a replay that is still stored but has no marker keeps the dispatch back
 	v2 := vault.New(vault.NewMemStore())
 	put(t, v2, 70, vault.Meta{Kind: vault.KindStudent})
+	// replay 70's shard has its machine up (claimed), still working on it
+	v2.PutJSONIfAbsent(context.Background(), vault.ClaimKey("4.15.1", "1", "shard-"+strconv.Itoa(Shard(70, 2))), map[string]int{"shard": Shard(70, 2)})
 	w2 := newWorker(t, v2, srv.URL, &fakeGH{}, Plan{Attempt: "1", Shards: 2, Items: []PlanItem{{70, "student"}}}, 1-Shard(70, 2), 2)
 	if st, _ := w2.Run(context.Background()); st.Dispatch != "" {
 		t.Fatalf("dispatched with replay 70 still open: %+v", st)
