@@ -172,6 +172,14 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.15.3 — the vault re-parses itself after a release (no change to the parse)
+
+- The parse output is byte-identical to 4.15.0. `fly.toml`: `REPARSE_AUTO=1`,
+  so `scripts/release-sync.sh` starts the re-parse of the whole vault after the
+  deploy, and `REPARSE_MACHINES=16` (the 4.15.2 trial: 1885 games in 53 min on
+  8 workers, 0 failed, 0 Valve requests). This release is the first re-parse
+  with no manual command.
+
 ### 4.15.2 — re-parse machines start in their role (no change to the parse)
 
 - The parse output is byte-identical to 4.15.0. The temporary re-parse machines

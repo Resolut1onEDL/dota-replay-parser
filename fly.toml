@@ -10,9 +10,11 @@ primary_region = "arn"
   # Replay vault (Tigris): off until the bucket and secrets exist. After a deploy
   # scripts/release-sync.sh always brings the daily maintain machine to the new
   # image and env (RETENTION_APPLY, WEB_URL); it starts the re-parse of the stored
-  # replays only when REPARSE_AUTO is 1 (keep 0 until the backfill is done).
-  REPARSE_AUTO = "0"
-  REPARSE_MACHINES = "8"
+  # replays only when REPARSE_AUTO is 1 (on since 4.15.3: the vault is filled).
+  # 16 workers: the 4.15.2 trial took 53 min on 8 for 1885 games; the same
+  # machine time, half the wait.
+  REPARSE_AUTO = "1"
+  REPARSE_MACHINES = "16"
   REPARSE_MAX_RUNTIME = "150m"
   RETENTION_APPLY = "0"
 
