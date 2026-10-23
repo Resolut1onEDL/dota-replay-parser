@@ -139,6 +139,8 @@ if [ -d "$WEB_DIR/parser" ]; then
   done
   # go.mod replaces manta with the patched copy in third_party/ (fixed8 fix)
   rsync -a --delete "$PARSER_REPO/third_party/" "$WEB_DIR/parser/third_party/"
+  # the fixtures main_test.go reads (4.14.0: testdata/lanes-9038946200.json, 88 KB): without them the copy's go test fails
+  rsync -a --delete "$PARSER_REPO/testdata/" "$WEB_DIR/parser/testdata/"
   git -C "$PARSER_REPO" rev-parse "$V^{commit}" > "$WEB_DIR/parser/UPSTREAM_COMMIT"
   (cd "$WEB_DIR/parser" && go build -o parser .)
   got=$("$WEB_DIR/parser/parser" --version 2>/dev/null || echo "?")
