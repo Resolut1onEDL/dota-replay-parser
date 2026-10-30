@@ -2,6 +2,11 @@
 // deliberately timid: dry-run unless told otherwise, only coach and pro
 // kinds, never a pro game the web still references, and no run may remove
 // more than a quarter of what it could remove.
+//
+// It also removes the free players' games the web parsed ahead of a request
+// and nobody opened in 7 days (web specs/2026-10-30-prefetch-active-replays.md):
+// only the ids the web's purge route names, only of kind student, dry-run
+// unless PrefetchApply, at most PrefetchMax a run.
 package retention
 
 import (
@@ -27,25 +32,39 @@ type Config struct {
 	Token      string // VAULT_SERVICE_TOKEN for the pins route
 	HTTP       *http.Client
 	Now        func() time.Time
+	// PrefetchApply deletes the games the web's purge route names (dry-run otherwise).
+	PrefetchApply bool
+	// PrefetchMax caps the deletions of one run (default 2000).
+	PrefetchMax int
 }
 
 // Report is written to _vault/retention/<date>.json.
 type Report struct {
-	At            string  `json:"at"`
-	Apply         bool    `json:"apply"`
-	CurrentPatch  int     `json:"current_patch"`
-	PreviousPatch int     `json:"previous_patch"`
-	Pool          int     `json:"pool"`
-	Candidates    int     `json:"candidates"`
-	Deleted       int     `json:"deleted"`
-	PinnedPro     int     `json:"pinned_pro"`
-	ProSkipped    int     `json:"pro_skipped_no_pins,omitempty"`
-	ChangedSkip   int     `json:"changed_skipped,omitempty"`
-	UnknownPatch  int     `json:"unknown_patch"`
-	ResolvedPatch int     `json:"resolved_patch"`
-	Aborted       string  `json:"aborted,omitempty"`
-	Error         string  `json:"error,omitempty"`
-	CandidateIDs  []int64 `json:"candidate_ids,omitempty"`
+	At            string         `json:"at"`
+	Apply         bool           `json:"apply"`
+	CurrentPatch  int            `json:"current_patch"`
+	PreviousPatch int            `json:"previous_patch"`
+	Pool          int            `json:"pool"`
+	Candidates    int            `json:"candidates"`
+	Deleted       int            `json:"deleted"`
+	PinnedPro     int            `json:"pinned_pro"`
+	ProSkipped    int            `json:"pro_skipped_no_pins,omitempty"`
+	ChangedSkip   int            `json:"changed_skipped,omitempty"`
+	UnknownPatch  int            `json:"unknown_patch"`
+	ResolvedPatch int            `json:"resolved_patch"`
+	Aborted       string         `json:"aborted,omitempty"`
+	Error         string         `json:"error,omitempty"`
+	CandidateIDs  []int64        `json:"candidate_ids,omitempty"`
+	Prefetch      PrefetchReport `json:"prefetch"`
+}
+
+// PrefetchReport is the part of a run that removes the games parsed ahead.
+type PrefetchReport struct {
+	Apply      bool   `json:"apply"`
+	Listed     int    `json:"listed"`     // ids the web named
+	Candidates int    `json:"candidates"` // of them in the vault, kind student
+	Deleted    int    `json:"deleted"`
+	Error      string `json:"error,omitempty"`
 }
 
 type patchEntry struct {
@@ -141,6 +160,73 @@ func (c Config) pins(ctx context.Context) (map[int64]bool, bool) {
 	return set, true
 }
 
+// purgeList asks the web for the games parsed ahead that may go. An error or a
+// missing route deletes nothing.
+func (c Config) purgeList(ctx context.Context) ([]int64, error) {
+	if c.WebURL == "" || c.Token == "" {
+		return nil, fmt.Errorf("web url or token missing")
+	}
+	b, code, err := c.get(ctx, strings.TrimRight(c.WebURL, "/")+"/api/internal/vault/purge", c.Token)
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("purge route: %d", code)
+	}
+	var out struct {
+		Prefetch []json.Number `json:"prefetch"`
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(out.Prefetch))
+	for _, n := range out.Prefetch {
+		if id, err := strconv.ParseInt(n.String(), 10, 64); err == nil && id > 0 {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// purgePrefetch removes the named games that the vault holds as a student's
+// game; anything else the list names is left alone.
+func purgePrefetch(ctx context.Context, v *vault.Vault, cfg Config) PrefetchReport {
+	rep := PrefetchReport{Apply: cfg.PrefetchApply}
+	ids, err := cfg.purgeList(ctx)
+	if err != nil {
+		rep.Error = "purge_list_unavailable: " + err.Error()
+		return rep
+	}
+	rep.Listed = len(ids)
+	max := cfg.PrefetchMax
+	if max <= 0 {
+		max = 2000
+	}
+	for _, id := range ids {
+		if rep.Candidates >= max {
+			break
+		}
+		cur, ok, err := v.Find(ctx, id)
+		if err != nil {
+			rep.Error = fmt.Sprintf("find %d: %v", id, err)
+			return rep
+		}
+		if !ok || cur.Meta.Kind != vault.KindStudent {
+			continue
+		}
+		rep.Candidates++
+		if !cfg.PrefetchApply {
+			continue
+		}
+		if err := v.S.Delete(ctx, vault.ReplayKey(id)); err != nil {
+			rep.Error = fmt.Sprintf("delete %d: %v", id, err)
+			return rep
+		}
+		rep.Deleted++
+	}
+	return rep
+}
+
 func semverLess(a, b string) bool {
 	pa, pb := strings.Split(a, "."), strings.Split(b, ".")
 	for i := 0; i < len(pa) && i < len(pb); i++ {
@@ -190,6 +276,9 @@ func Run(ctx context.Context, v *vault.Vault, cfg Config) (Report, error) {
 		}
 		return rep, err
 	}
+
+	// the games parsed ahead go by the web's list, whatever the patch step finds
+	rep.Prefetch = purgePrefetch(ctx, v, cfg)
 
 	all, cur, prev, err := cfg.patches(ctx)
 	if err != nil {
