@@ -128,11 +128,15 @@ func runMaintain(ctx context.Context) error {
 		WebURL:     vaultCfg.WebURL,
 		Token:      vaultCfg.ServiceToken,
 		HTTP:       &http.Client{Timeout: 30 * time.Second},
+		// the web's games parsed ahead and unopened for 7 days (dry-run until the founder sets it)
+		PrefetchApply: os.Getenv("PREFETCH_PURGE_APPLY") == "1",
 	})
 	if err != nil {
 		errs = append(errs, fmt.Errorf("retention: %w", err))
 	}
 	log.Printf("maintain: retention apply=%v pool=%d candidates=%d deleted=%d unknown_patch=%d aborted=%q error=%q",
 		rep.Apply, rep.Pool, rep.Candidates, rep.Deleted, rep.UnknownPatch, rep.Aborted, rep.Error)
+	log.Printf("maintain: prefetch purge apply=%v listed=%d candidates=%d deleted=%d error=%q",
+		rep.Prefetch.Apply, rep.Prefetch.Listed, rep.Prefetch.Candidates, rep.Prefetch.Deleted, rep.Prefetch.Error)
 	return errors.Join(errs...)
 }

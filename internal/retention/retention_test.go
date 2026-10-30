@@ -25,12 +25,14 @@ const patchJSON = `[
  {"id":61,"name":"7.42","date":"2026-12-01T00:00:00Z"}]`
 
 type env struct {
-	v      *vault.Vault
-	mem    *vault.MemStore
-	od     *httptest.Server
-	web    *httptest.Server
-	pinsOK bool
-	pins   []int64
+	v       *vault.Vault
+	mem     *vault.MemStore
+	od      *httptest.Server
+	web     *httptest.Server
+	pinsOK  bool
+	pins    []int64
+	purge   []int64
+	purgeOK bool
 }
 
 func setup(t *testing.T) *env {
@@ -45,6 +47,10 @@ func setup(t *testing.T) *env {
 		w.Write([]byte(patchJSON))
 	}))
 	e.web = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/internal/vault/purge" && r.Header.Get("Authorization") == "Bearer svc" && e.purgeOK {
+			json.NewEncoder(w).Encode(map[string]any{"prefetch": e.purge})
+			return
+		}
 		if r.URL.Path != "/api/internal/vault/pins" || r.Header.Get("Authorization") != "Bearer svc" || !e.pinsOK {
 			w.WriteHeader(404)
 			return
@@ -273,5 +279,47 @@ func TestACoachCopyOfAProGameCannotShedItsProtection(t *testing.T) {
 	rep, _ := Run(context.Background(), e.v, e.cfg(true))
 	if rep.Deleted != 0 || rep.PinnedPro != 1 || !e.has(1) {
 		t.Fatalf("a pinned pro game was deleted: %+v", rep)
+	}
+}
+
+// web specs/2026-10-30-prefetch-active-replays.md: the free players' games parsed ahead and unopened for 7 days go
+// by the web's list — only those it names, only a student's game, dry-run unless PrefetchApply.
+func TestPrefetchPurgeDeletesOnlyNamedStudentGames(t *testing.T) {
+	e := setup(t)
+	e.recent(t, 20)
+	e.put(t, 7001, vault.KindStudent, "60") // named: goes
+	e.put(t, 7002, vault.KindStudent, "60") // not named: stays
+	e.put(t, 7003, vault.KindPro, "60")     // named but a pro game: stays
+	e.purge, e.purgeOK = []int64{7001, 7003, 9999}, true
+
+	dry, err := Run(context.Background(), e.v, e.cfg(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Prefetch.Listed != 3 || dry.Prefetch.Candidates != 1 || dry.Prefetch.Deleted != 0 || !e.has(7001) {
+		t.Fatalf("dry run: %+v", dry.Prefetch)
+	}
+	cfg := e.cfg(false)
+	cfg.PrefetchApply = true
+	rep, err := Run(context.Background(), e.v, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Prefetch.Deleted != 1 || e.has(7001) || !e.has(7002) || !e.has(7003) {
+		t.Fatalf("apply: %+v", rep.Prefetch)
+	}
+}
+
+func TestPrefetchPurgeWithoutTheListDeletesNothing(t *testing.T) {
+	e := setup(t)
+	e.put(t, 7001, vault.KindStudent, "60")
+	cfg := e.cfg(false)
+	cfg.PrefetchApply = true
+	rep, err := Run(context.Background(), e.v, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Prefetch.Error == "" || rep.Prefetch.Deleted != 0 || !e.has(7001) {
+		t.Fatalf("no list: %+v", rep.Prefetch)
 	}
 }
