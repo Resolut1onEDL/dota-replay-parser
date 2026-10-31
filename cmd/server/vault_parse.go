@@ -139,6 +139,7 @@ func respondParsed(w http.ResponseWriter, out []byte, parseDur, download time.Du
 	}
 	w.Header().Set("X-Parse-Ms", fmt.Sprint(parseDur.Milliseconds()))
 	log.Printf("parsed in %s (json %d KB)", parseDur.Round(time.Millisecond), len(out)>>10)
+	http.NewResponseController(w).SetWriteDeadline(time.Now().Add(responseWriteTimeout))
 	w.Write(out)
 }
 

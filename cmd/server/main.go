@@ -52,6 +52,12 @@ var (
 	// checks) for minutes. Cap it so a slow CDN fails fast and the caller
 	// falls back, while a normal large download still completes.
 	downloadClient = &http.Client{Timeout: downloadTimeout()}
+	// How long a parsed answer may take to reach the client. A Fly suspend
+	// mid-request leaves a connection the proxy has dropped and the frozen VM
+	// never heard of; without a deadline the write waits out TCP retransmission
+	// (~15 min, 2026-10-31) holding the parse slot. A few MB over Fly's network
+	// take well under a second, so this only ever stops a dead client.
+	responseWriteTimeout = 60 * time.Second
 )
 
 func downloadTimeout() time.Duration {
@@ -402,6 +408,7 @@ func serveParsed(ctx context.Context, w http.ResponseWriter, demPath string, dow
 	}
 	w.Header().Set("X-Parse-Ms", fmt.Sprint(parseDur.Milliseconds()))
 	log.Printf("parsed in %s (json %d KB)", parseDur.Round(time.Millisecond), len(out)>>10)
+	http.NewResponseController(w).SetWriteDeadline(time.Now().Add(responseWriteTimeout))
 	w.Write(out)
 }
 
