@@ -11,12 +11,13 @@ primary_region = "arn"
   # scripts/release-sync.sh always brings the daily maintain machine to the new
   # image and env (RETENTION_APPLY, WEB_URL); it starts the re-parse of the stored
   # replays only when REPARSE_AUTO is 1 (on since 4.15.3: the vault is filled).
-  # 12 workers: the 4.15.2 trial took 53 min on 8 for 1885 games. The org's
-  # machine limit is 20 (6 always there: parse x2 + maintain, lobby bots, GC,
-  # lead agent) — 4.15.3 got 14 of 16; leave room for a deploy elsewhere. A
-  # refused machine no longer stalls a run: the started workers share its shard.
+  # 8 workers: the 4.15.2 trial took 53 min on 8 for 1885 games. The org's
+  # machine limit is 20 (11 always there: parse x6 + maintain, lobby bots, GC,
+  # lead agent, student refresh) — 4.15.3 got 14 of 16; leave room for a deploy
+  # elsewhere. A refused machine no longer stalls a run: the started workers
+  # share its shard.
   REPARSE_AUTO = "1"
-  REPARSE_MACHINES = "12"
+  REPARSE_MACHINES = "8"
   REPARSE_MAX_RUNTIME = "150m"
   RETENTION_APPLY = "0"
 
@@ -27,6 +28,15 @@ primary_region = "arn"
   auto_stop_machines = "suspend"
   auto_start_machines = true
   min_machines_running = 0
+
+  # A machine parses one replay at a time (MAX_CONCURRENT): the proxy sends it
+  # no second request and wakes another machine instead; with every machine
+  # busy it holds the request until one frees. Without this the default soft
+  # limit (20) kept one machine taking every parse and answering parser_busy.
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 1
+    hard_limit = 1
 
   [[http_service.checks]]
     interval = "30s"
