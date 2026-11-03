@@ -987,6 +987,38 @@ func TestDetectSpawnBlocks(t *testing.T) {
 	}
 }
 
+// v4.16.1: a tie on distance does not depend on the order the units come in (the entity map's, random). 9014199146
+// flipped between runs of one binary: at 1:00 Shadow Demon (4) and Dazzle (7) both 4.5 cells from a small camp's
+// spawner, at 41:00 Grimstroke (8) and a Naga Siren illusion (9) both 2.8 cells. A tie on cells goes to the unit
+// nearer by its exact position, whatever its kind or slot; a tie on that too to the lower entity index.
+func TestDetectSpawnBlocksTie(t *testing.T) {
+	for _, rev := range []bool{false, true} {
+		s := &ParserState{CampSpawners: [][2]float64{{88, 126}}, CampSpawnerFine: [][2]float64{{88.5, 126.5}}}
+		s.SpawnLives = []spawnLife{{camp: 0, species: "prowler_shaman", seen: 10}}
+		waiting := spawnUnit{player: 0, by: "waiting", x: 88, y: 126}
+		ties := [][]spawnUnit{
+			{{player: 7, by: "hero", x: 92, y: 128, fx: 92.2, fy: 128.1, ent: 300}, {player: 4, by: "hero", x: 84, y: 124, fx: 85.9, fy: 125, ent: 450}},
+			{{player: 8, by: "hero", x: 88, y: 128, fx: 88.6, fy: 129.9, ent: 100}, {player: 3, by: "illusion", x: 90, y: 126, fx: 90.1, fy: 126.6, ent: 500}},
+			{{player: 2, by: "hero", x: 86, y: 126, fx: 86.5, fy: 126.5, ent: 700}, {player: 6, by: "hero", x: 90, y: 126, fx: 90.5, fy: 126.5, ent: 200}},
+		}
+		for k, units := range ties {
+			if rev {
+				units = []spawnUnit{units[1], units[0]}
+			}
+			s.SpawnSnaps = append(s.SpawnSnaps, spawnSnap{t: float64(1200 + 60*k), units: units, neutrals: []spawnUnit{waiting}})
+		}
+		got := detectSpawnBlocks(s, nil)
+		want := []SpawnBlock{
+			{Time: 1200, CampX: 88, CampY: 126, CampTier: "ancient", Player: 4, By: "hero", Dist: 4.5},
+			{Time: 1260, CampX: 88, CampY: 126, CampTier: "ancient", Player: 3, By: "illusion", Dist: 2},
+			{Time: 1320, CampX: 88, CampY: 126, CampTier: "ancient", Player: 6, By: "hero", Dist: 2},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("reversed %v: got %+v, want %+v", rev, got, want)
+		}
+	}
+}
+
 // v4.11.0: a Tormentor kill from Valve's CHAT_MESSAGE_MINIBOSS_KILL. Match 9013821098: value 3, playerid_1 5 at
 // 20:58 — OpenDota's objectives say team 3, slot 5, 1259 s.
 func TestTormentorKill(t *testing.T) {
