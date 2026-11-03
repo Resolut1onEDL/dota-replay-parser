@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.15.4"
+const parserVersion = "4.16.0"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -28,6 +28,24 @@ type ItemPurchase struct {
 	ItemID   int     `json:"itemId"`
 	Time     float64 `json:"time"`
 	ItemName string  `json:"itemName,omitempty"`
+}
+
+// TPState is one change point of a player's teleport (v4.16.0): from T until the next row's T the hero held
+// Charges Town Portal Scrolls in the TP slot, and the teleport cooldown ran until CDEnd. A row is written only
+// when something changes — a scroll arrives or is spent, a cooldown starts (or is reset early), Boots of Travel
+// go on or off; the first row is at the horn, the last state lasts to the game's end.
+//
+// The cooldown is the engine's own (the scroll's m_fCooldown), so Octarine Core, talents, Spell Prism, neutral
+// items and Boots of Travel are already in it. Boots of Travel keep the scroll in the TP slot and never spend it
+// (Charges stays ≥ 1); their teleport is the scroll's, on a 40 s cooldown. After the last scroll is spent the
+// scroll is gone, and CDEnd keeps the end read at that use, so a new scroll bought before it would still wait.
+// Times are game seconds on the combat-log axis, like deathEvents. Seconds with no teleport ready that the
+// cooldown does not excuse: alive, Charges == 0 and t ≥ CDEnd.
+type TPState struct {
+	T       float64 `json:"t"`
+	Charges int     `json:"charges"`
+	CDEnd   float64 `json:"cdEnd,omitempty"`  // omitted: no cooldown running at T
+	Travel  int     `json:"travel,omitempty"` // Boots of Travel in the main slots: 1, or 2 for level 2
 }
 
 type WardEvent struct {
@@ -566,6 +584,7 @@ type PlayerStats struct {
 
 	// General stats
 	TPCount    int             `json:"tpCount,omitempty"`
+	TPTimeline []TPState       `json:"tpTimeline,omitempty"` // v4.16.0
 	CreepKills CreepKillPhases `json:"creepKills"`
 
 	// v4.6.0: enemy-base highground entries (whole game, not just laning).
@@ -1108,6 +1127,13 @@ type PlayerState struct {
 	// TP tracking
 	TPCount      int
 	CurrentHasTP bool // tracked from m_hItems.0015 entity
+	// v4.16.0: the teleport timeline (see TPState)
+	TPHeroEnt  int32   // the hero entity the timeline follows (the first real one seen)
+	TPSlotEnt  int32   // item entity in that hero's TP slot, 0 = empty
+	TPTravel   int     // Boots of Travel level in the main slots
+	TPCdEnd    float64 // last cooldown end read off the scroll, kept after the last one is spent
+	TPCdEnt    int32   // the scroll that cooldown was read off
+	TPTimeline []TPState
 
 	// Smoke tracking
 	SmokeCount int
@@ -1585,6 +1611,49 @@ func (s *ParserState) unitOwner(unit string) int {
 // combat-log axis (see EntityAxisOffset).
 func (s *ParserState) entityActual() float64 {
 	return s.ActualGameSeconds(s.GameTime()) + s.EntityAxisOffset
+}
+
+// observeTP reads the scroll in the hero's TP slot and writes a tpTimeline row when the state differs from the
+// last row (v4.16.0). m_fCooldown on an item is the time left, not the end; it jitters by a tick between reads,
+// so a cooldown end counts as new only when it moves by more than a second.
+func (s *ParserState) observeTP(ps *PlayerState) {
+	if s.GameStartTime <= 0 || (s.GameEndTime > 0 && s.GameTime() > s.GameEndTime) {
+		return
+	}
+	t := s.entityActual()
+	if t < 0 {
+		return
+	}
+	charges := 0
+	if ps.TPSlotEnt > 0 {
+		if ent := s.Parser.FindEntity(ps.TPSlotEnt); ent != nil && ent.GetClassName() == "CDOTA_Item_TeleportScroll" {
+			if c, ok := ent.GetInt32("m_iCurrentCharges"); ok && c > 0 {
+				charges = int(c)
+			}
+			if left, ok := ent.GetFloat32("m_fCooldown"); ok && left > 0 {
+				ps.TPCdEnd, ps.TPCdEnt = t+float64(left), ps.TPSlotEnt
+			} else if ps.TPCdEnd > t && ps.TPCdEnt == ps.TPSlotEnt {
+				ps.TPCdEnd = t // reset early (Refresher Orb); a scroll just bought reads 0 until its cooldown syncs
+			}
+		}
+	}
+	ps.recordTP(t, charges)
+}
+
+// recordTP appends a tpTimeline row for the state at t unless it is the last row's.
+func (ps *PlayerState) recordTP(t float64, charges int) {
+	cdEnd := 0.0
+	if ps.TPCdEnd > t {
+		cdEnd = math.Round(ps.TPCdEnd*10) / 10
+	}
+	if n := len(ps.TPTimeline); n > 0 {
+		last := ps.TPTimeline[n-1]
+		sameCd := math.Abs(cdEnd-last.CDEnd) <= 1 || (cdEnd == 0 && last.CDEnd <= t+1)
+		if last.Charges == charges && last.Travel == ps.TPTravel && sameCd {
+			return
+		}
+	}
+	ps.TPTimeline = append(ps.TPTimeline, TPState{T: math.Round(t*10) / 10, Charges: charges, CDEnd: cdEnd, Travel: ps.TPTravel})
 }
 
 // illusionEcho reports a combat-log entry made by one of the player's
@@ -3284,6 +3353,29 @@ func main() {
 					} else {
 						state.Players[playerIdx].CurrentHasTP = false
 					}
+					// v4.16.0: the teleport timeline follows one hero entity, the first real one seen — Meepo's clones
+					// and Arc Warden's Tempest Double carry TP slots of their own (9028084780: the double's 11
+					// teleports are in tpCount, not in the hero's timeline)
+					if ps := state.Players[playerIdx]; realHero {
+						if ps.TPHeroEnt == 0 || state.Parser.FindEntity(ps.TPHeroEnt) == nil {
+							ps.TPHeroEnt = e.GetIndex()
+						}
+						if ps.TPHeroEnt == e.GetIndex() {
+							ps.TPSlotEnt = 0
+							if handle, ok := e.GetUint32("m_hItems.0015"); ok && handle > 0 && handle < 16777215 {
+								ps.TPSlotEnt = int32(handle & 0x3FFF)
+							}
+							ps.TPTravel = 0
+							for _, n := range ps.FinalItems {
+								if n == "item_travel_boots_2" {
+									ps.TPTravel = 2
+								} else if n == "item_travel_boots" && ps.TPTravel == 0 {
+									ps.TPTravel = 1
+								}
+							}
+							state.observeTP(ps)
+						}
+					}
 
 					// Track ability ownership for skill build (scan ability handles via m_vecAbilities).
 					// v4.7.1: illusions owned by this player (Terrorblade's
@@ -3863,6 +3955,14 @@ func main() {
 				state.ItemEntities[idx] = name
 			} else {
 				state.ItemEntities[idx] = normalizeEntityItemName(strings.TrimPrefix(className, "CDOTA_Item_"))
+			}
+			// v4.16.0: a charge spent or a cooldown started shows on the scroll before the hero's next update
+			if className == "CDOTA_Item_TeleportScroll" {
+				for _, ps := range state.Players {
+					if ps != nil && ps.TPSlotEnt == idx {
+						state.observeTP(ps)
+					}
+				}
 			}
 		}
 
@@ -5172,6 +5272,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			},
 			RuneStats: buildRuneSummary(ps.Runes),
 			TPCount:   ps.TPCount,
+			TPTimeline: ps.TPTimeline,
 			HgEntries:      hgEntries[i],
 			HgEntriesCount: len(hgEntries[i]),
 			StackEvents:    stackEvents[i],
