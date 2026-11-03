@@ -2236,3 +2236,87 @@ func TestDetectLanesMeanMidStoodSideLane(t *testing.T) {
 		t.Errorf("got lane %q roamed %v, want \"safe\" not roamed", lanes[0], roamed[0])
 	}
 }
+
+// v4.16.0: a tpTimeline row only when the teleport state changes. The cooldown end read off the scroll jitters by a
+// tick between reads; a cooldown that runs out on its own writes nothing, one reset early (Refresher Orb) does.
+func TestRecordTP(t *testing.T) {
+	ps := &PlayerState{}
+	ps.recordTP(0.1, 1) // the horn: one scroll, no cooldown
+	ps.TPCdEnd = 380.04
+	ps.recordTP(300, 1) // the cast: an 80 s cooldown starts
+	ps.TPCdEnd = 380.1
+	ps.recordTP(300.2, 1) // the same cooldown, read a tick later
+	ps.recordTP(303, 0)   // the channel ends and spends the last scroll; its cooldown end stays
+	ps.recordTP(320, 1)   // a scroll bought during the cooldown
+	ps.recordTP(400, 1)   // the cooldown ran out: nothing changed
+	ps.TPTravel = 1
+	ps.recordTP(500, 1) // Boots of Travel
+	ps.TPCdEnd = 540
+	ps.recordTP(500.5, 1) // a 40 s teleport
+	ps.TPCdEnd = 510
+	ps.recordTP(510, 1) // Refresher Orb resets it
+	want := []TPState{
+		{T: 0.1, Charges: 1},
+		{T: 300, Charges: 1, CDEnd: 380},
+		{T: 303, Charges: 0, CDEnd: 380.1},
+		{T: 320, Charges: 1, CDEnd: 380.1},
+		{T: 500, Charges: 1, Travel: 1},
+		{T: 500.5, Charges: 1, CDEnd: 540, Travel: 1},
+		{T: 510, Charges: 1, Travel: 1},
+	}
+	if !reflect.DeepEqual(ps.TPTimeline, want) {
+		t.Errorf("timeline\n got %+v\nwant %+v", ps.TPTimeline, want)
+	}
+}
+
+// v4.16.0, match 8664300772: nobody had Boots of Travel or a cooldown reduction, so every teleport starts the
+// scroll's 80 s cooldown and spends one charge, and the cooldown starts are the tpCount teleports.
+func TestTPTimelineReplay(t *testing.T) {
+	demPath := filepath.Join("test-replays", "8664300772.dem")
+	if _, err := os.Stat(demPath); err != nil {
+		t.Skipf("no replay: %v", err)
+	}
+	bin := filepath.Join(t.TempDir(), "parser")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin, demPath).Output()
+	if err != nil {
+		t.Fatalf("parser run: %v", err)
+	}
+	var got Match
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("parser stdout not JSON: %v", err)
+	}
+	total := 0
+	for i, p := range got.Players {
+		tl := p.Stats.TPTimeline
+		if len(tl) == 0 || tl[0].T > 1 {
+			t.Errorf("player %d (%s): timeline starts %+v, want a row at the horn", i, p.HeroName, tl)
+			continue
+		}
+		uses, spent := 0, 0
+		for k := 1; k < len(tl); k++ {
+			r, prev := tl[k], tl[k-1]
+			if r.T < prev.T || r.Charges < 0 || r.Travel != 0 {
+				t.Errorf("player %d: row %+v after %+v", i, r, prev)
+			}
+			if r.CDEnd > 0 && math.Abs(r.CDEnd-prev.CDEnd) > 1 {
+				uses++
+				if l := r.CDEnd - r.T; math.Abs(l-80) > 0.5 {
+					t.Errorf("player %d: a %.1f s cooldown at %.1f, want 80", i, l, r.T)
+				}
+			}
+			if r.Charges < prev.Charges {
+				spent += prev.Charges - r.Charges
+			}
+		}
+		if uses != p.Stats.TPCount || spent != uses {
+			t.Errorf("player %d (%s): %d cooldowns, %d charges spent, tpCount %d", i, p.HeroName, uses, spent, p.Stats.TPCount)
+		}
+		total += uses
+	}
+	if total < 50 {
+		t.Errorf("%d teleports in the match, want the 57 seen", total)
+	}
+}

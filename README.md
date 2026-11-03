@@ -172,6 +172,34 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.16.0 — the teleport timeline
+
+- `players[].stats.tpTimeline` — `[{t, charges, cdEnd, travel}]`, a row each time
+  the hero's teleport changes: the Town Portal Scroll charges in the TP slot, the
+  game second its cooldown ends (omitted when none runs), Boots of Travel in the
+  main slots (`travel: 1|2`, omitted without). The first row is at the horn; the
+  last state lasts to the game's end. Times on the combat-log axis, like
+  `deathEvents`. Read off the real hero's scroll entity (`m_iCurrentCharges`;
+  `m_fCooldown` is the time left, not the end), so every cooldown reduction is
+  the engine's own. Boots of Travel keep the scroll in the slot and never spend
+  it — their teleport is the scroll's, on a 40 s cooldown. After the last scroll
+  is spent `cdEnd` keeps the end read at that use. Seconds with no teleport
+  ready that the cooldown does not excuse: alive, `charges == 0`, `t ≥ cdEnd`.
+- Checked on four audit replays (9014199146, 9015251447, 9013916315,
+  9032887997): cooldown starts = the TP casts in `itemCastEvents` for 40 of 40
+  players, = `tpCount` for 39 (a Boots of Travel 2 holder's `tpCount` is 2
+  higher: two `modifier_teleporting` with no cast; Arc Warden's `tpCount` also
+  holds his Tempest Double's teleports, the timeline is the hero's own —
+  9028084780: 22 and 11; Meepo's clones change nothing — 9032885465: 9 = 9);
+  324 teleports — 80 s ×256,
+  60 s ×4, 40 s with Boots of Travel ×62, 30 s ×2. Of 295 scrolls arriving,
+  105 are purchases and 185 come free at a death: the game gives one at almost
+  every death (none with Boots of Travel or on an Aegis), and the combat log
+  has no purchase for it — OpenDota's `purchase_log` lists the same 105. That
+  is why `itemPurchases` + the starting scroll fall short of `tpCount`.
+- Every other field byte-identical to 4.15.4 on those four (one
+  `spawnBlocks[].player` tie flips between runs of 4.15.4 itself); output +0.4–0.6 %.
+
 ### 4.15.4 — a refused re-parse machine no longer stalls the run (no change to the parse)
 
 - The parse output is byte-identical to 4.15.0. 4.15.3 asked for 16 workers and
