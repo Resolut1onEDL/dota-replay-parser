@@ -48,6 +48,15 @@ type TPState struct {
 	Travel  int     `json:"travel,omitempty"` // Boots of Travel in the main slots: 1, or 2 for level 2
 }
 
+// CooldownStart is a cooldown starting on one of the hero's abilities (slots 0–5) or items (main slots and the
+// neutral slot), read off the entity (v4.17.0): t = when it was seen, end = when it is ready again (game clock,
+// combat-log axis). A cooldown cut short (Refresher Orb) is a row with end = t. Ready at x = no row with t ≤ x < end.
+type CooldownStart struct {
+	T    float64 `json:"t"`
+	Name string  `json:"name"`
+	End  float64 `json:"end"`
+}
+
 type WardEvent struct {
 	Time      float64 `json:"time"`
 	Type      int     `json:"type"` // 0 = observer, 1 = sentry
@@ -586,6 +595,7 @@ type PlayerStats struct {
 	// General stats
 	TPCount    int             `json:"tpCount,omitempty"`
 	TPTimeline []TPState       `json:"tpTimeline,omitempty"` // v4.16.0
+	Cooldowns  []CooldownStart `json:"cooldowns,omitempty"`  // v4.17.0
 	CreepKills CreepKillPhases `json:"creepKills"`
 
 	// v4.6.0: enemy-base highground entries (whole game, not just laning).
@@ -1138,6 +1148,10 @@ type PlayerState struct {
 	TPCdEnd    float64 // last cooldown end read off the scroll, kept after the last one is spent
 	TPCdEnt    int32   // the scroll that cooldown was read off
 	TPTimeline []TPState
+	// v4.17.0: cooldown starts of the hero's abilities and items (see CooldownStart)
+	Cooldowns  []CooldownStart
+	CdEnd      map[int32]float64 // entity → the last cooldown end seen on it
+	CdLastScan float64
 
 	// Smoke tracking
 	SmokeCount int
@@ -1644,6 +1658,86 @@ func (s *ParserState) observeTP(ps *PlayerState) {
 		}
 	}
 	ps.recordTP(t, charges)
+}
+
+// observeCooldowns reads m_fCooldown (the time left) on the hero's abilities in slots 0–5 and his items in the main
+// slots and the neutral slot, at most four times a game second, and writes a row when a cooldown starts or is cut
+// short (v4.17.0). As on the TP scroll the end jitters by a tick between reads, so a start counts as new only when the
+// end moves by more than a second.
+func (s *ParserState) observeCooldowns(ps *PlayerState, hero *manta.Entity) {
+	if s.GameStartTime <= 0 || (s.GameEndTime > 0 && s.GameTime() > s.GameEndTime) {
+		return
+	}
+	t := s.entityActual()
+	if t < 0 || t-ps.CdLastScan < 0.25 {
+		return
+	}
+	ps.CdLastScan = t
+	if ps.CdEnd == nil {
+		ps.CdEnd = map[int32]float64{}
+	}
+	keys := make([]string, 0, 13)
+	for i := 0; i < 6; i++ {
+		keys = append(keys, fmt.Sprintf("m_vecAbilities.%04d", i))
+	}
+	for i := 0; i < 6; i++ {
+		keys = append(keys, fmt.Sprintf("m_hItems.%04d", i))
+	}
+	keys = append(keys, "m_hItems.0016")
+	for _, key := range keys {
+		handle, ok := hero.GetUint32(key)
+		if !ok || handle == 0 || handle >= 16777215 {
+			continue
+		}
+		idx := int32(handle & 0x3FFF)
+		ent := s.Parser.FindEntity(idx)
+		if ent == nil {
+			continue
+		}
+		cls := ent.GetClassName()
+		var name string
+		switch {
+		case strings.HasPrefix(cls, "CDOTA_Ability_"):
+			name = abilityEntityName(s, ent, cls)
+		case strings.HasPrefix(cls, "CDOTA_Item_"):
+			if name = s.itemEntityName(ent); name == "" {
+				name = normalizeEntityItemName(strings.TrimPrefix(cls, "CDOTA_Item_"))
+			}
+		default:
+			continue
+		}
+		if name == "" || strings.HasPrefix(name, "special_bonus_") {
+			continue
+		}
+		left, _ := ent.GetFloat32("m_fCooldown")
+		prev, seen := ps.CdEnd[idx]
+		end, row := nextCooldown(t, float64(left), prev, seen)
+		if row {
+			ps.Cooldowns = append(ps.Cooldowns, CooldownStart{T: math.Round(t*10) / 10, Name: name, End: math.Round(end*10) / 10})
+		}
+		if left > 0 || row {
+			ps.CdEnd[idx] = end
+		}
+	}
+}
+
+// minCooldown: a shorter one is an internal tick (Bottle, ward stacks, Io's tether break), not a cooldown to wait out
+const minCooldown = 1.0
+
+// nextCooldown decides one read of an entity's m_fCooldown: left = time left now, prev = the last end seen on it.
+// It returns the end to keep and whether that is a new row — a start (nothing running, or the end moved later by
+// more than the tick jitter of a second) or a cooldown cut short (none left while the last end is still ahead).
+func nextCooldown(t, left, prev float64, seen bool) (float64, bool) {
+	switch {
+	case left >= minCooldown:
+		end := t + left
+		return end, !seen || prev <= t || end > prev+1
+	case left > 0:
+		return prev, false
+	case seen && prev > t+1:
+		return t, true
+	}
+	return prev, false
 }
 
 // recordTP appends a tpTimeline row for the state at t unless it is the last row's.
@@ -3387,6 +3481,7 @@ func main() {
 								}
 							}
 							state.observeTP(ps)
+							state.observeCooldowns(ps, e)
 						}
 					}
 
@@ -5287,6 +5382,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			RuneStats: buildRuneSummary(ps.Runes),
 			TPCount:   ps.TPCount,
 			TPTimeline: ps.TPTimeline,
+			Cooldowns:  ps.Cooldowns,
 			HgEntries:      hgEntries[i],
 			HgEntriesCount: len(hgEntries[i]),
 			StackEvents:    stackEvents[i],
