@@ -8,6 +8,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -69,6 +70,23 @@ type ItemGain struct {
 	N    int     `json:"n"` // charges gained (1 for an item without charges)
 }
 
+// InvRow is one change of one hero item slot (v4.17.0): the item now in slot S (0–5 inventory, 6–8 backpack,
+// 9–14 stash, 16 neutral; "" = the slot emptied: sold, moved, combined, dropped) and, when a cooldown started, the
+// game second it ends. A row is written only on a change, so a slot holds its last row's item until the next one.
+// With it «BKB was ready and not pressed», «the core item sat in the stash during the fight» and sells are read
+// from the replay instead of guessed from purchases.
+type InvRow struct {
+	T     float64 `json:"t"`
+	S     int     `json:"s"`
+	Item  string  `json:"item,omitempty"`
+	CDEnd float64 `json:"cdEnd,omitempty"`
+}
+
+type invSlot struct {
+	item  string
+	cdEnd float64
+}
+
 type damageHit struct {
 	T          float64
 	A, V, K, D int
@@ -79,6 +97,35 @@ type wideTrack struct {
 	HP, HPMax, Mana, ManaMax []int
 	ItemGains                []ItemGain
 	itemSeen                 map[uint32]int // item handle → charges last seen
+	Inventory                []InvRow
+	inv                      map[int]invSlot // slot → last written state
+}
+
+// invSlots are the slots the inventory timeline follows; 15 (the TP scroll) has its own tpTimeline.
+var invSlots = []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16}
+
+// recordSlot writes an inventory row when slot's item differs from its last row, or when a new cooldown starts on
+// the same item. m_fCooldown is the time left and jitters by a tick between reads (see observeTP), so a cooldown end
+// is new only when it moves by more than a second.
+func (w *wideTrack) recordSlot(t float64, slot int, item string, cdLeft float64) {
+	if w.inv == nil {
+		w.inv = make(map[int]invSlot)
+	}
+	prev, seen := w.inv[slot]
+	cdEnd := 0.0
+	if cdLeft > 0 {
+		cdEnd = math.Round((t+cdLeft)*10) / 10
+	}
+	if seen && prev.item == item {
+		if cdEnd == 0 || math.Abs(cdEnd-prev.cdEnd) <= 1 {
+			return
+		}
+	}
+	if !seen && item == "" {
+		return
+	}
+	w.inv[slot] = invSlot{item: item, cdEnd: cdEnd}
+	w.Inventory = append(w.Inventory, InvRow{T: math.Round(t*10) / 10, S: slot, Item: item, CDEnd: cdEnd})
 }
 
 func damageSource(attackerName string, state *ParserState) int {
@@ -234,6 +281,21 @@ func (s *ParserState) sampleWide(e *manta.Entity, ps *PlayerState, t float64) {
 		w.HP, w.HPMax, w.Mana, w.ManaMax = append(w.HP, w.HP[last]), append(w.HPMax, w.HPMax[last]), append(w.Mana, w.Mana[last]), append(w.ManaMax, w.ManaMax[last])
 	}
 	w.HP[sec], w.HPMax[sec], w.Mana[sec], w.ManaMax[sec] = int(hp), int(hpMax), int(mana), int(manaMax)
+
+	for _, slot := range invSlots {
+		name, cdLeft := "", 0.0
+		if handle, ok := e.GetUint32(fmt.Sprintf("m_hItems.%04d", slot)); ok && handle != 0 && handle < 16777215 {
+			if itemEnt := s.Parser.FindEntity(int32(handle & 0x3FFF)); itemEnt != nil && strings.HasPrefix(itemEnt.GetClassName(), "CDOTA_Item_") {
+				if name = s.itemEntityName(itemEnt); name == "" {
+					name = normalizeEntityItemName(strings.TrimPrefix(itemEnt.GetClassName(), "CDOTA_Item_"))
+				}
+				if left, okC := itemEnt.GetFloat32("m_fCooldown"); okC && left > 0 {
+					cdLeft = float64(left)
+				}
+			}
+		}
+		w.recordSlot(t, slot, name, cdLeft)
+	}
 
 	if w.itemSeen == nil {
 		w.itemSeen = make(map[uint32]int)
