@@ -606,6 +606,7 @@ type PlayerStats struct {
 	// v4.9.0 wide export (wide.go): HP/mana per second and items arriving on the hero.
 	Vitals    *Vitals    `json:"vitals,omitempty"`
 	ItemGains []ItemGain `json:"itemGains,omitempty"`
+	Inventory []InvRow   `json:"inventory,omitempty"` // v4.17.0
 }
 
 type Player struct {
@@ -5282,6 +5283,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 			DewardEvents:   ps.Dewards,
 			Vitals:         ps.Wide.vitals(int(duration)),
 			ItemGains:      ps.Wide.ItemGains,
+			Inventory:      ps.Wide.Inventory,
 			CreepKills: CreepKillPhases{
 				LaneCreepsPre10:    ps.LaneCreepsPre10,
 				LaneCreeps10to25:   ps.LaneCreeps10to25,
