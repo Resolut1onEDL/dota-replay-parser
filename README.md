@@ -38,6 +38,7 @@ Stdout is the JSON output. Stderr carries progress logs. Exit code 0 = success.
   "positionTrack":   [ { t, p } ]            // 4.13.0: 1 Hz hero positions, see below
   "damageSeconds":   [ { t, a, v, k, d } ]   // 4.9.0 wide export, see below
   "controlEvents":   [ { t, p, a, m, ab, stun, slow, on } ]
+  "objectiveDamageSeconds": [ { t, a, o, d } ]  // players' damage to buildings, Roshan, Tormentors
   "parserVersion":   "<semver>"
 }
 ```
@@ -58,6 +59,14 @@ field changes meaning.
   fight detector reserves that name for a hero→hero-only stream.
 - `controlEvents` — modifiers the combat log gives a stun or a slow duration,
   applied to (`on`) and removed from (`!on`) a real hero.
+- `objectiveDamageSeconds` — a player's damage to one objective per game
+  second: `a` slot (illusions and summons count as the owner, as in
+  `towerDamage`), `o` an enemy building's unit name without `npc_dota_`
+  (`badguys_tower1_mid`, `goodguys_range_rax_bot`, … — damage to the own side's
+  buildings is left out, like `towerDamage`), `roshan` or `tormentor`, `d` sum.
+  Summed per slot over buildings it equals the combat-log `towerDamage` (Valve's
+  `m_flTowerDamage` may differ). For «who pushed a free lane» and «who hit
+  Roshan», not only who landed the last hit.
 - `players[].stats.vitals` — `{hp, hpMax, mana, manaMax}`, one value per game
   second from the horn (index = second).
 - `players[].stats.itemGains` — `[{t, item, n}]`: an item arriving on the hero
@@ -171,6 +180,19 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   4.11.0 in all 99, no audit field worse than the baseline; 23 bans a game
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
+
+### 4.18.0 — players' damage to objectives per second
+
+- `objectiveDamageSeconds` `[{t, a, o, d}]`: each player's damage to each enemy
+  building, Roshan and Tormentor per game second (illusions and summons count
+  as the owner; the own side's buildings are left out, as in `towerDamage`).
+  Lets a metric tell who pushed a free lane or hit Roshan, not only who landed
+  the last hit (ResoAI-web `docs/role-index-2026-11/objectives/`).
+- Audit set (99 matches): every other field byte-identical to 4.17.0 (6
+  matches parsed by both builds), no audit field worse than the baseline; the
+  sum over buildings equals `towerDamage` for 99.8 % of 489 players with 500+;
+  the building's last hitter hit it in the 6 s before in 98.1 % of 1,019 kills;
+  Roshan's last hitter has Roshan damage in 96 of 96. ~450 rows a game.
 
 ### 4.16.1 — a camp ban names the same player every run
 

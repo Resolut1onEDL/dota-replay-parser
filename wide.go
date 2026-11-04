@@ -344,3 +344,69 @@ func (w *wideTrack) vitals(duration int) *Vitals {
 	n := duration + 1
 	return &Vitals{HP: w.HP[:n], HPMax: w.HPMax[:n], Mana: w.Mana[:n], ManaMax: w.ManaMax[:n]}
 }
+
+// ObjectiveDamageSecond is the damage one player dealt to one objective within
+// one game second: an enemy building (tower, barracks, fort, shrine — the same
+// set and the same crediting as towerDamage), Roshan or a Tormentor. Lets a
+// metric tell who pushed a free lane or hit Roshan, not only who landed the
+// last hit, from the stored JSON.
+type ObjectiveDamageSecond struct {
+	T int    `json:"t"` // floor of the game second, 0 = horn
+	A int    `json:"a"` // attacker slot 0-9 (summons and illusions count as their owner)
+	O string `json:"o"` // the objective: building unit name without npc_dota_, "roshan" or "tormentor"
+	D int    `json:"d"` // damage summed over the second
+}
+
+type objectiveHit struct {
+	T float64
+	A int
+	O string
+	D int
+}
+
+// objectiveName is the objective a combat-log damage target is, "" for anything else. Buildings follow
+// towerDamage's rule: only the attacker's enemy side counts (an ally's AoE on its own tower is no push).
+func objectiveName(targetName string, attackerRadiant bool) string {
+	switch {
+	case targetName == "npc_dota_roshan":
+		return "roshan"
+	case strings.HasPrefix(targetName, "npc_dota_miniboss"):
+		return "tormentor"
+	case isBuildingTarget(targetName):
+		if isRad, ok := buildingIsRadiant(targetName); ok && isRad != attackerRadiant {
+			return strings.TrimPrefix(targetName, "npc_dota_")
+		}
+	}
+	return ""
+}
+
+// objectiveSeconds sums the hits per (second, attacker, objective), in time order.
+func objectiveSeconds(hits []objectiveHit) []ObjectiveDamageSecond {
+	type key struct {
+		t, a int
+		o    string
+	}
+	sums := make(map[key]int)
+	for _, h := range hits {
+		t := int(h.T)
+		if h.T < 0 && float64(t) != h.T {
+			t--
+		}
+		sums[key{t, h.A, h.O}] += h.D
+	}
+	out := make([]ObjectiveDamageSecond, 0, len(sums))
+	for k, d := range sums {
+		out = append(out, ObjectiveDamageSecond{T: k.t, A: k.a, O: k.o, D: d})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.T != b.T {
+			return a.T < b.T
+		}
+		if a.A != b.A {
+			return a.A < b.A
+		}
+		return a.O < b.O
+	})
+	return out
+}
