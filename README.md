@@ -181,14 +181,14 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
-### 4.17.0 — players' damage to objectives per second
+### 4.18.0 — players' damage to objectives per second
 
 - `objectiveDamageSeconds` `[{t, a, o, d}]`: each player's damage to each enemy
   building, Roshan and Tormentor per game second (illusions and summons count
   as the owner; the own side's buildings are left out, as in `towerDamage`).
   Lets a metric tell who pushed a free lane or hit Roshan, not only who landed
   the last hit (ResoAI-web `docs/role-index-2026-11/objectives/`).
-- Audit set (99 matches): every other field byte-identical to 4.16.1 (6
+- Audit set (99 matches): every other field byte-identical to 4.17.0 (6
   matches parsed by both builds), no audit field worse than the baseline; the
   sum over buildings equals `towerDamage` for 99.8 % of 489 players with 500+;
   the building's last hitter hit it in the 6 s before in 98.1 % of 1,019 kills;

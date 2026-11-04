@@ -107,3 +107,30 @@ func TestObjectiveSecondsSumsPerSecondAttackerAndObjective(t *testing.T) {
 		}
 	}
 }
+
+// v4.17.0: one row per real change of a slot — a jittering cooldown read or the same item read again writes nothing.
+func TestRecordSlotWritesOnlyChanges(t *testing.T) {
+	w := &wideTrack{}
+	w.recordSlot(100, 2, "", 0)                  // an empty slot never seen: nothing
+	w.recordSlot(120, 2, "black_king_bar", 0)    // bought
+	w.recordSlot(121, 2, "black_king_bar", 0)    // read again
+	w.recordSlot(600, 2, "black_king_bar", 95)   // pressed: cooldown to 695
+	w.recordSlot(601, 2, "black_king_bar", 94.4) // the same cooldown, a tick of jitter
+	w.recordSlot(700, 2, "black_king_bar", 0)    // cooled down: no row, cdEnd already said so
+	w.recordSlot(710, 2, "", 0)                  // moved out
+	w.recordSlot(710, 7, "black_king_bar", 0)    // into the backpack
+	want := []InvRow{
+		{T: 120, S: 2, Item: "black_king_bar"},
+		{T: 600, S: 2, Item: "black_king_bar", CDEnd: 695},
+		{T: 710, S: 2},
+		{T: 710, S: 7, Item: "black_king_bar"},
+	}
+	if len(w.Inventory) != len(want) {
+		t.Fatalf("got %d rows, want %d: %+v", len(w.Inventory), len(want), w.Inventory)
+	}
+	for i := range want {
+		if w.Inventory[i] != want[i] {
+			t.Errorf("row %d: got %+v, want %+v", i, w.Inventory[i], want[i])
+		}
+	}
+}
