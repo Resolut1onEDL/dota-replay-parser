@@ -38,6 +38,7 @@ Stdout is the JSON output. Stderr carries progress logs. Exit code 0 = success.
   "positionTrack":   [ { t, p } ]            // 4.13.0: 1 Hz hero positions, see below
   "damageSeconds":   [ { t, a, v, k, d } ]   // 4.9.0 wide export, see below
   "controlEvents":   [ { t, p, a, m, ab, stun, slow, on } ]
+  "objectiveDamageSeconds": [ { t, a, o, d } ]  // players' damage to buildings, Roshan, Tormentors
   "parserVersion":   "<semver>"
 }
 ```
@@ -58,6 +59,14 @@ field changes meaning.
   fight detector reserves that name for a hero→hero-only stream.
 - `controlEvents` — modifiers the combat log gives a stun or a slow duration,
   applied to (`on`) and removed from (`!on`) a real hero.
+- `objectiveDamageSeconds` — a player's damage to one objective per game
+  second: `a` slot (illusions and summons count as the owner, as in
+  `towerDamage`), `o` an enemy building's unit name without `npc_dota_`
+  (`badguys_tower1_mid`, `goodguys_range_rax_bot`, … — damage to the own side's
+  buildings is left out, like `towerDamage`), `roshan` or `tormentor`, `d` sum.
+  Summed per slot over buildings it equals the combat-log `towerDamage` (Valve's
+  `m_flTowerDamage` may differ). For «who pushed a free lane» and «who hit
+  Roshan», not only who landed the last hit.
 - `players[].stats.vitals` — `{hp, hpMax, mana, manaMax}`, one value per game
   second from the horn (index = second).
 - `players[].stats.itemGains` — `[{t, item, n}]`: an item arriving on the hero

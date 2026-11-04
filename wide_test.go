@@ -62,3 +62,48 @@ func TestVitalsPadToGameEndCarryingLastValue(t *testing.T) {
 		t.Fatal("a hero never sampled must have no vitals, not zeros")
 	}
 }
+
+func TestObjectiveNameCountsOnlyEnemyBuildingsRoshanAndTormentor(t *testing.T) {
+	cases := []struct {
+		target  string
+		radiant bool
+		want    string
+	}{
+		{"npc_dota_badguys_tower1_mid", true, "badguys_tower1_mid"},
+		{"npc_dota_goodguys_tower1_mid", true, ""}, // own tower: no push
+		{"npc_dota_goodguys_range_rax_bot", false, "goodguys_range_rax_bot"},
+		{"npc_dota_roshan", false, "roshan"},
+		{"npc_dota_miniboss", true, "tormentor"},
+		{"npc_dota_creep_badguys_melee", true, ""},
+		{"npc_dota_hero_axe", true, ""},
+	}
+	for _, c := range cases {
+		if got := objectiveName(c.target, c.radiant); got != c.want {
+			t.Errorf("objectiveName(%q, %v) = %q, want %q", c.target, c.radiant, got, c.want)
+		}
+	}
+}
+
+func TestObjectiveSecondsSumsPerSecondAttackerAndObjective(t *testing.T) {
+	got := objectiveSeconds([]objectiveHit{
+		{T: 600.2, A: 1, O: "badguys_tower1_mid", D: 100},
+		{T: 600.8, A: 1, O: "badguys_tower1_mid", D: 120}, // same second → summed
+		{T: 600.5, A: 1, O: "roshan", D: 80},
+		{T: 600.5, A: 0, O: "badguys_tower1_mid", D: 50},
+		{T: 601.0, A: 1, O: "badguys_tower1_mid", D: 10},
+	})
+	want := []ObjectiveDamageSecond{
+		{T: 600, A: 0, O: "badguys_tower1_mid", D: 50},
+		{T: 600, A: 1, O: "badguys_tower1_mid", D: 220},
+		{T: 600, A: 1, O: "roshan", D: 80},
+		{T: 601, A: 1, O: "badguys_tower1_mid", D: 10},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}

@@ -702,6 +702,8 @@ type Match struct {
 	SpawnBlocks     []SpawnBlock     `json:"spawnBlocks,omitempty"` // v4.12.0: camp bans, the whole game
 	// v4.9.0 wide export (wide.go): damage to heroes per second, control modifiers on heroes.
 	DamageSeconds  []DamageSecond  `json:"damageSeconds,omitempty"`
+	// players' damage to enemy buildings, Roshan and Tormentors per second (wide.go)
+	ObjectiveDamageSeconds []ObjectiveDamageSecond `json:"objectiveDamageSeconds,omitempty"`
 	ControlEvents  []ControlEvent  `json:"controlEvents,omitempty"`
 
 	Players []Player `json:"players"`
@@ -1186,6 +1188,7 @@ type ParserState struct {
 	Parser       *manta.Parser
 	Players      [10]*PlayerState
 	DamageHits   []damageHit     // v4.9.0: every damage entry on a real hero → combatSeconds
+	ObjectiveHits []objectiveHit // every player's damage to enemy buildings, Roshan and Tormentors → objectiveDamageSeconds
 	ModEvents    []ControlEvent // v4.9.0: control modifiers on real heroes
 	modActive    map[string]int  // "slot|modifier" → applications not yet removed
 	// v4.9.0: the spells each player holds stolen right now (Rubick), by their combat-log name —
@@ -2651,6 +2654,13 @@ func main() {
 			damage := int(m.GetValue())
 			damageType := m.GetDamageType()
 			state.recordDamage(m, actualTime, attackerName, targetName, damage, damageType)
+			if damage > 0 {
+				if owner := state.damageOwner(m, attackerName); owner >= 0 && owner < 10 && state.Players[owner] != nil {
+					if o := objectiveName(targetName, state.Players[owner].IsRadiant); o != "" {
+						state.ObjectiveHits = append(state.ObjectiveHits, objectiveHit{T: actualTime, A: owner, O: o, D: damage})
+					}
+				}
+			}
 
 			// hero_damage and the per-target report count as Valve's scoreboard does (checked against
 			// OpenDota's hero_damage on 70 players, exact for 65): damage to a real enemy hero — not to an
@@ -5416,6 +5426,7 @@ func buildMatchOutput(state *ParserState, duration float64) Match {
 		CampBlocks:             campBlocks,
 		SpawnBlocks:            spawnBlocks,
 		DamageSeconds:          damageSeconds(state.DamageHits),
+		ObjectiveDamageSeconds: objectiveSeconds(state.ObjectiveHits),
 		ControlEvents:          state.ModEvents,
 		Players:                players,
 		ParsedFromReplay:       true,
