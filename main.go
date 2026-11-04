@@ -20,7 +20,7 @@ import (
 // `parser --version` for distribution tooling (parse-service /healthz,
 // companion/uploader bin verification, scripts/release-sync.sh), and must
 // match the release tag (vX.Y.Z) that ships the binaries.
-const parserVersion = "4.16.0"
+const parserVersion = "4.16.1"
 
 // ============= TYPES (Stratz-compatible + extras) =============
 
@@ -107,7 +107,8 @@ type TormentorEvent struct {
 // stands in the camp's box). Read from the camps themselves: no neutral alive there at the mark and none appearing
 // with it. The blocker is the player's unit nearest to the spawner then — his hero, an illusion, a summon (Nature's
 // Prophet's treants, Lone Druid's bear, a dominated creep), a courier or a ward; Player -1 / By "" when no player's
-// unit stood within reach. Dist: cells from the spawner to that unit.
+// unit stood within reach. Dist: cells from the spawner to that unit. Two units equally near in cells (v4.16.1): the
+// one nearer by its exact position; a ward loses a tie to a unit.
 type SpawnBlock struct {
 	Time     float64 `json:"time"`
 	CampX    float64 `json:"campX"`
@@ -1299,6 +1300,7 @@ type ParserState struct {
 
 	// v4.6.0: raw signals for pulls / stun combos / highground entries.
 	CampSpawners      [][2]float64         // CDOTA_NeutralSpawner cells = camp anchors
+	CampSpawnerFine   [][2]float64          // v4.16.1: the same spawners' exact positions (see cellFine)
 	NeutralSpawnCells map[int32][2]float64 // live neutral creep → first-seen cell (≈ its camp)
 	NeutDeletions     []neutDeletion       // neutral entity deletions ≤13 min (corpse lag ~7.5s)
 	PullDeaths        []pullDeathRec       // lane-creep<->neutral combat-log deaths ≤13 min
@@ -3488,6 +3490,7 @@ func main() {
 				if cy, ok2 := e.GetUint64("CBodyComponent.m_cellY"); ok2 {
 					state.SpawnerCamp[e.GetIndex()] = len(state.CampSpawners)
 					state.CampSpawners = append(state.CampSpawners, [2]float64{float64(cx), float64(cy)})
+					state.CampSpawnerFine = append(state.CampSpawnerFine, cellFine(e, cx, cy))
 				}
 			}
 		}
@@ -6598,6 +6601,22 @@ type spawnUnit struct {
 	player int
 	by     string // "hero" | "illusion" | "summon" | "courier"
 	x, y   float64
+	fx, fy float64 // v4.16.1: exact position (cellFine), for a tie on cells
+	ent    int32   // v4.16.1: entity index, for a tie on the exact position too
+}
+
+// cellFine is e's exact position in cell units: CBodyComponent cells come in steps of 2 (256 world units) and m_vecX/Y
+// is the offset inside, 0-256 units (measured on 9014199146: a hero crossing cells 180→178 goes vec 11→250). Without
+// the offsets it is the cell itself.
+func cellFine(e *manta.Entity, cx, cy uint64) [2]float64 {
+	fine := [2]float64{float64(cx), float64(cy)}
+	if vx, ok := e.GetFloat32("CBodyComponent.m_vecX"); ok {
+		fine[0] += float64(vx) / 128
+	}
+	if vy, ok := e.GetFloat32("CBodyComponent.m_vecY"); ok {
+		fine[1] += float64(vy) / 128
+	}
+	return fine
 }
 
 type spawnSnap struct {
@@ -6680,7 +6699,8 @@ func snapUnits(state *ParserState, p *manta.Parser, t float64) spawnSnap {
 		if owner < 0 || owner > 9 {
 			continue
 		}
-		snap.units = append(snap.units, spawnUnit{player: owner, by: by, x: float64(cx), y: float64(cy)})
+		fine := cellFine(u, cx, cy)
+		snap.units = append(snap.units, spawnUnit{player: owner, by: by, x: float64(cx), y: float64(cy), fx: fine[0], fy: fine[1], ent: u.GetIndex()})
 	}
 	return snap
 }
@@ -6911,10 +6931,20 @@ func detectSpawnBlocks(state *ParserState, tiers []string) []SpawnBlock {
 					}
 				}
 			}
-			who, by, best := -1, "", 99.0
+			spFine := sp
+			if ci < len(state.CampSpawnerFine) {
+				spFine = state.CampSpawnerFine[ci]
+			}
+			who, by, best, bestFine, bestEnt := -1, "", 99.0, 99.0, int32(0)
 			for _, u := range snap.units {
-				if d := math.Hypot(sp[0]-u.x, sp[1]-u.y); d < best {
-					who, by, best = u.player, u.by, d
+				// cells come in steps of 2, so two units often stand equally near, and snap.units come in the entity
+				// map's random order: a tie goes to the unit nearer by its exact position, then to the lower entity
+				// index (v4.16.1: 9014199146 flipped between runs, players 4 and 7 both 4.5 cells away). Not the lower
+				// slot or the entity index alone: on the audit set each hands the cross-team ties to one team.
+				d := math.Hypot(sp[0]-u.x, sp[1]-u.y)
+				fine := math.Hypot(spFine[0]-u.fx, spFine[1]-u.fy)
+				if d < best || (d == best && (fine < bestFine || (fine == bestFine && u.ent < bestEnt))) {
+					who, by, best, bestFine, bestEnt = u.player, u.by, d, fine, u.ent
 				}
 			}
 			for pi := 0; pi < 10; pi++ {

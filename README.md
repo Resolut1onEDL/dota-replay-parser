@@ -172,6 +172,24 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.16.1 — a camp ban names the same player every run
+
+- `spawnBlocks[].player` / `by`: positions come in cells that step by 2, so two
+  units often stand equally near the spawner, and the tie went to the one the
+  entity map listed first — a random order: one replay parsed twice could name
+  different blockers (9014199146: at 1:00 Shadow Demon or Dazzle, both 4.5
+  cells; at 41:00 Grimstroke or a Naga Siren illusion, 2.8). A tie on cells now
+  goes to the unit nearer by its exact position (the cell plus
+  `CBodyComponent.m_vecX/Y`, the offset inside it), then to the lower entity
+  index; `dist` stays in cells. Not the lower slot or the entity index: on the
+  audit set the slot gives the Radiant every cross-team tie, the entity index
+  gives the Dire 17 of 18; the exact position splits them 9 / 12.
+- Audit set (99 matches): 22 of 2,636 bans in 18 matches name another unit
+  than that 4.16.0 run (14 a hero → another hero, 4 a hero → an illusion or a
+  summon, 4 the other way), same time, camp and distance; every other field
+  byte-identical, no audit field worse than the baseline. 9014199146 parsed
+  8 times: 8 identical outputs.
+
 ### 4.16.0 — the teleport timeline
 
 - `players[].stats.tpTimeline` — `[{t, charges, cdEnd, travel}]`, a row each time
