@@ -2352,3 +2352,90 @@ func TestTPTimelineReplay(t *testing.T) {
 		t.Errorf("%d teleports in the match, want the 57 seen", total)
 	}
 }
+
+func TestNextCooldown(t *testing.T) {
+	cases := []struct {
+		name    string
+		t, left float64
+		prev    float64
+		seen    bool
+		end     float64
+		row     bool
+	}{
+		{"first start", 100, 90, 0, false, 190, true},
+		{"same cooldown, a tick of jitter", 100.25, 89.8, 190, true, 190.05, false},
+		{"recast after it was ready", 300, 90, 190, true, 390, true},
+		{"refreshed and recast at once: the end moves later", 120, 90, 190, true, 210, true},
+		{"cut short (Refresher Orb)", 150, 0, 190, true, 150, true},
+		{"ready on time: no row", 190.5, 0, 190, true, 190, false},
+		{"an internal tick (Bottle) is no cooldown", 50, 0.4, 0, false, 0, false},
+		{"never seen, nothing running", 10, 0, 0, false, 0, false},
+	}
+	for _, c := range cases {
+		end, row := nextCooldown(c.t, c.left, c.prev, c.seen)
+		if row != c.row || math.Abs(end-c.end) > 1e-9 {
+			t.Errorf("%s: got end %.2f row %v, want end %.2f row %v", c.name, end, row, c.end, c.row)
+		}
+	}
+}
+
+// TestCooldownsReplay: on a real replay at least 90 % of the casts (abilityCastEvents, itemCastEvents) of abilities
+// and items that ever show a cooldown have a cooldown start within a second of the cast. CD_REPLAY names the .dem;
+// skipped without one. (9013821098: 1165 of 1200; the misses are recasts — Io's Tether, Tusk's Snowball launch —
+// and Quelling Blade's tree cut.)
+func TestCooldownsReplay(t *testing.T) {
+	demPath := os.Getenv("CD_REPLAY")
+	if demPath == "" {
+		t.Skip("CD_REPLAY not set")
+	}
+	bin := filepath.Join(t.TempDir(), "parser")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build failed: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin, demPath).Output()
+	if err != nil {
+		t.Fatalf("parser run: %v", err)
+	}
+	var got Match
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("parser stdout not JSON: %v", err)
+	}
+	casts, matched, rows := 0, 0, 0
+	for _, p := range got.Players {
+		if p.Stats == nil {
+			continue
+		}
+		rows += len(p.Stats.Cooldowns)
+		has := map[string]bool{}
+		for _, cd := range p.Stats.Cooldowns {
+			has[cd.Name] = true
+			if cd.End < cd.T {
+				t.Errorf("%s: cooldown ends before it starts (%.1f < %.1f)", cd.Name, cd.End, cd.T)
+			}
+		}
+		check := func(name string, at float64) {
+			if !has[name] {
+				return
+			}
+			casts++
+			for _, cd := range p.Stats.Cooldowns {
+				if cd.Name == name && math.Abs(cd.T-at) <= 1 {
+					matched++
+					return
+				}
+			}
+		}
+		for _, c := range p.Stats.AbilityCastEvents {
+			check(c.Ability, c.Time)
+		}
+		for _, c := range p.Stats.ItemCastEvents {
+			check(c.Item, c.Time)
+		}
+	}
+	if rows == 0 || casts < 100 {
+		t.Fatalf("%d cooldown rows, %d casts to check", rows, casts)
+	}
+	if float64(matched) < 0.9*float64(casts) {
+		t.Errorf("%d of %d casts have a cooldown start within 1 s", matched, casts)
+	}
+}

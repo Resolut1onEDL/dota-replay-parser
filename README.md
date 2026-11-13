@@ -181,6 +181,14 @@ what changed meaning (the report: `audit/reports/2026-10-07-after.md`):
   (median), 21 % of them `player: -1` (a mark that did not wake with no
   player's unit within reach), camp tier unknown for 0.3 %. Parse time +~14 %.
 
+### 4.19.0 — cooldown timeline
+
+- `players[].stats.cooldowns` `[{t, name, end}]`: every time an ability or item
+  cooldown starts (`t`, game seconds), its name and when it ends (`end`). Lets
+  a metric tell what a player had ready going into a fight (ResoAI-web
+  «Драки»). Checked on 9013821098: 1,165 of 1,200 casts (97 %) have a cooldown
+  start within 1 s (`TestCooldownsReplay`, `CD_REPLAY`).
+
 ### 4.18.0 — players' damage to objectives per second
 
 - `objectiveDamageSeconds` `[{t, a, o, d}]`: each player's damage to each enemy
